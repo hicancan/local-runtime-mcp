@@ -1,0 +1,15 @@
+# Binaries
+/bin/
+/wmcp.exe
+/wmcp
+
+# Local configuration and secrets
+/config.yaml
+*.local.yaml
+.env
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

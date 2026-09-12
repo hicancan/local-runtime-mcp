@@ -1,0 +1,4 @@
+workspaces:
+  workspace:
+    root: ${WMCP_WORKSPACE_ROOT}
+    description: Primary workspace
