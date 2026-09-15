@@ -7,10 +7,18 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+
+	pty "github.com/aymanbagabas/go-pty"
 )
 
 type unixProcessControl struct {
 	process *os.Process
+}
+
+func preparePTY(*pty.Cmd) {}
+
+func attachManaged(process *os.Process) (processControl, error) {
+	return &unixProcessControl{process: process}, nil
 }
 
 func startManaged(command *exec.Cmd) (processControl, error) {

@@ -42,7 +42,7 @@ func TestToolCatalogAndIdentity(t *testing.T) {
 	expected := map[string]annotationExpectation{
 		"filesystem_list": {true, false, true, false}, "filesystem_stat": {true, false, true, false},
 		"filesystem_read_text": {true, false, true, false}, "filesystem_write_text": {false, true, true, false},
-		"filesystem_edit_text": {false, true, true, false}, "filesystem_search_text": {true, false, true, false},
+		"filesystem_patch_text": {false, true, true, false}, "filesystem_search_text": {true, false, true, false},
 		"image_read": {true, false, true, false}, "process_run": {false, true, false, true},
 		"process_continue": {false, true, false, true},
 		"browser_status":   {true, false, true, false}, "browser_tabs": {true, false, true, false},
@@ -92,9 +92,12 @@ func TestToolCatalogAndIdentity(t *testing.T) {
 	if _, ok := schemas["filesystem_write_text"]["create_parents"]; !ok {
 		t.Fatal("filesystem_write_text is missing explicit create_parents")
 	}
+	if _, ok := schemas["computer_action"]["element_ref"]; !ok {
+		t.Fatal("computer_action is missing UI Automation element_ref")
+	}
 	for toolName, forbidden := range map[string][]string{
-		"computer_state":  {"include_accessibility"},
-		"computer_action": {"element_ref"},
+		"computer_state": {"include_accessibility"},
+		"browser_action": {"selector"},
 	} {
 		for _, name := range forbidden {
 			if _, ok := schemas[toolName][name]; ok {
@@ -127,7 +130,7 @@ func TestFilesystemImageAndProcessTools(t *testing.T) {
 	if readResult.Content != "hello from MCP\n" {
 		t.Fatalf("unexpected read: %+v", readResult)
 	}
-	callOK(t, session, "filesystem_edit_text", map[string]any{"path": note, "edits": []map[string]any{{"old_text": "hello", "new_text": "hi"}}})
+	callOK(t, session, "filesystem_patch_text", map[string]any{"path": note, "expected_sha256": written.SHA256, "hunks": []map[string]any{{"old": "hello", "new": "hi", "after": " from MCP"}}})
 	callOK(t, session, "filesystem_stat", map[string]any{"path": note})
 	callOK(t, session, "filesystem_list", map[string]any{"path": root})
 	search := callOK(t, session, "filesystem_search_text", map[string]any{"path": root, "query": "hi"})

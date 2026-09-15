@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"unicode/utf8"
 )
@@ -272,71 +273,106 @@ func WriteText(path, content string, options WriteTextOptions) (TextWriteResult,
 	return TextWriteResult{Path: resolved, Bytes: len(data), Created: created, SHA256: hashBytes(data)}, nil
 }
 
-func EditText(path string, options EditTextOptions) (TextEditResult, error) {
+func PatchText(path string, options PatchTextOptions) (TextPatchResult, error) {
 	resolved, err := resolve(path)
 	if err != nil {
-		return TextEditResult{}, err
+		return TextPatchResult{}, err
 	}
-	if len(options.Edits) == 0 {
-		return TextEditResult{}, errors.New("edits cannot be empty")
+	if len(options.Hunks) == 0 {
+		return TextPatchResult{}, errors.New("hunks cannot be empty")
 	}
-	if len(options.Edits) > 1_000 {
-		return TextEditResult{}, errors.New("edits cannot contain more than 1000 items")
+	if len(options.Hunks) > 1_000 {
+		return TextPatchResult{}, errors.New("hunks cannot contain more than 1000 items")
+	}
+	if len(options.ExpectedSHA256) != 64 {
+		return TextPatchResult{}, errors.New("expected_sha256 is required and must contain 64 hexadecimal characters")
+	}
+	if _, err := hex.DecodeString(options.ExpectedSHA256); err != nil {
+		return TextPatchResult{}, errors.New("expected_sha256 is required and must contain 64 hexadecimal characters")
 	}
 	info, err := os.Lstat(resolved)
 	if err != nil {
-		return TextEditResult{}, err
+		return TextPatchResult{}, err
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
-		return TextEditResult{}, errors.New("edit path cannot be a symbolic link")
+		return TextPatchResult{}, errors.New("patch path cannot be a symbolic link")
 	}
 	if !info.Mode().IsRegular() {
-		return TextEditResult{}, errors.New("edit path must be a regular file")
+		return TextPatchResult{}, errors.New("patch path must be a regular file")
 	}
 	if info.Size() > maxTextBytes {
-		return TextEditResult{}, fmt.Errorf("file exceeds edit limit of %d bytes", maxTextBytes)
+		return TextPatchResult{}, fmt.Errorf("file exceeds patch limit of %d bytes", maxTextBytes)
 	}
 	data, err := os.ReadFile(resolved)
 	if err != nil {
-		return TextEditResult{}, err
+		return TextPatchResult{}, err
 	}
 	if !utf8.Valid(data) || bytes.IndexByte(data, 0) >= 0 {
-		return TextEditResult{}, errors.New("file is not UTF-8 text")
+		return TextPatchResult{}, errors.New("file is not UTF-8 text")
 	}
-	if options.ExpectedSHA256 != "" && !strings.EqualFold(hashBytes(data), options.ExpectedSHA256) {
-		return TextEditResult{}, errors.New("file content does not match expected_sha256")
+	if !strings.EqualFold(hashBytes(data), options.ExpectedSHA256) {
+		return TextPatchResult{}, errors.New("file content does not match expected_sha256")
 	}
-	updated := string(data)
-	replacements := make([]int, len(options.Edits))
-	for index, edit := range options.Edits {
-		if edit.OldText == "" {
-			return TextEditResult{}, fmt.Errorf("edits[%d].old_text cannot be empty", index)
+
+	type locatedHunk struct {
+		start, end int
+		new        string
+		index      int
+	}
+	original := string(data)
+	located := make([]locatedHunk, 0, len(options.Hunks))
+	for index, hunk := range options.Hunks {
+		if hunk.Old == "" && hunk.Before == "" && hunk.After == "" {
+			return TextPatchResult{}, fmt.Errorf("hunks[%d] insertion requires before or after context", index)
 		}
-		count := strings.Count(updated, edit.OldText)
-		if count == 0 {
-			return TextEditResult{}, fmt.Errorf("edits[%d].old_text was not found", index)
+		anchor := hunk.Before + hunk.Old + hunk.After
+		matches := allExactMatches(original, anchor)
+		if len(matches) == 0 {
+			return TextPatchResult{}, fmt.Errorf("hunks[%d] context was not found in the original file", index)
 		}
-		if !edit.ReplaceAll && count != 1 {
-			return TextEditResult{}, fmt.Errorf("edits[%d].old_text matched %d times; provide a unique value or set replace_all", index, count)
+		if len(matches) != 1 {
+			return TextPatchResult{}, fmt.Errorf("hunks[%d] context matched %d times in the original file", index, len(matches))
 		}
-		limit := 1
-		if edit.ReplaceAll {
-			limit = -1
-		}
-		updated = strings.Replace(updated, edit.OldText, edit.NewText, limit)
-		replacements[index] = count
-		if !edit.ReplaceAll {
-			replacements[index] = 1
+		start := matches[0] + len(hunk.Before)
+		located = append(located, locatedHunk{start: start, end: start + len(hunk.Old), new: hunk.New, index: index})
+	}
+	sort.Slice(located, func(i, j int) bool { return located[i].start < located[j].start })
+	for index := 1; index < len(located); index++ {
+		previous, current := located[index-1], located[index]
+		if current.start < previous.end || current.start == previous.start {
+			return TextPatchResult{}, fmt.Errorf("hunks[%d] overlaps hunks[%d] in the original file", current.index, previous.index)
 		}
 	}
-	updatedBytes := []byte(updated)
+	updated := append([]byte(nil), data...)
+	for index := len(located) - 1; index >= 0; index-- {
+		hunk := located[index]
+		updated = append(updated[:hunk.start], append([]byte(hunk.new), updated[hunk.end:]...)...)
+	}
+	updatedBytes := updated
 	if len(updatedBytes) > maxTextBytes {
-		return TextEditResult{}, fmt.Errorf("edited file exceeds limit of %d bytes", maxTextBytes)
+		return TextPatchResult{}, fmt.Errorf("patched file exceeds limit of %d bytes", maxTextBytes)
 	}
 	if err := atomicWrite(resolved, updatedBytes, info.Mode().Perm()); err != nil {
-		return TextEditResult{}, err
+		return TextPatchResult{}, err
 	}
-	return TextEditResult{Path: resolved, Bytes: len(updatedBytes), Replacements: replacements, SHA256: hashBytes(updatedBytes)}, nil
+	return TextPatchResult{Path: resolved, Bytes: len(updatedBytes), Hunks: len(located), SHA256: hashBytes(updatedBytes)}, nil
+}
+
+func allExactMatches(value, pattern string) []int {
+	if pattern == "" {
+		return nil
+	}
+	var matches []int
+	for offset := 0; offset <= len(value)-len(pattern); {
+		index := strings.Index(value[offset:], pattern)
+		if index < 0 {
+			break
+		}
+		absolute := offset + index
+		matches = append(matches, absolute)
+		offset = absolute + 1
+	}
+	return matches
 }
 
 func SearchText(path, query string, regex, caseSensitive, includeHidden bool, maxResults int) (SearchResult, error) {

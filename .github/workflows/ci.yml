@@ -14,11 +14,30 @@ jobs:
         os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.27.0'
           cache: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: browser-extension/package-lock.json
+      - working-directory: browser-extension
+        run: npm ci
+      - working-directory: browser-extension
+        run: npm run build
+      - run: git diff --exit-code -- internal/browser/extension
+      - if: runner.os == 'Windows'
+        uses: dtolnay/rust-toolchain@stable
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/build-native.ps1
+      - if: runner.os == 'Windows'
+        run: cargo fmt --manifest-path native/computer-windows/Cargo.toml --check
+      - if: runner.os == 'Windows'
+        run: cargo clippy --manifest-path native/computer-windows/Cargo.toml --all-targets -- -D warnings
       - run: go test ./...
       - if: runner.os == 'Windows'
         shell: pwsh

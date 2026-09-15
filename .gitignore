@@ -11,6 +11,9 @@
 # Local scratch data
 /tmp/
 /.pytest_cache/
+/browser-extension/node_modules/
+/native/computer-windows/target/
+/internal/computer/worker_windows_*.exe
 
 # Editors and operating systems
 .idea/

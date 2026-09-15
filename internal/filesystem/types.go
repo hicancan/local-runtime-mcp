@@ -43,17 +43,21 @@ type TextWriteResult struct {
 	SHA256  string `json:"sha256"`
 }
 
-type TextEditResult struct {
-	Path         string `json:"path"`
-	Bytes        int    `json:"bytes"`
-	Replacements []int  `json:"replacements"`
-	SHA256       string `json:"sha256"`
+type TextPatchResult struct {
+	Path   string `json:"path"`
+	Bytes  int    `json:"bytes"`
+	Hunks  int    `json:"hunks"`
+	SHA256 string `json:"sha256"`
 }
 
-type TextEdit struct {
-	OldText    string `json:"old_text"`
-	NewText    string `json:"new_text"`
-	ReplaceAll bool   `json:"replace_all,omitempty"`
+// TextPatchHunk identifies one exact edit against the original file. Before
+// and After are context, not replacement text. Old may be empty for an
+// insertion, but then at least one context field is required.
+type TextPatchHunk struct {
+	Before string `json:"before,omitempty"`
+	Old    string `json:"old"`
+	New    string `json:"new"`
+	After  string `json:"after,omitempty"`
 }
 
 type ReadTextOptions struct {
@@ -69,8 +73,8 @@ type WriteTextOptions struct {
 	CreateParents  bool
 }
 
-type EditTextOptions struct {
-	Edits          []TextEdit
+type PatchTextOptions struct {
+	Hunks          []TextPatchHunk
 	ExpectedSHA256 string
 }
 

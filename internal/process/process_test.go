@@ -51,6 +51,27 @@ func TestManagedProcessStdinAndOutputLimit(t *testing.T) {
 	}
 }
 
+func TestPTYProcessLifecycle(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager := NewManager(ctx)
+	result, err := manager.Run(context.Background(), Options{
+		Program: os.Args[0], Args: []string{"-test.run=TestProcessHelper", "--", "delayed"},
+		Environment: map[string]string{"LRMCP_PROCESS_HELPER": "1"}, IOMode: "pty", Columns: 100, Rows: 30, YieldTimeMS: 30,
+	})
+	if err != nil {
+		t.Skipf("PTY unavailable: %v", err)
+	}
+	if !result.Running || result.SessionID == "" || result.IOMode != "pty" {
+		t.Fatalf("initial PTY result = %+v", result)
+	}
+	completed, err := manager.Continue(context.Background(), ContinueOptions{SessionID: result.SessionID, Columns: 120, Rows: 40, YieldTimeMS: 2000})
+	terminalOutput := result.Stdout + completed.Stdout
+	if err != nil || completed.Running || completed.ExitCode != 0 || !strings.Contains(terminalOutput, "first") || !strings.Contains(terminalOutput, "second") || completed.Stderr != "" {
+		t.Fatalf("completed PTY result = %+v, %v", completed, err)
+	}
+}
+
 func TestProcessHelper(t *testing.T) {
 	if os.Getenv("LRMCP_PROCESS_HELPER") != "1" {
 		return

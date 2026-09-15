@@ -21,7 +21,7 @@ import (
 	"github.com/hicancan/local-runtime-mcp/internal/config"
 )
 
-const ExtensionVersion = "5.0.0"
+const ExtensionVersion = "6.0.0"
 
 type Bridge struct {
 	configured bool
@@ -60,16 +60,11 @@ type Tab struct {
 }
 
 type SnapshotElement struct {
-	Ref         string         `json:"ref"`
-	Tag         string         `json:"tag"`
-	Role        string         `json:"role,omitempty"`
-	Name        string         `json:"name,omitempty"`
-	Text        string         `json:"text,omitempty"`
-	Href        string         `json:"href,omitempty"`
-	Placeholder string         `json:"placeholder,omitempty"`
-	Value       string         `json:"value,omitempty"`
-	Disabled    bool           `json:"disabled,omitempty"`
-	Rect        map[string]int `json:"rect,omitempty"`
+	Ref      string `json:"ref"`
+	Role     string `json:"role"`
+	Name     string `json:"name,omitempty"`
+	Value    string `json:"value,omitempty"`
+	Disabled bool   `json:"disabled,omitempty"`
 }
 
 type Snapshot struct {
@@ -110,7 +105,6 @@ type ScreenshotInfo struct {
 type Action struct {
 	Kind         string   `json:"kind" jsonschema:"browser operation to perform"`
 	TabID        int      `json:"tab_id" jsonschema:"positive browser tab ID"`
-	Selector     string   `json:"selector,omitempty" jsonschema:"CSS selector in the top document; prefer ref after a snapshot"`
 	Ref          string   `json:"ref,omitempty" jsonschema:"versioned element reference from a retained browser_snapshot in the current page epoch"`
 	ScreenshotID string   `json:"screenshot_id,omitempty" jsonschema:"viewport screenshot ID required for coordinate targeting"`
 	X            *float64 `json:"x,omitempty" jsonschema:"viewport X coordinate associated with screenshot_id"`
@@ -413,7 +407,7 @@ func validateAction(action Action) error {
 	}
 	targetCount := func() int {
 		count := 0
-		for _, present := range []bool{action.Selector != "", action.Ref != "", action.ScreenshotID != ""} {
+		for _, present := range []bool{action.Ref != "", action.ScreenshotID != ""} {
 			if present {
 				count++
 			}
@@ -432,7 +426,7 @@ func validateAction(action Action) error {
 	switch action.Kind {
 	case "click", "double_click", "hover", "drag":
 		if targetCount() != 1 {
-			return fmt.Errorf("%s requires selector, ref, or screenshot_id coordinates", action.Kind)
+			return fmt.Errorf("%s requires ref or screenshot_id coordinates", action.Kind)
 		}
 		if err := requireScreenshotPoint(); err != nil {
 			return err
@@ -444,7 +438,7 @@ func validateAction(action Action) error {
 		}
 	case "type_text", "set_value":
 		if targetCount() != 1 || action.ScreenshotID != "" {
-			return fmt.Errorf("%s requires selector or ref", action.Kind)
+			return fmt.Errorf("%s requires ref", action.Kind)
 		}
 		if action.Text == "" {
 			return fmt.Errorf("%s requires text", action.Kind)
@@ -454,7 +448,7 @@ func validateAction(action Action) error {
 			return errors.New("press_key requires key")
 		}
 		if targetCount() > 1 || action.ScreenshotID != "" {
-			return errors.New("press_key accepts at most one selector or ref")
+			return errors.New("press_key accepts at most one ref")
 		}
 	case "scroll":
 		if action.ScrollX == 0 && action.ScrollY == 0 {
@@ -468,15 +462,15 @@ func validateAction(action Action) error {
 		}
 	case "select":
 		if targetCount() != 1 || action.ScreenshotID != "" || action.Option == "" {
-			return errors.New("select requires selector or ref and option")
+			return errors.New("select requires ref and option")
 		}
 	case "check":
 		if targetCount() != 1 || action.ScreenshotID != "" || action.Checked == nil {
-			return errors.New("check requires selector or ref and checked")
+			return errors.New("check requires ref and checked")
 		}
 	case "upload_files":
 		if targetCount() != 1 || action.ScreenshotID != "" || len(action.Files) == 0 {
-			return errors.New("upload_files requires selector or ref and files")
+			return errors.New("upload_files requires ref and files")
 		}
 	case "handle_dialog":
 		if action.Accept == nil {

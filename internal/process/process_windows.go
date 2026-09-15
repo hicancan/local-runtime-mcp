@@ -3,9 +3,11 @@
 package process
 
 import (
+	"os"
 	"os/exec"
 	"unsafe"
 
+	pty "github.com/aymanbagabas/go-pty"
 	"golang.org/x/sys/windows"
 )
 
@@ -14,9 +16,31 @@ type windowsProcessControl struct {
 }
 
 func startManaged(command *exec.Cmd) (processControl, error) {
-	job, err := windows.CreateJobObject(nil, nil)
+	job, err := newWindowsJob()
 	if err != nil {
 		return nil, err
+	}
+	if err := command.Start(); err != nil {
+		windows.CloseHandle(job)
+		return nil, err
+	}
+	return assignWindowsJob(job, command.Process)
+}
+
+func preparePTY(*pty.Cmd) {}
+
+func attachManaged(process *os.Process) (processControl, error) {
+	job, err := newWindowsJob()
+	if err != nil {
+		return nil, err
+	}
+	return assignWindowsJob(job, process)
+}
+
+func newWindowsJob() (windows.Handle, error) {
+	job, err := windows.CreateJobObject(nil, nil)
+	if err != nil {
+		return 0, err
 	}
 	information := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
 	information.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
@@ -27,22 +51,21 @@ func startManaged(command *exec.Cmd) (processControl, error) {
 		uint32(unsafe.Sizeof(information)),
 	); err != nil {
 		windows.CloseHandle(job)
-		return nil, err
+		return 0, err
 	}
-	if err := command.Start(); err != nil {
-		windows.CloseHandle(job)
-		return nil, err
-	}
-	processHandle, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(command.Process.Pid))
+	return job, nil
+}
+
+func assignWindowsJob(job windows.Handle, process *os.Process) (processControl, error) {
+	processHandle, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(process.Pid))
 	if err != nil {
-		_ = command.Process.Kill()
+		_ = process.Kill()
 		windows.CloseHandle(job)
 		return nil, err
 	}
 	defer windows.CloseHandle(processHandle)
 	if err := windows.AssignProcessToJobObject(job, processHandle); err != nil {
-		_ = command.Process.Kill()
-		_ = command.Wait()
+		_ = process.Kill()
 		windows.CloseHandle(job)
 		return nil, err
 	}

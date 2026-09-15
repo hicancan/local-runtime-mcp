@@ -14,10 +14,30 @@ func TestWindowsDesktopSmoke(t *testing.T) {
 	if os.Getenv("LRMCP_DESKTOP_SMOKE") != "1" {
 		t.Skip("set LRMCP_DESKTOP_SMOKE=1 in an interactive Windows session")
 	}
-	controller := New()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	controller := New(ctx)
+	defer controller.Close()
 	targets, err := controller.Targets(context.Background())
 	if err != nil {
 		t.Fatalf("window discovery failed: targets=%+v err=%v", targets, err)
+	}
+	var active string
+	for _, target := range targets.Windows {
+		if target.Active {
+			active = target.TargetID
+			break
+		}
+	}
+	if active == "" {
+		t.Fatal("window discovery did not identify the foreground target")
+	}
+	windowImage, windowState, err := controller.State(context.Background(), StateOptions{TargetID: active})
+	if err != nil || len(windowImage) < 8 || windowState.TargetID != active || windowState.StateID == "" {
+		t.Fatalf("foreground WGC/UIA state failed: bytes=%d state=%+v err=%v", len(windowImage), windowState, err)
+	}
+	if len(windowState.Elements) == 0 {
+		t.Fatal("foreground UI Automation projection returned no interactive elements")
 	}
 	data, info, err := controller.State(context.Background(), StateOptions{})
 	if err != nil {

@@ -1,0 +1,12 @@
+{
+  "name": "@local-runtime-mcp/browser-extension",
+  "private": true,
+  "version": "6.0.0",
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/chrome": "0.1.12",
+    "typescript": "6.0.2"
+  }
+}

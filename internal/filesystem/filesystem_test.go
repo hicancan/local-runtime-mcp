@@ -28,14 +28,14 @@ func TestTextLifecycleAndCompareAndSwap(t *testing.T) {
 	if string(unchanged) != "one\ntwo\nthree\n" {
 		t.Fatalf("stale write changed file: %q", unchanged)
 	}
-	edited, err := EditText(path, EditTextOptions{
+	edited, err := PatchText(path, PatchTextOptions{
 		ExpectedSHA256: written.SHA256,
-		Edits:          []TextEdit{{OldText: "one", NewText: "ONE"}, {OldText: "two", NewText: "TWO"}},
+		Hunks:          []TextPatchHunk{{Old: "one", New: "ONE", After: "\n"}, {Before: "one\n", Old: "two", New: "TWO", After: "\nthree"}},
 	})
-	if err != nil || len(edited.Replacements) != 2 || edited.Replacements[0] != 1 || edited.Replacements[1] != 1 {
+	if err != nil || edited.Hunks != 2 {
 		t.Fatalf("batch edit = %+v, %v", edited, err)
 	}
-	if _, err := EditText(path, EditTextOptions{Edits: []TextEdit{{OldText: "ONE", NewText: "changed"}, {OldText: "missing", NewText: "x"}}}); err == nil {
+	if _, err := PatchText(path, PatchTextOptions{ExpectedSHA256: edited.SHA256, Hunks: []TextPatchHunk{{Old: "ONE", New: "changed", After: "\n"}, {Old: "missing", New: "x", After: "\n"}}}); err == nil {
 		t.Fatal("partially invalid batch edit succeeded")
 	}
 	unchanged, _ = os.ReadFile(path)
@@ -57,12 +57,38 @@ func TestMutationsRejectFinalSymlink(t *testing.T) {
 	if _, err := WriteText(link, "changed", WriteTextOptions{}); err == nil {
 		t.Fatal("write followed a final symbolic link")
 	}
-	if _, err := EditText(link, EditTextOptions{Edits: []TextEdit{{OldText: "original", NewText: "changed"}}}); err == nil {
+	hash, _ := hashFile(target)
+	if _, err := PatchText(link, PatchTextOptions{ExpectedSHA256: hash, Hunks: []TextPatchHunk{{Old: "original", New: "changed"}}}); err == nil {
 		t.Fatal("edit followed a final symbolic link")
 	}
 	data, err := os.ReadFile(target)
 	if err != nil || string(data) != "original" {
 		t.Fatalf("symlink mutation changed target: %q, %v", data, err)
+	}
+}
+
+func TestPatchUsesOneImmutableBaseAndRejectsAmbiguity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "patch.txt")
+	data := "alpha\nbeta\ngamma\n"
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := PatchText(path, PatchTextOptions{ExpectedSHA256: hashBytes([]byte(data)), Hunks: []TextPatchHunk{
+		{Before: "alpha\n", Old: "beta", New: "BETA", After: "\ngamma"},
+		{Before: "gamma", Old: "", New: "!", After: "\n"},
+	}})
+	if err != nil || result.Hunks != 2 {
+		t.Fatalf("patch = %+v, %v", result, err)
+	}
+	got, _ := os.ReadFile(path)
+	if string(got) != "alpha\nBETA\ngamma!\n" {
+		t.Fatalf("patched content = %q", got)
+	}
+	if _, err := PatchText(path, PatchTextOptions{ExpectedSHA256: result.SHA256, Hunks: []TextPatchHunk{{Old: "a", New: "x"}}}); err == nil {
+		t.Fatal("ambiguous patch succeeded")
+	}
+	if _, err := PatchText(path, PatchTextOptions{Hunks: []TextPatchHunk{{Old: "alpha", New: "x"}}}); err == nil {
+		t.Fatal("patch without expected_sha256 succeeded")
 	}
 }
 

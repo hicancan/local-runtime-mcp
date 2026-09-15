@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            executable: lrmcp.exe
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            executable: lrmcp
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            executable: lrmcp
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+            executable: lrmcp
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            executable: lrmcp
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.0'
+          cache: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: browser-extension/package-lock.json
+      - working-directory: browser-extension
+        run: npm ci
+      - working-directory: browser-extension
+        run: npm run build
+      - run: git diff --exit-code -- internal/browser/extension
+      - if: runner.os == 'Windows'
+        uses: dtolnay/rust-toolchain@stable
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/build-native.ps1
+      - run: go test ./...
+      - name: Build
+        shell: pwsh
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          $name = "local-runtime-mcp_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          New-Item -ItemType Directory -Path "dist/$name" -Force | Out-Null
+          go build -trimpath -ldflags "-s -w" -o "dist/$name/${{ matrix.executable }}" ./cmd/lrmcp
+          Copy-Item README.md,LICENSE "dist/$name/"
+          Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: '*-*'
+          merge-multiple: true
+          path: dist
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/*.zip --verify-tag --generate-notes --title "Local Runtime MCP ${{ github.ref_name }}"

@@ -13,7 +13,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const Version = "5.0.0"
+const Version = "6.0.0"
 
 const instructions = "Local Runtime MCP exposes the machine where lrmcp is running. Filesystem and image tools accept direct absolute paths or paths relative to the server process. Process tools execute installed programs directly without shell parsing and return sessions for longer programs. Browser tools use the bundled Chromium extension over an authenticated loopback bridge. Computer tools operate the current interactive desktop and target open windows. Prefer browser tools for web pages, computer tools for native UI, and native image-content tools for images and screenshots."
 
@@ -27,13 +27,16 @@ func New(ctx context.Context, browserBridge *browser.Bridge, computerController 
 	mcp.AddTool(server, tool("filesystem_stat", "Inspect path", "Inspect a direct path without following symbolic links; optionally calculate a regular file's SHA-256.", true, false, true, false), filesystemStat)
 	mcp.AddTool(server, tool("filesystem_read_text", "Read text file", "Read bounded complete UTF-8 lines from a direct machine path, starting at any one-based line.", true, false, true, false), filesystemReadText)
 	mcp.AddTool(server, tool("filesystem_write_text", "Write text file", "Atomically create or replace a complete UTF-8 text file, optionally requiring an expected SHA-256.", false, true, true, false), filesystemWriteText)
-	mcp.AddTool(server, tool("filesystem_edit_text", "Edit text file", "Validate ordered exact UTF-8 replacements in memory and commit all of them together.", false, true, true, false), filesystemEditText)
+	mcp.AddTool(server, tool("filesystem_patch_text", "Patch text file", "Apply uniquely anchored, non-overlapping UTF-8 hunks against one expected file version and commit them atomically.", false, true, true, false), filesystemPatchText)
 	mcp.AddTool(server, tool("filesystem_search_text", "Search text files", "Search bounded UTF-8 files below a direct path using literal text or a Go regular expression.", true, false, true, false), filesystemSearchText)
 	mcp.AddTool(server, tool("image_read", "Read image", "Return a direct PNG, JPEG, GIF, or WebP path as native MCP image content with metadata.", true, false, true, false), imageRead)
 
 	processManager := runtimeprocess.NewManager(ctx)
-	mcp.AddTool(server, tool("process_run", "Run process", "Start an installed program directly with an argument array. Completed programs return their result; longer programs return a session ID for process_continue.", false, true, false, true), processRun(processManager))
-	mcp.AddTool(server, tool("process_continue", "Continue process", "Read incremental output, write or close stdin, wait for, or terminate a process session returned by process_run.", false, true, false, true), processContinue(processManager))
+	processRunTool := inputTool[processRunInput](tool("process_run", "Run process", "Start a program directly in pipe or interactive PTY mode. Completed programs return their result; longer programs return a session ID.", false, true, false, true), func(schema *jsonschema.Schema) {
+		schema.Properties["io_mode"].Enum = enum("pipe", "pty")
+	})
+	mcp.AddTool(server, processRunTool, processRun(processManager))
+	mcp.AddTool(server, tool("process_continue", "Continue process", "Read incremental output, write or close pipe stdin, resize a PTY, wait for, or terminate a process session.", false, true, false, true), processContinue(processManager))
 
 	registerBrowserTools(server, browserBridge)
 	registerComputerTools(server, computerController)
@@ -123,14 +126,14 @@ func filesystemWriteText(_ context.Context, _ *mcp.CallToolRequest, in writeText
 	return nil, result, err
 }
 
-type editTextInput struct {
-	Path           string                `json:"path" jsonschema:"absolute text-file path or path relative to the server process"`
-	Edits          []filesystem.TextEdit `json:"edits" jsonschema:"ordered exact replacements validated in memory and committed together"`
-	ExpectedSHA256 string                `json:"expected_sha256,omitempty" jsonschema:"edit only when the existing file has this SHA-256"`
+type patchTextInput struct {
+	Path           string                     `json:"path" jsonschema:"absolute text-file path or path relative to the server process"`
+	Hunks          []filesystem.TextPatchHunk `json:"hunks" jsonschema:"exact contextual hunks, all located against the same original file"`
+	ExpectedSHA256 string                     `json:"expected_sha256" jsonschema:"required SHA-256 of the original file"`
 }
 
-func filesystemEditText(_ context.Context, _ *mcp.CallToolRequest, in editTextInput) (*mcp.CallToolResult, filesystem.TextEditResult, error) {
-	result, err := filesystem.EditText(in.Path, filesystem.EditTextOptions{Edits: in.Edits, ExpectedSHA256: in.ExpectedSHA256})
+func filesystemPatchText(_ context.Context, _ *mcp.CallToolRequest, in patchTextInput) (*mcp.CallToolResult, filesystem.TextPatchResult, error) {
+	result, err := filesystem.PatchText(in.Path, filesystem.PatchTextOptions{Hunks: in.Hunks, ExpectedSHA256: in.ExpectedSHA256})
 	return nil, result, err
 }
 
@@ -149,13 +152,19 @@ func filesystemSearchText(_ context.Context, _ *mcp.CallToolRequest, in searchTe
 }
 
 type imageReadInput struct {
-	Path      string `json:"path" jsonschema:"absolute image path or path relative to the server process"`
-	MaxBytes  int    `json:"max_bytes,omitempty" jsonschema:"maximum complete image size from 1 to 67108864; defaults to 10485760"`
-	MaxPixels int    `json:"max_pixels,omitempty" jsonschema:"maximum width times height from 1 to 250000000; defaults to 40000000"`
+	Path       string `json:"path" jsonschema:"absolute image path or path relative to the server process"`
+	MaxBytes   int    `json:"max_bytes,omitempty" jsonschema:"maximum complete image size from 1 to 67108864; defaults to 10485760"`
+	MaxPixels  int    `json:"max_pixels,omitempty" jsonschema:"maximum width times height from 1 to 250000000; defaults to 40000000"`
+	CropX      int    `json:"crop_x,omitempty" jsonschema:"non-negative source X coordinate; requires crop_width and crop_height"`
+	CropY      int    `json:"crop_y,omitempty" jsonschema:"non-negative source Y coordinate; requires crop_width and crop_height"`
+	CropWidth  int    `json:"crop_width,omitempty" jsonschema:"positive source crop width; requires crop_height"`
+	CropHeight int    `json:"crop_height,omitempty" jsonschema:"positive source crop height; requires crop_width"`
+	MaxWidth   int    `json:"max_width,omitempty" jsonschema:"maximum projected width from 1 to 32768; aspect ratio is preserved"`
+	MaxHeight  int    `json:"max_height,omitempty" jsonschema:"maximum projected height from 1 to 32768; aspect ratio is preserved"`
 }
 
 func imageRead(_ context.Context, _ *mcp.CallToolRequest, in imageReadInput) (*mcp.CallToolResult, runtimeimage.ReadResult, error) {
-	data, metadata, err := runtimeimage.Read(in.Path, in.MaxBytes, in.MaxPixels)
+	data, metadata, err := runtimeimage.Read(in.Path, runtimeimage.ReadOptions{MaxBytes: in.MaxBytes, MaxPixels: in.MaxPixels, CropX: in.CropX, CropY: in.CropY, CropWidth: in.CropWidth, CropHeight: in.CropHeight, MaxWidth: in.MaxWidth, MaxHeight: in.MaxHeight})
 	if err != nil {
 		return nil, runtimeimage.ReadResult{}, err
 	}
@@ -173,6 +182,9 @@ type processRunInput struct {
 	TimeoutSeconds int               `json:"timeout_seconds,omitempty" jsonschema:"lifetime timeout from 1 to 86400 seconds; defaults to 300"`
 	MaxOutputBytes int               `json:"max_output_bytes,omitempty" jsonschema:"separate retained stdout and stderr limit from 1 to 16777216 bytes; defaults to 1048576"`
 	YieldTimeMS    int               `json:"yield_time_ms,omitempty" jsonschema:"initial wait from 1 to 60000 milliseconds; defaults to 10000"`
+	IOMode         string            `json:"io_mode,omitempty" jsonschema:"pipe for separate stdout and stderr, or pty for one interactive terminal stream; defaults to pipe"`
+	Columns        int               `json:"columns,omitempty" jsonschema:"PTY width from 1 to 1000; defaults to 80"`
+	Rows           int               `json:"rows,omitempty" jsonschema:"PTY height from 1 to 1000; defaults to 25"`
 }
 
 func processRun(manager *runtimeprocess.Manager) func(context.Context, *mcp.CallToolRequest, processRunInput) (*mcp.CallToolResult, runtimeprocess.Result, error) {
@@ -181,6 +193,7 @@ func processRun(manager *runtimeprocess.Manager) func(context.Context, *mcp.Call
 			Program: in.Program, Args: in.Args, Directory: in.Directory, Environment: in.Environment,
 			Stdin: in.Stdin, KeepStdinOpen: in.KeepStdinOpen, TimeoutSeconds: in.TimeoutSeconds,
 			MaxOutputBytes: in.MaxOutputBytes, YieldTimeMS: in.YieldTimeMS,
+			IOMode: in.IOMode, Columns: in.Columns, Rows: in.Rows,
 		})
 		if err != nil {
 			return nil, result, fmt.Errorf("run process: %w", err)
@@ -195,12 +208,14 @@ type processContinueInput struct {
 	CloseStdin  bool   `json:"close_stdin,omitempty" jsonschema:"close the process stdin after writing"`
 	Terminate   bool   `json:"terminate,omitempty" jsonschema:"terminate the complete process tree"`
 	YieldTimeMS int    `json:"yield_time_ms,omitempty" jsonschema:"wait for output or exit from 1 to 60000 milliseconds; defaults to 1000"`
+	Columns     int    `json:"columns,omitempty" jsonschema:"new PTY width from 1 to 1000; requires rows"`
+	Rows        int    `json:"rows,omitempty" jsonschema:"new PTY height from 1 to 1000; requires columns"`
 }
 
 func processContinue(manager *runtimeprocess.Manager) func(context.Context, *mcp.CallToolRequest, processContinueInput) (*mcp.CallToolResult, runtimeprocess.Result, error) {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in processContinueInput) (*mcp.CallToolResult, runtimeprocess.Result, error) {
 		result, err := manager.Continue(ctx, runtimeprocess.ContinueOptions{
-			SessionID: in.SessionID, Stdin: in.Stdin, CloseStdin: in.CloseStdin, Terminate: in.Terminate, YieldTimeMS: in.YieldTimeMS,
+			SessionID: in.SessionID, Stdin: in.Stdin, CloseStdin: in.CloseStdin, Terminate: in.Terminate, YieldTimeMS: in.YieldTimeMS, Columns: in.Columns, Rows: in.Rows,
 		})
 		if err != nil {
 			return nil, result, fmt.Errorf("continue process: %w", err)

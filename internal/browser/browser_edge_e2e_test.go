@@ -29,9 +29,15 @@ func TestEdgeExtensionEndToEnd(t *testing.T) {
 		t.Skip("Microsoft Edge was not found")
 	}
 
+	child := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(writer, `<!doctype html><title>child</title><p id="status">child ready</p><button id="child" onclick="document.querySelector('#status').textContent='child clicked'">Child action</button>`)
+	}))
+	defer child.Close()
+	childURL := strings.Replace(child.URL, "127.0.0.1", "localhost", 1)
 	page := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprint(writer, `<!doctype html><title>LRMCP E2E</title><main><h1>ready</h1><button id="button" onclick="document.querySelector('h1').textContent='clicked'">Run</button></main>`)
+		fmt.Fprintf(writer, `<!doctype html><title>LRMCP E2E</title><main><h1>ready</h1><button id="button" onclick="document.querySelector('h1').textContent='clicked'">Run</button><iframe src=%q></iframe></main>`, childURL)
 	}))
 	defer page.Close()
 
@@ -109,8 +115,35 @@ func TestEdgeExtensionEndToEnd(t *testing.T) {
 		}
 		t.Fatal(err)
 	}
-	if snapshot.PageEpoch == "" || !strings.Contains(snapshot.Text, "ready") || len(snapshot.Elements) != 1 {
+	if snapshot.PageEpoch == "" || !strings.Contains(snapshot.Text, "ready") || !strings.Contains(snapshot.Text, "Child action") || len(snapshot.Elements) < 2 {
 		t.Fatalf("unexpected initial snapshot: %+v", snapshot)
+	}
+	var childRef string
+	for _, element := range snapshot.Elements {
+		if element.Name == "Child action" {
+			childRef = element.Ref
+			break
+		}
+	}
+	if childRef == "" {
+		t.Fatalf("cross-origin child button is missing from AX snapshot: %+v", snapshot.Elements)
+	}
+	if _, err := bridge.Act(callContext, Action{Kind: "click", TabID: tabID, Ref: childRef}); err != nil {
+		t.Fatalf("cross-origin child action failed: %v", err)
+	}
+	afterChild, err := bridge.Snapshot(callContext, tabID, 20, 1000)
+	if err != nil || !strings.Contains(afterChild.Text, "child clicked") || afterChild.PageEpoch == snapshot.PageEpoch {
+		t.Fatalf("child action snapshot=%+v err=%v", afterChild, err)
+	}
+	var runRef string
+	for _, element := range afterChild.Elements {
+		if element.Name == "Run" {
+			runRef = element.Ref
+			break
+		}
+	}
+	if runRef == "" {
+		t.Fatalf("main-frame Run button is missing after child action: %+v", afterChild.Elements)
 	}
 	image, screenshot, err := bridge.Screenshot(callContext, ScreenshotOptions{TabID: tabID})
 	if err != nil {
@@ -119,10 +152,10 @@ func TestEdgeExtensionEndToEnd(t *testing.T) {
 	if len(image) < 8 || string(image[:8]) != "\x89PNG\r\n\x1a\n" || screenshot.ScreenshotID == "" {
 		t.Fatalf("unexpected screenshot: %+v bytes=%d", screenshot, len(image))
 	}
-	if len(image) < 8 || string(image[:8]) != "\x89PNG\r\n\x1a\n" || screenshot.PageEpoch != snapshot.PageEpoch || screenshot.ScreenshotID == "" {
-		t.Fatalf("snapshot/screenshot epoch mismatch: snapshot=%+v screenshot=%+v bytes=%d", snapshot, screenshot, len(image))
+	if len(image) < 8 || string(image[:8]) != "\x89PNG\r\n\x1a\n" || screenshot.PageEpoch != afterChild.PageEpoch || screenshot.ScreenshotID == "" {
+		t.Fatalf("snapshot/screenshot epoch mismatch: snapshot=%+v screenshot=%+v bytes=%d", afterChild, screenshot, len(image))
 	}
-	if _, err := bridge.Act(callContext, Action{Kind: "click", TabID: tabID, Ref: snapshot.Elements[0].Ref}); err != nil {
+	if _, err := bridge.Act(callContext, Action{Kind: "click", TabID: tabID, Ref: runRef}); err != nil {
 		t.Fatal(err)
 	}
 	zero := 0.0

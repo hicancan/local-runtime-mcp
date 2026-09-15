@@ -20,9 +20,9 @@ func registerBrowserTools(server *mcp.Server, bridge *browser.Bridge) {
 		schema.Properties["tab_id"].Minimum = jsonschema.Ptr(1.0)
 	})
 	mcp.AddTool(server, navigationTool, browserNavigate(bridge))
-	mcp.AddTool(server, tool("browser_snapshot", "Read browser page", "Return bounded visible text and versioned references for interactive elements, including open shadow roots and accessible same-origin frames.", true, false, true, true), browserSnapshot(bridge))
+	mcp.AddTool(server, tool("browser_snapshot", "Read browser page", "Return bounded accessibility text and versioned references for interactive elements across the main document and cross-origin child frames.", true, false, true, true), browserSnapshot(bridge))
 	mcp.AddTool(server, tool("browser_screenshot", "Capture browser page", "Return a viewport, full-page, or clipped native PNG. Viewport screenshots yield IDs for coordinate actions.", true, false, true, true), browserScreenshot(bridge))
-	browserActionTool := inputTool[browser.Action](tool("browser_action", "Act on browser page", "Use one versioned element ref, CSS selector, or viewport screenshot coordinate target to control a page; also supports keys, scrolling, files, dialogs, and JavaScript.", false, true, false, true), func(schema *jsonschema.Schema) {
+	browserActionTool := inputTool[browser.Action](tool("browser_action", "Act on browser page", "Use one accessibility-tree ref or one versioned viewport screenshot coordinate; also supports keys, scrolling, files, dialogs, and explicit JavaScript escape-hatch evaluation.", false, true, false, true), func(schema *jsonschema.Schema) {
 		schema.Properties["kind"].Enum = enum("click", "double_click", "hover", "drag", "type_text", "set_value", "press_key", "scroll", "select", "check", "upload_files", "handle_dialog", "evaluate")
 		schema.Properties["button"].Enum = enum("left", "middle", "right")
 		schema.Properties["tab_id"].Minimum = jsonschema.Ptr(1.0)
@@ -31,12 +31,11 @@ func registerBrowserTools(server *mcp.Server, bridge *browser.Bridge) {
 }
 
 func registerComputerTools(server *mcp.Server, controller computer.Controller) {
-	mcp.AddTool(server, tool("computer_targets", "List desktop targets", "List currently open top-level windows that can be targeted. This does not list installed applications.", true, false, true, false), computerTargets(controller))
-	mcp.AddTool(server, tool("computer_state", "Read desktop state", "Return the current virtual desktop or foreground selected window as native PNG plus a state ID.", true, false, true, false), computerState(controller))
-	computerActionTool := inputTool[computer.Action](tool("computer_action", "Control desktop", "Activate a window, or act on the exact foreground desktop state returned by computer_state. Every non-activation action requires state_id and invalidates all prior states.", false, true, false, false), func(schema *jsonschema.Schema) {
+	mcp.AddTool(server, tool("computer_targets", "List desktop targets", "List open top-level windows with opaque, validated target IDs. This does not list installed applications.", true, false, true, false), computerTargets(controller))
+	mcp.AddTool(server, tool("computer_state", "Read desktop state", "Return a WGC native PNG plus one state ID and bounded UI Automation references for the current desktop or selected foreground target.", true, false, true, false), computerState(controller))
+	computerActionTool := inputTool[computer.Action](tool("computer_action", "Control desktop", "Activate a target, or use coordinates or a UI Automation ref from the exact foreground computer_state. Every action invalidates every prior state.", false, true, false, false), func(schema *jsonschema.Schema) {
 		schema.Properties["kind"].Enum = enum("activate", "move", "click", "double_click", "drag", "type_text", "set_value", "press_key", "scroll")
 		schema.Properties["button"].Enum = enum("left", "middle", "right")
-		schema.Properties["window_id"].Minimum = jsonschema.Ptr(0.0)
 	})
 	mcp.AddTool(server, computerActionTool, computerAction(controller))
 }

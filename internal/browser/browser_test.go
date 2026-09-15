@@ -63,8 +63,8 @@ func TestBridgeRoundTrip(t *testing.T) {
 
 func fakeExtension(ctx context.Context, address string, errorsChannel chan<- error) {
 	for {
-		body := bytes.NewBufferString(`{"instance_id":"test-instance","browser":"test","extension_version":"5.0.0"}`)
-		request, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+address+"/v1/poll", body)
+		body, _ := json.Marshal(Peer{InstanceID: "test-instance", Browser: "test", ExtensionVersion: ExtensionVersion})
+		request, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+address+"/v1/poll", bytes.NewReader(body))
 		request.Header.Set("Authorization", "Bearer "+testToken)
 		request.Header.Set("Content-Type", "application/json")
 		response, err := http.DefaultClient.Do(request)
@@ -232,7 +232,7 @@ func TestActionValidation(t *testing.T) {
 	checked := true
 	accepted := false
 	zero, two, three := 0.0, 2.0, 3.0
-	valid := []Action{{Kind: "click", TabID: 1, Ref: "q1:e1"}, {Kind: "double_click", TabID: 1, ScreenshotID: "p1", X: &zero, Y: &zero}, {Kind: "hover", TabID: 1, Selector: "button"}, {Kind: "drag", TabID: 1, Ref: "q1:e1", ToX: &two, ToY: &three}, {Kind: "type_text", TabID: 1, Selector: "input", Text: "x"}, {Kind: "set_value", TabID: 1, Ref: "q1:e1", Text: "x"}, {Kind: "press_key", TabID: 1, Key: "Control+L"}, {Kind: "scroll", TabID: 1, ScrollY: 500}, {Kind: "select", TabID: 1, Selector: "select", Option: "one"}, {Kind: "check", TabID: 1, Ref: "q1:e1", Checked: &checked}, {Kind: "upload_files", TabID: 1, Selector: "input", Files: []string{"C:/x.txt"}}, {Kind: "handle_dialog", TabID: 1, Accept: &accepted}, {Kind: "evaluate", TabID: 1, Script: "document.title"}}
+	valid := []Action{{Kind: "click", TabID: 1, Ref: "q1:e1"}, {Kind: "double_click", TabID: 1, ScreenshotID: "p1", X: &zero, Y: &zero}, {Kind: "hover", TabID: 1, Ref: "q1:e1"}, {Kind: "drag", TabID: 1, Ref: "q1:e1", ToX: &two, ToY: &three}, {Kind: "type_text", TabID: 1, Ref: "q1:e1", Text: "x"}, {Kind: "set_value", TabID: 1, Ref: "q1:e1", Text: "x"}, {Kind: "press_key", TabID: 1, Key: "Control+L"}, {Kind: "scroll", TabID: 1, ScrollY: 500}, {Kind: "select", TabID: 1, Ref: "q1:e1", Option: "one"}, {Kind: "check", TabID: 1, Ref: "q1:e1", Checked: &checked}, {Kind: "upload_files", TabID: 1, Ref: "q1:e1", Files: []string{"C:/x.txt"}}, {Kind: "handle_dialog", TabID: 1, Accept: &accepted}, {Kind: "evaluate", TabID: 1, Script: "document.title"}}
 	for _, action := range valid {
 		if err := validateAction(action); err != nil {
 			t.Errorf("%+v: %v", action, err)
@@ -244,7 +244,7 @@ func TestActionValidation(t *testing.T) {
 	if err := validateAction(Action{Kind: "check", TabID: 1, Ref: "q1:e1"}); err == nil {
 		t.Fatal("check without checked should fail")
 	}
-	if err := validateAction(Action{Kind: "click", TabID: 1, Ref: "q1:e1", Selector: "button"}); err == nil {
+	if err := validateAction(Action{Kind: "click", TabID: 1, Ref: "q1:e1", ScreenshotID: "p1", X: &zero, Y: &zero}); err == nil {
 		t.Fatal("ambiguous target should fail")
 	}
 }
