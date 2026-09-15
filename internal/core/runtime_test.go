@@ -19,7 +19,12 @@ import (
 func testRuntime(t *testing.T) (*Runtime, string) {
 	t.Helper()
 	root := t.TempDir()
-	return New(config.Config{Roots: map[string]config.Root{"test": {Path: root}}}), root
+	runtime := New(config.Config{Roots: map[string]config.Root{"test": {Path: root}}})
+	canonical, err := runtime.Root("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return runtime, canonical.Path
 }
 
 func TestResolveRejectsRootEscape(t *testing.T) {

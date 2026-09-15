@@ -18,7 +18,19 @@ type Runtime struct {
 func New(cfg config.Config) *Runtime {
 	roots := make(map[string]RootInfo, len(cfg.Roots))
 	for name, root := range cfg.Roots {
-		roots[name] = RootInfo{Name: name, Path: root.Path, Description: root.Description}
+		// Config.Load already canonicalizes roots. Keep New safe for callers that
+		// construct Config directly (notably embedders and tests), too. On macOS,
+		// temporary directories are commonly exposed through /var while resolving
+		// to /private/var; comparing one spelling with the other would otherwise
+		// reject paths that are actually inside the configured root.
+		path := root.Path
+		if abs, err := filepath.Abs(path); err == nil {
+			path = abs
+		}
+		if canonical, err := filepath.EvalSymlinks(path); err == nil {
+			path = canonical
+		}
+		roots[name] = RootInfo{Name: name, Path: filepath.Clean(path), Description: root.Description}
 	}
 	return &Runtime{roots: roots}
 }

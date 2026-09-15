@@ -21,8 +21,12 @@ func TestLoadResolvesRelativeRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cfg.Roots["demo"].Path; got != root {
-		t.Fatalf("path = %q, want %q", got, root)
+	want, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Roots["demo"].Path; got != want {
+		t.Fatalf("path = %q, want %q", got, want)
 	}
 }
 
@@ -37,8 +41,12 @@ func TestLoadExpandsEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Roots["demo"].Path != root {
-		t.Fatalf("path = %q, want %q", cfg.Roots["demo"].Path, root)
+	want, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Roots["demo"].Path != want {
+		t.Fatalf("path = %q, want %q", cfg.Roots["demo"].Path, want)
 	}
 }
 
@@ -111,8 +119,12 @@ func TestLoadDefaultsToCurrentDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cfg.Roots["default"].Path; got != root {
-		t.Fatalf("path = %q, want %q", got, root)
+	want, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Roots["default"].Path; got != want {
+		t.Fatalf("path = %q, want %q", got, want)
 	}
 }
 
