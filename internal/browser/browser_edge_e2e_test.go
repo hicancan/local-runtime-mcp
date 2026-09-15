@@ -34,7 +34,7 @@ func TestEdgeExtensionEndToEnd(t *testing.T) {
 		fmt.Fprint(writer, `<!doctype html><title>child</title><p id="status">child ready</p><button id="child" onclick="document.querySelector('#status').textContent='child clicked'">Child action</button>`)
 	}))
 	defer child.Close()
-	childURL := strings.Replace(child.URL, "127.0.0.1", "localhost", 1)
+	childURL := strings.Replace(child.URL, "127.0.0.1", "child.lrmcp.invalid", 1)
 	page := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprintf(writer, `<!doctype html><title>LRMCP E2E</title><main><h1>ready</h1><button id="button" onclick="document.querySelector('h1').textContent='clicked'">Run</button><iframe src=%q></iframe></main>`, childURL)
@@ -60,6 +60,7 @@ func TestEdgeExtensionEndToEnd(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "edge.log")
 	command := exec.Command(edge,
 		"--headless=new", "--disable-gpu", "--silent-debugger-extension-api", "--no-first-run", "--no-default-browser-check", "--enable-logging", "--v=1", "--log-file="+logPath,
+		"--host-resolver-rules=MAP child.lrmcp.invalid 127.0.0.1",
 		"--user-data-dir="+profile,
 		"--disable-extensions-except="+extension,
 		"--load-extension="+extension,

@@ -39,7 +39,8 @@ chrome.debugger.onEvent.addListener((source, method, rawParams) => {
     if (!sessions) childSessions.set(source.tabId, sessions = new Set());
     sessions.add(params.sessionId);
     sendCDP({ tabId: source.tabId, sessionId: params.sessionId }, 'Target.setAutoAttach', {
-      autoAttach: true, waitForDebuggerOnStart: false, flatten: true
+      autoAttach: true, waitForDebuggerOnStart: false, flatten: true,
+      filter: [{ type: 'iframe', exclude: false }]
     }).catch(() => {});
   } else if (method === 'Target.detachedFromTarget' && params.sessionId) {
     childSessions.get(source.tabId)?.delete(params.sessionId);
@@ -483,7 +484,10 @@ async function attach(tabId: number) {
   }
   attachedTabs.add(tabId);
   childSessions.set(tabId, new Set());
-  await sendCDP({ tabId }, 'Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true });
+  await sendCDP({ tabId }, 'Target.setAutoAttach', {
+    autoAttach: true, waitForDebuggerOnStart: false, flatten: true,
+    filter: [{ type: 'iframe', exclude: false }]
+  });
 }
 
 async function waitForLoad(tabId: number) {
