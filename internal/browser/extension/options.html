@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Local Runtime MCP Browser Bridge</title>
+    <style>
+      body { font: 14px system-ui, sans-serif; max-width: 640px; margin: 32px auto; padding: 0 20px; color: #202124; }
+      label { display: block; margin: 18px 0 6px; font-weight: 600; }
+      input { box-sizing: border-box; width: 100%; padding: 9px; }
+      button { margin-top: 20px; padding: 9px 18px; }
+      #status { margin-left: 12px; }
+      code { background: #f1f3f4; padding: 2px 5px; }
+    </style>
+  </head>
+  <body>
+    <h1>Local Runtime MCP Browser Bridge</h1>
+    <p>Enter the loopback address and token from your <code>lrmcp</code> configuration. The token never leaves this browser profile except when authenticating to that local address.</p>
+    <label for="address">Bridge address</label>
+    <input id="address" value="127.0.0.1:9315" autocomplete="off">
+    <label for="token">Bridge token</label>
+    <input id="token" type="password" autocomplete="off">
+    <button id="save">Save and connect</button><span id="status"></span>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

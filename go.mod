@@ -1,10 +1,12 @@
-module github.com/hicancan/workspace-mcp
+module github.com/hicancan/local-runtime-mcp
 
-go 1.26.2
+go 1.27.0
 
 require (
-	github.com/modelcontextprotocol/go-sdk v1.7.0
-	github.com/openai/tunnel-client v0.0.12
+	github.com/kbinani/screenshot v0.0.0-20250624051815-089614a94018
+	github.com/modelcontextprotocol/go-sdk v1.8.0
+	github.com/openai/tunnel-client v0.0.14
+	golang.org/x/image v0.46.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -14,13 +16,17 @@ require (
 	github.com/buger/jsonparser v1.1.2 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
+	github.com/gen2brain/shm v0.1.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/godbus/dbus/v5 v5.1.0 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/grafana/regexp v0.0.0-20240518133315-a468a5bfb3bc // indirect
 	github.com/invopop/jsonschema v0.13.0 // indirect
+	github.com/jezek/xgb v1.1.1 // indirect
 	github.com/jpillora/backoff v1.0.0 // indirect
+	github.com/lxn/win v0.0.0-20210218163916-a377121e959e // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/panjf2000/ants/v2 v2.11.3 // indirect
@@ -50,7 +56,7 @@ require (
 	golang.org/x/net v0.43.0 // indirect
 	golang.org/x/oauth2 v0.35.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.41.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	google.golang.org/protobuf v1.36.8 // indirect
 )

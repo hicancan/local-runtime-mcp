@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Local Runtime MCP Browser Bridge",
+  "version": "2.0.0",
+  "description": "Lets Local Runtime MCP control the current Chromium browser through an authenticated local bridge.",
+  "permissions": [
+    "activeTab",
+    "debugger",
+    "downloads",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "service_worker": "service_worker.js",
+    "type": "module"
+  },
+  "options_page": "options.html",
+  "action": {
+    "default_title": "Local Runtime MCP Browser Bridge"
+  }
+}

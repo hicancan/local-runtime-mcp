@@ -8,47 +8,47 @@ import (
 	"image/color"
 	"image/png"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/hicancan/workspace-mcp/internal/config"
-	"github.com/hicancan/workspace-mcp/internal/workspace"
+	"github.com/hicancan/local-runtime-mcp/internal/browser"
+	"github.com/hicancan/local-runtime-mcp/internal/config"
+	"github.com/hicancan/local-runtime-mcp/internal/core"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 type annotationExpectation struct {
-	readOnly    bool
-	destructive bool
-	idempotent  bool
-	openWorld   bool
+	readOnly, destructive, idempotent, openWorld bool
 }
 
-func TestToolCatalogAndAnnotations(t *testing.T) {
+func TestToolCatalogAndIdentity(t *testing.T) {
 	session := connect(t, t.TempDir())
-	if resources := session.InitializeResult().Capabilities.Resources; resources != nil {
-		t.Fatalf("resources capability must be absent: %+v", resources)
+	initialized := session.InitializeResult()
+	if initialized.ServerInfo.Name != "local-runtime-mcp" || initialized.ServerInfo.Version != Version {
+		t.Fatalf("unexpected identity: %+v", initialized.ServerInfo)
+	}
+	if !strings.HasPrefix(initialized.Instructions, "Local Runtime MCP operates on the machine") {
+		t.Fatalf("unexpected instructions: %q", initialized.Instructions)
+	}
+	if initialized.Capabilities.Resources != nil {
+		t.Fatalf("resources capability must be absent: %+v", initialized.Capabilities.Resources)
 	}
 	listed, err := session.ListTools(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	expected := map[string]annotationExpectation{
-		"workspace_list": {true, false, true, false},
-		"workspace_info": {true, false, true, false},
-		"file_tree":      {true, false, true, false},
-		"file_info":      {true, false, true, false},
-		"file_read":      {true, false, true, false},
-		"file_write":     {false, true, true, false},
-		"image_read":     {true, false, true, false},
-		"file_search":    {true, false, true, false},
-		"git_status":     {true, false, true, false},
-		"git_diff":       {true, false, true, false},
-		"git_pull":       {false, true, false, false},
-		"git_commit":     {false, false, false, false},
-		"git_push":       {false, true, false, false},
-		"exec":           {false, true, false, true},
+		"filesystem_roots": {true, false, true, false}, "filesystem_list": {true, false, true, false},
+		"filesystem_stat": {true, false, true, false}, "filesystem_read_text": {true, false, true, false},
+		"filesystem_write_text": {false, true, true, false}, "filesystem_edit_text": {false, true, true, false},
+		"filesystem_search_text": {true, false, true, false}, "image_read": {true, false, true, false},
+		"process_run": {false, true, false, true}, "browser_status": {true, false, true, false},
+		"browser_tabs": {true, false, true, false}, "browser_open": {false, false, false, true},
+		"browser_close": {false, true, true, false}, "browser_navigate": {false, false, false, true},
+		"browser_snapshot": {true, false, true, true}, "browser_screenshot": {true, false, true, true},
+		"browser_action": {false, true, false, true}, "computer_screenshot": {true, false, true, false},
+		"computer_action": {false, true, false, false},
 	}
 	if len(listed.Tools) != len(expected) {
 		t.Fatalf("tool count = %d, want %d", len(listed.Tools), len(expected))
@@ -68,149 +68,79 @@ func TestToolCatalogAndAnnotations(t *testing.T) {
 	}
 }
 
-func TestWorkspaceFileImageAndExecTools(t *testing.T) {
+func TestFilesystemImageAndProcessTools(t *testing.T) {
 	root := t.TempDir()
 	session := connect(t, root)
-
-	callOK(t, session, "workspace_list", map[string]any{})
-	callOK(t, session, "workspace_info", map[string]any{"workspace": "demo"})
-
-	writeArgs := map[string]any{"workspace": "demo", "path": "docs/note.txt", "content": "hello from MCP\n"}
-	firstWrite := callOK(t, session, "file_write", writeArgs)
-	secondWrite := callOK(t, session, "file_write", writeArgs)
-	if structuredSHA256(t, firstWrite) != structuredSHA256(t, secondWrite) {
-		t.Fatal("file_write is not idempotent for identical input")
+	callOK(t, session, "filesystem_roots", map[string]any{})
+	write := callOK(t, session, "filesystem_write_text", map[string]any{"root": "test", "path": "docs/note.txt", "content": "hello from MCP\n", "create_only": true})
+	var written core.TextWriteResult
+	decodeStructured(t, write, &written)
+	read := callOK(t, session, "filesystem_read_text", map[string]any{"root": "test", "path": "docs/note.txt"})
+	var readResult core.TextReadResult
+	decodeStructured(t, read, &readResult)
+	if readResult.Content != "hello from MCP\n" || readResult.SHA256 != written.SHA256 {
+		t.Fatalf("unexpected read: %+v", readResult)
+	}
+	callOK(t, session, "filesystem_edit_text", map[string]any{"root": "test", "path": "docs/note.txt", "old_text": "hello", "new_text": "hi", "expected_sha256": written.SHA256})
+	callOK(t, session, "filesystem_stat", map[string]any{"root": "test", "path": "docs/note.txt"})
+	callOK(t, session, "filesystem_list", map[string]any{"root": "test"})
+	search := callOK(t, session, "filesystem_search_text", map[string]any{"root": "test", "query": "hi"})
+	var searched searchTextOutput
+	decodeStructured(t, search, &searched)
+	if len(searched.Matches) != 1 {
+		t.Fatalf("unexpected search: %+v", searched)
 	}
 
-	read := callOK(t, session, "file_read", map[string]any{"workspace": "demo", "path": "docs/note.txt"})
-	var decoded workspace.ReadResult
-	decodeStructured(t, read, &decoded)
-	if decoded.Content != "hello from MCP\n" || decoded.SHA256 != structuredSHA256(t, firstWrite) {
-		t.Fatalf("unexpected file_read result: %+v", decoded)
-	}
-	callOK(t, session, "file_info", map[string]any{"workspace": "demo", "path": "docs/note.txt"})
-	callOK(t, session, "file_tree", map[string]any{"workspace": "demo", "path": "."})
-	search := callOK(t, session, "file_search", map[string]any{"workspace": "demo", "query": "hello"})
-	var searchOutput FileSearchOutput
-	decodeStructured(t, search, &searchOutput)
-	if len(searchOutput.Matches) != 1 {
-		t.Fatalf("unexpected file_search result: %+v", searchOutput)
-	}
-
-	imagePath := filepath.Join(root, "figure.png")
-	imageFile, err := os.Create(imagePath)
-	if err != nil {
+	frame := image.NewRGBA(image.Rect(0, 0, 3, 2))
+	frame.Set(1, 1, color.RGBA{R: 255, A: 255})
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, frame); err != nil {
 		t.Fatal(err)
 	}
-	wantImage := image.NewRGBA(image.Rect(0, 0, 3, 2))
-	wantImage.Set(1, 1, color.RGBA{R: 255, A: 255})
-	if err := png.Encode(imageFile, wantImage); err != nil {
-		imageFile.Close()
+	if err := os.WriteFile(filepath.Join(root, "figure.png"), encoded.Bytes(), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := imageFile.Close(); err != nil {
-		t.Fatal(err)
+	imageResult := callOK(t, session, "image_read", map[string]any{"root": "test", "path": "figure.png"})
+	if len(imageResult.Content) == 0 {
+		t.Fatal("image tool returned no content")
 	}
-	wantImageBytes, err := os.ReadFile(imagePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	imageResult := callOK(t, session, "image_read", map[string]any{"workspace": "demo", "path": "figure.png"})
-	if len(imageResult.Content) != 1 {
-		t.Fatalf("image content count = %d, want 1", len(imageResult.Content))
-	}
-	imageContent, ok := imageResult.Content[0].(*mcp.ImageContent)
-	if !ok || imageContent.MIMEType != "image/png" || !bytes.Equal(imageContent.Data, wantImageBytes) {
+	content, ok := imageResult.Content[0].(*mcp.ImageContent)
+	if !ok || content.MIMEType != "image/png" || !bytes.Equal(content.Data, encoded.Bytes()) {
 		t.Fatalf("unexpected image content: %#v", imageResult.Content[0])
 	}
 
-	execResult := callOK(t, session, "exec", map[string]any{
-		"workspace": "demo", "command": "go", "args": []string{"env", "GOMOD"},
-	})
-	var command workspace.CommandResult
-	decodeStructured(t, execResult, &command)
-	if command.ExitCode != 0 || (!strings.Contains(filepath.Clean(command.Stdout), filepath.Clean(root)) && !strings.Contains(command.Stdout, os.DevNull)) {
-		t.Fatalf("unexpected exec result: %+v", command)
-	}
-}
-
-func TestGitTools(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git is not installed")
-	}
-	base := t.TempDir()
-	root := filepath.Join(base, "work")
-	remote := filepath.Join(base, "remote.git")
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	manager := workspace.NewManager(&config.Config{Workspaces: map[string]config.Workspace{"demo": {Root: root}}})
-	ctx := context.Background()
-	for _, args := range [][]string{
-		{"init", "-b", "main"},
-		{"config", "user.name", "Workspace MCP Test"},
-		{"config", "user.email", "wmcp-test@example.invalid"},
-	} {
-		result, err := manager.Git(ctx, "demo", args...)
-		if err != nil || result.ExitCode != 0 {
-			t.Fatalf("git %v failed: err=%v result=%+v", args, err, result)
-		}
-	}
-	if out, err := exec.Command("git", "init", "--bare", remote).CombinedOutput(); err != nil {
-		t.Fatalf("init bare remote: %v: %s", err, out)
-	}
-	if result, err := manager.Git(ctx, "demo", "remote", "add", "origin", remote); err != nil || result.ExitCode != 0 {
-		t.Fatalf("add remote: err=%v result=%+v", err, result)
+	process := callOK(t, session, "process_run", map[string]any{"root": "test", "program": "go", "args": []string{"version"}})
+	var processResult core.ProcessResult
+	decodeStructured(t, process, &processResult)
+	if processResult.ExitCode != 0 || !strings.Contains(processResult.Stdout, "go version") {
+		t.Fatalf("unexpected process result: %+v", processResult)
 	}
 
-	session := connectWithManager(t, manager)
-	callOK(t, session, "git_status", map[string]any{"workspace": "demo"})
-	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("# demo\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	callOK(t, session, "git_diff", map[string]any{"workspace": "demo"})
-	commit := callOK(t, session, "git_commit", map[string]any{"workspace": "demo", "message": "Initial test commit"})
-	var commitResult workspace.CommandResult
-	decodeStructured(t, commit, &commitResult)
-	if commitResult.ExitCode != 0 {
-		t.Fatalf("git_commit failed: %+v", commitResult)
-	}
-	push := callOK(t, session, "git_push", map[string]any{"workspace": "demo", "branch": "main"})
-	var pushResult workspace.CommandResult
-	decodeStructured(t, push, &pushResult)
-	if pushResult.ExitCode != 0 {
-		t.Fatalf("git_push failed: %+v", pushResult)
-	}
-	pull := callOK(t, session, "git_pull", map[string]any{"workspace": "demo", "branch": "main"})
-	var pullResult workspace.CommandResult
-	decodeStructured(t, pull, &pullResult)
-	if pullResult.ExitCode != 0 {
-		t.Fatalf("git_pull failed: %+v", pullResult)
+	status := callOK(t, session, "browser_status", map[string]any{})
+	var browserStatus browser.Status
+	decodeStructured(t, status, &browserStatus)
+	if browserStatus.Enabled {
+		t.Fatalf("test bridge should be disabled: %+v", browserStatus)
 	}
 }
 
 func connect(t *testing.T, root string) *mcp.ClientSession {
 	t.Helper()
-	manager := workspace.NewManager(&config.Config{Workspaces: map[string]config.Workspace{"demo": {Root: root}}})
-	return connectWithManager(t, manager)
-}
-
-func connectWithManager(t *testing.T, manager *workspace.Manager) *mcp.ClientSession {
-	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
+	runtime := core.New(config.Config{Roots: map[string]config.Root{"test": {Path: root}}})
+	bridge, err := browser.Start(ctx, config.Browser{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
-	serverDone := make(chan error, 1)
-	go func() { serverDone <- New(manager).Run(ctx, serverTransport) }()
-	client := mcp.NewClient(&mcp.Implementation{Name: "wmcp-test", Version: "1.0.0"}, nil)
+	go func() { _ = New(runtime, bridge, nil).Run(ctx, serverTransport) }()
+	client := mcp.NewClient(&mcp.Implementation{Name: "lrmcp-test", Version: Version}, nil)
 	session, err := client.Connect(ctx, clientTransport, nil)
 	if err != nil {
 		cancel()
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_ = session.Close()
-		cancel()
-	})
+	t.Cleanup(func() { _ = session.Close(); cancel() })
 	return session
 }
 
@@ -225,18 +155,11 @@ func callOK(t *testing.T, session *mcp.ClientSession, name string, arguments map
 
 func decodeStructured(t *testing.T, result *mcp.CallToolResult, output any) {
 	t.Helper()
-	b, err := json.Marshal(result.StructuredContent)
+	data, err := json.Marshal(result.StructuredContent)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(b, output); err != nil {
+	if err := json.Unmarshal(data, output); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func structuredSHA256(t *testing.T, result *mcp.CallToolResult) string {
-	t.Helper()
-	var decoded workspace.WriteResult
-	decodeStructured(t, result, &decoded)
-	return decoded.SHA256
 }

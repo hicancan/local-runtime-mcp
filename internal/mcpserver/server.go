@@ -2,276 +2,195 @@ package mcpserver
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"strings"
 
-	"github.com/hicancan/workspace-mcp/internal/workspace"
+	"github.com/hicancan/local-runtime-mcp/internal/browser"
+	"github.com/hicancan/local-runtime-mcp/internal/computer"
+	"github.com/hicancan/local-runtime-mcp/internal/core"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const Version = "1.0.0"
+const Version = "2.0.0"
 
-// New creates a Workspace MCP server with the complete tool set.
-func New(manager *workspace.Manager) *mcp.Server {
-	server := mcp.NewServer(&mcp.Implementation{Name: "workspace-mcp", Version: Version}, nil)
+const instructions = "Local Runtime MCP operates on the machine where this server process runs. Filesystem, image, and process calls use configured roots and cannot escape them. Browser tools control the user's Chromium tabs through the authenticated bundled extension; computer tools operate the desktop through the configured OS backend. Prefer browser tools for web pages and computer tools for native UI. Read images and screenshots through their native image-content tools."
 
-	mcp.AddTool(server, tool("workspace_list", "List workspaces", "List available workspaces and their detected capabilities.", true, false, true, false), workspaceList(manager))
-	mcp.AddTool(server, tool("workspace_info", "Inspect workspace", "Describe one workspace and its detected capabilities.", true, false, true, false), workspaceInfo(manager))
-	mcp.AddTool(server, tool("file_tree", "List files", "List files and directories inside a workspace.", true, false, true, false), fileTree(manager))
-	mcp.AddTool(server, tool("file_info", "Inspect file", "Inspect a file or directory, including its MIME type and SHA-256 digest.", true, false, true, false), fileInfo(manager))
-	mcp.AddTool(server, tool("file_read", "Read text file", "Read a UTF-8 text file from a workspace with its SHA-256 digest.", true, false, true, false), fileRead(manager))
-	mcp.AddTool(server, tool("file_write", "Write text file", "Create or fully replace a UTF-8 text file in a workspace.", false, true, true, false), fileWrite(manager))
-	mcp.AddTool(server, tool("image_read", "Read image", "Return a PNG, JPEG, GIF, or WebP file as MCP image content so the model can inspect it.", true, false, true, false), imageRead(manager))
-	mcp.AddTool(server, tool("file_search", "Search files", "Search text files throughout a workspace using text or a Go regular expression.", true, false, true, false), fileSearch(manager))
-	mcp.AddTool(server, tool("git_status", "Get Git status", "Return machine-readable Git branch and working-tree status for a workspace.", true, false, true, false), gitStatus(manager))
-	mcp.AddTool(server, tool("git_diff", "Get Git diff", "Return the working-tree or staged Git diff for a workspace.", true, false, true, false), gitDiff(manager))
-	mcp.AddTool(server, tool("git_pull", "Pull Git changes", "Pull changes into the workspace using the installed Git CLI.", false, true, false, false), gitPull(manager))
-	mcp.AddTool(server, tool("git_commit", "Commit Git changes", "Optionally stage all changes and create a Git commit in the workspace.", false, false, false, false), gitCommit(manager))
-	mcp.AddTool(server, tool("git_push", "Push Git changes", "Push workspace commits using the installed Git CLI and configured credentials.", false, true, false, false), gitPush(manager))
-	mcp.AddTool(server, tool("exec", "Run command", "Run a local CLI program with arguments and the workspace root as its working directory.", false, true, false, true), runExec(manager))
+func New(runtime *core.Runtime, browserBridge *browser.Bridge, computerController computer.Controller) *mcp.Server {
+	server := mcp.NewServer(
+		&mcp.Implementation{Name: "local-runtime-mcp", Version: Version},
+		&mcp.ServerOptions{Instructions: instructions, Capabilities: &mcp.ServerCapabilities{}},
+	)
+
+	mcp.AddTool(server, tool("filesystem_roots", "List filesystem roots", "List the configured filesystem roots available to all runtime tools.", true, false, true, false), filesystemRoots(runtime))
+	mcp.AddTool(server, tool("filesystem_list", "List directory", "List files and directories below a path in a configured root without following symbolic links.", true, false, true, false), filesystemList(runtime))
+	mcp.AddTool(server, tool("filesystem_stat", "Inspect path", "Inspect a file or directory. Regular files include MIME type and SHA-256 digest.", true, false, true, false), filesystemStat(runtime))
+	mcp.AddTool(server, tool("filesystem_read_text", "Read text file", "Read bounded UTF-8 text and return the complete-file SHA-256 digest for concurrency checks.", true, false, true, false), filesystemReadText(runtime))
+	mcp.AddTool(server, tool("filesystem_write_text", "Write text file", "Atomically create or replace a UTF-8 text file, optionally guarded by its previous SHA-256 digest.", false, true, true, false), filesystemWriteText(runtime))
+	mcp.AddTool(server, tool("filesystem_edit_text", "Edit text file", "Atomically replace an exact UTF-8 text fragment, rejecting ambiguous matches by default.", false, true, true, false), filesystemEditText(runtime))
+	mcp.AddTool(server, tool("filesystem_search_text", "Search text files", "Search bounded UTF-8 files below a path using literal text or a Go regular expression.", true, false, true, false), filesystemSearchText(runtime))
+	mcp.AddTool(server, tool("image_read", "Read image", "Return PNG, JPEG, GIF, or WebP bytes as native MCP image content with image metadata.", true, false, true, false), imageRead(runtime))
+	mcp.AddTool(server, tool("process_run", "Run process", "Run an installed program directly with an argument array, optional stdin, bounded output, and a root-relative directory.", false, true, false, true), processRun(runtime))
+	registerBrowserTools(server, browserBridge)
+	registerComputerTools(server, computerController)
 
 	return server
 }
 
 func tool(name, title, description string, readOnly, destructive, idempotent, openWorld bool) *mcp.Tool {
-	return &mcp.Tool{Name: name, Title: title, Description: description, Annotations: &mcp.ToolAnnotations{
-		ReadOnlyHint: readOnly, DestructiveHint: boolPointer(destructive),
-		IdempotentHint: idempotent, OpenWorldHint: boolPointer(openWorld),
-	}}
-}
-
-func boolPointer(value bool) *bool {
-	return &value
-}
-
-type EmptyInput struct{}
-
-type WorkspaceListOutput struct {
-	Workspaces []workspace.Info `json:"workspaces"`
-}
-
-func workspaceList(manager *workspace.Manager) func(context.Context, *mcp.CallToolRequest, EmptyInput) (*mcp.CallToolResult, WorkspaceListOutput, error) {
-	return func(context.Context, *mcp.CallToolRequest, EmptyInput) (*mcp.CallToolResult, WorkspaceListOutput, error) {
-		return nil, WorkspaceListOutput{Workspaces: manager.List()}, nil
+	return &mcp.Tool{
+		Name: name, Title: title, Description: description,
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint: readOnly, DestructiveHint: pointer(destructive),
+			IdempotentHint: idempotent, OpenWorldHint: pointer(openWorld),
+		},
 	}
 }
 
-type WorkspaceInput struct {
-	Workspace string `json:"workspace" jsonschema:"workspace name"`
+func pointer(value bool) *bool { return &value }
+
+type emptyInput struct{}
+
+type rootsOutput struct {
+	Roots []core.RootInfo `json:"roots"`
 }
 
-type WorkspaceInfoOutput struct {
-	Workspace workspace.Info `json:"workspace"`
-}
-
-func workspaceInfo(manager *workspace.Manager) func(context.Context, *mcp.CallToolRequest, WorkspaceInput) (*mcp.CallToolResult, WorkspaceInfoOutput, error) {
-	return func(_ context.Context, _ *mcp.CallToolRequest, in WorkspaceInput) (*mcp.CallToolResult, WorkspaceInfoOutput, error) {
-		if _, err := manager.Root(in.Workspace); err != nil {
-			return nil, WorkspaceInfoOutput{}, err
-		}
-		return nil, WorkspaceInfoOutput{Workspace: manager.Info(in.Workspace)}, nil
+func filesystemRoots(runtime *core.Runtime) func(context.Context, *mcp.CallToolRequest, emptyInput) (*mcp.CallToolResult, rootsOutput, error) {
+	return func(context.Context, *mcp.CallToolRequest, emptyInput) (*mcp.CallToolResult, rootsOutput, error) {
+		return nil, rootsOutput{Roots: runtime.Roots()}, nil
 	}
 }
 
-type FileTreeInput struct {
-	Workspace     string `json:"workspace" jsonschema:"configured workspace name"`
-	Path          string `json:"path,omitempty" jsonschema:"directory path relative to the workspace; defaults to the root"`
-	MaxDepth      int    `json:"max_depth,omitempty" jsonschema:"maximum directory depth; defaults to 4"`
+type listInput struct {
+	Root          string `json:"root" jsonschema:"configured root name"`
+	Path          string `json:"path,omitempty" jsonschema:"directory path relative to the root; defaults to the root"`
+	MaxDepth      int    `json:"max_depth,omitempty" jsonschema:"maximum traversal depth from 1 to 64; defaults to 4"`
 	IncludeHidden bool   `json:"include_hidden,omitempty" jsonschema:"include dotfiles and dot directories"`
 }
 
-type FileTreeOutput struct {
-	Entries []workspace.TreeEntry `json:"entries"`
+type listOutput struct {
+	Entries []core.FileEntry `json:"entries"`
 }
 
-func fileTree(manager *workspace.Manager) func(context.Context, *mcp.CallToolRequest, FileTreeInput) (*mcp.CallToolResult, FileTreeOutput, error) {
-	return func(_ context.Context, _ *mcp.CallToolRequest, in FileTreeInput) (*mcp.CallToolResult, FileTreeOutput, error) {
-		entries, err := manager.Tree(in.Workspace, in.Path, in.MaxDepth, in.IncludeHidden)
-		return nil, FileTreeOutput{Entries: entries}, err
+func filesystemList(runtime *core.Runtime) func(context.Context, *mcp.CallToolRequest, listInput) (*mcp.CallToolResult, listOutput, error) {
+	return func(_ context.Context, _ *mcp.CallToolRequest, in listInput) (*mcp.CallToolResult, listOutput, error) {
+		entries, err := runtime.List(in.Root, in.Path, in.MaxDepth, in.IncludeHidden)
+		return nil, listOutput{Entries: entries}, err
 	}
 }
 
-type FileReadInput struct {
-	Workspace string `json:"workspace" jsonschema:"configured workspace name"`
-	Path      string `json:"path" jsonschema:"file path relative to the workspace"`
-	MaxBytes  int    `json:"max_bytes,omitempty" jsonschema:"maximum bytes returned; defaults to 1048576"`
+type pathInput struct {
+	Root string `json:"root" jsonschema:"configured root name"`
+	Path string `json:"path" jsonschema:"path relative to the root"`
 }
 
-type FilePathInput struct {
-	Workspace string `json:"workspace" jsonschema:"configured workspace name"`
-	Path      string `json:"path" jsonschema:"file or directory path relative to the workspace"`
-}
-
-func fileInfo(manager *workspace.Manager) func(context.Context, *mcp.CallToolRequest, FilePathInput) (*mcp.CallToolResult, workspace.FileInfo, error) {
-	return func(_ context.Context, _ *mcp.CallToolRequest, in FilePathInput) (*mcp.CallToolResult, workspace.FileInfo, error) {
-		out, err := manager.Inspect(in.Workspace, in.Path)
-		return nil, out, err
+func filesystemStat(runtime *core.Runtime) func(context.Context, *mcp.CallToolRequest, pathInput) (*mcp.CallToolResult, core.FileInfo, error) {
+	return func(_ context.Context, _ *mcp.CallToolRequest, in pathInput) (*mcp.CallToolResult, core.FileInfo, error) {
+		result, err := runtime.Stat(in.Root, in.Path)
+		return nil, result, err
 	}
 }
 
-func fileRead(manager *workspace.Manager) func(context.Context, *mcp.CallToolRequest, FileReadInput) (*mcp.CallToolResult, workspace.ReadResult, error) {
-	return func(_ context.Context, _ *mcp.CallToolRequest, in FileReadInput) (*mcp.CallToolResult, workspace.ReadResult, error) {
-		out, err := manager.Read(in.Workspace, in.Path, in.MaxBytes)
-		return nil, out, err
+type readTextInput struct {
+	Root     string `json:"root" jsonschema:"configured root name"`
+	Path     string `json:"path" jsonschema:"text file path relative to the root"`
+	MaxBytes int    `json:"max_bytes,omitempty" jsonschema:"maximum bytes returned from 1 to 8388608; defaults to 1048576"`
+}
+
+func filesystemReadText(runtime *core.Runtime) func(context.Context, *mcp.CallToolRequest, readTextInput) (*mcp.CallToolResult, core.TextReadResult, error) {
+	return func(_ context.Context, _ *mcp.CallToolRequest, in readTextInput) (*mcp.CallToolResult, core.TextReadResult, error) {
+		result, err := runtime.ReadText(in.Root, in.Path, in.MaxBytes)
+		return nil, result, err
 	}
 }
 
-type FileWriteInput struct {
-	Workspace string `json:"workspace" jsonschema:"configured workspace name"`
-	Path      string `json:"path" jsonschema:"file path relative to the workspace"`
-	Content   string `json:"content" jsonschema:"complete UTF-8 file content"`
+type writeTextInput struct {
+	Root           string `json:"root" jsonschema:"configured root name"`
+	Path           string `json:"path" jsonschema:"text file path relative to the root"`
+	Content        string `json:"content" jsonschema:"complete UTF-8 file content"`
+	ExpectedSHA256 string `json:"expected_sha256,omitempty" jsonschema:"optional SHA-256 digest that the existing file must match"`
+	CreateOnly     bool   `json:"create_only,omitempty" jsonschema:"fail if the target already exists"`
 }
 
-func fileWrite(manager *workspace.Manager) func(context.Context, *mcp.CallToolRequest, FileWriteInput) (*mcp.CallToolResult, workspace.WriteResult, error) {
-	return func(_ context.Context, _ *mcp.CallToolRequest, in FileWriteInput) (*mcp.CallToolResult, workspace.WriteResult, error) {
-		if strings.TrimSpace(in.Path) == "" {
-			return nil, workspace.WriteResult{}, errors.New("path cannot be empty")
-		}
-		out, err := manager.Write(in.Workspace, in.Path, in.Content)
-		return nil, out, err
+func filesystemWriteText(runtime *core.Runtime) func(context.Context, *mcp.CallToolRequest, writeTextInput) (*mcp.CallToolResult, core.TextWriteResult, error) {
+	return func(_ context.Context, _ *mcp.CallToolRequest, in writeTextInput) (*mcp.CallToolResult, core.TextWriteResult, error) {
+		result, err := runtime.WriteText(in.Root, in.Path, in.Content, in.ExpectedSHA256, in.CreateOnly)
+		return nil, result, err
 	}
 }
 
-type ImageReadInput struct {
-	Workspace string `json:"workspace" jsonschema:"configured workspace name"`
-	Path      string `json:"path" jsonschema:"image file path relative to the workspace"`
-	MaxBytes  int    `json:"max_bytes,omitempty" jsonschema:"maximum complete image size returned; defaults to 10485760"`
+type editTextInput struct {
+	Root           string `json:"root" jsonschema:"configured root name"`
+	Path           string `json:"path" jsonschema:"text file path relative to the root"`
+	OldText        string `json:"old_text" jsonschema:"exact existing UTF-8 text to replace"`
+	NewText        string `json:"new_text" jsonschema:"replacement UTF-8 text"`
+	ExpectedSHA256 string `json:"expected_sha256,omitempty" jsonschema:"optional SHA-256 digest that the file must match"`
+	ReplaceAll     bool   `json:"replace_all,omitempty" jsonschema:"replace every match instead of requiring exactly one"`
 }
 
-func imageRead(manager *workspace.Manager) func(context.Context, *mcp.CallToolRequest, ImageReadInput) (*mcp.CallToolResult, workspace.ImageReadResult, error) {
-	return func(_ context.Context, _ *mcp.CallToolRequest, in ImageReadInput) (*mcp.CallToolResult, workspace.ImageReadResult, error) {
-		data, out, err := manager.ReadImage(in.Workspace, in.Path, in.MaxBytes)
-		if err != nil {
-			return nil, workspace.ImageReadResult{}, err
-		}
-		result := &mcp.CallToolResult{Content: []mcp.Content{&mcp.ImageContent{Data: data, MIMEType: out.MIMEType}}}
-		return result, out, nil
+func filesystemEditText(runtime *core.Runtime) func(context.Context, *mcp.CallToolRequest, editTextInput) (*mcp.CallToolResult, core.TextEditResult, error) {
+	return func(_ context.Context, _ *mcp.CallToolRequest, in editTextInput) (*mcp.CallToolResult, core.TextEditResult, error) {
+		result, err := runtime.EditText(in.Root, in.Path, in.OldText, in.NewText, in.ExpectedSHA256, in.ReplaceAll)
+		return nil, result, err
 	}
 }
 
-type FileSearchInput struct {
-	Workspace     string `json:"workspace" jsonschema:"configured workspace name"`
-	Query         string `json:"query" jsonschema:"text or Go regular expression to find"`
+type searchTextInput struct {
+	Root          string `json:"root" jsonschema:"configured root name"`
+	Path          string `json:"path,omitempty" jsonschema:"file or directory path relative to the root; defaults to the root"`
+	Query         string `json:"query" jsonschema:"literal text or Go regular expression to find"`
 	Regex         bool   `json:"regex,omitempty" jsonschema:"interpret query as a Go regular expression"`
 	CaseSensitive bool   `json:"case_sensitive,omitempty" jsonschema:"perform a case-sensitive search"`
-	MaxResults    int    `json:"max_results,omitempty" jsonschema:"maximum matches returned; defaults to 200"`
+	IncludeHidden bool   `json:"include_hidden,omitempty" jsonschema:"include dotfiles and dot directories"`
+	MaxResults    int    `json:"max_results,omitempty" jsonschema:"maximum matches from 1 to 10000; defaults to 200"`
 }
 
-type FileSearchOutput struct {
-	Matches []workspace.SearchMatch `json:"matches"`
+type searchTextOutput struct {
+	Matches []core.SearchMatch `json:"matches"`
 }
 
-func fileSearch(manager *workspace.Manager) func(context.Context, *mcp.CallToolRequest, FileSearchInput) (*mcp.CallToolResult, FileSearchOutput, error) {
-	return func(_ context.Context, _ *mcp.CallToolRequest, in FileSearchInput) (*mcp.CallToolResult, FileSearchOutput, error) {
-		matches, err := manager.Search(in.Workspace, in.Query, in.Regex, in.CaseSensitive, in.MaxResults)
-		return nil, FileSearchOutput{Matches: matches}, err
+func filesystemSearchText(runtime *core.Runtime) func(context.Context, *mcp.CallToolRequest, searchTextInput) (*mcp.CallToolResult, searchTextOutput, error) {
+	return func(_ context.Context, _ *mcp.CallToolRequest, in searchTextInput) (*mcp.CallToolResult, searchTextOutput, error) {
+		matches, err := runtime.SearchText(in.Root, in.Path, in.Query, in.Regex, in.CaseSensitive, in.IncludeHidden, in.MaxResults)
+		return nil, searchTextOutput{Matches: matches}, err
 	}
 }
 
-func gitStatus(manager *workspace.Manager) func(context.Context, *mcp.CallToolRequest, WorkspaceInput) (*mcp.CallToolResult, workspace.CommandResult, error) {
-	return func(ctx context.Context, _ *mcp.CallToolRequest, in WorkspaceInput) (*mcp.CallToolResult, workspace.CommandResult, error) {
-		out, err := manager.Git(ctx, in.Workspace, "status", "--porcelain=v2", "--branch")
-		return nil, out, err
-	}
+type imageReadInput struct {
+	Root     string `json:"root" jsonschema:"configured root name"`
+	Path     string `json:"path" jsonschema:"image path relative to the root"`
+	MaxBytes int    `json:"max_bytes,omitempty" jsonschema:"maximum complete image size from 1 to 67108864; defaults to 10485760"`
 }
 
-type GitDiffInput struct {
-	Workspace string `json:"workspace" jsonschema:"configured workspace name"`
-	Staged    bool   `json:"staged,omitempty" jsonschema:"show staged changes instead of working-tree changes"`
-	Path      string `json:"path,omitempty" jsonschema:"optional path relative to the workspace"`
-}
-
-func gitDiff(manager *workspace.Manager) func(context.Context, *mcp.CallToolRequest, GitDiffInput) (*mcp.CallToolResult, workspace.CommandResult, error) {
-	return func(ctx context.Context, _ *mcp.CallToolRequest, in GitDiffInput) (*mcp.CallToolResult, workspace.CommandResult, error) {
-		args := []string{"diff"}
-		if in.Staged {
-			args = append(args, "--cached")
-		}
-		if in.Path != "" {
-			args = append(args, "--", in.Path)
-		}
-		out, err := manager.Git(ctx, in.Workspace, args...)
-		return nil, out, err
-	}
-}
-
-type GitRemoteInput struct {
-	Workspace string `json:"workspace" jsonschema:"configured workspace name"`
-	Remote    string `json:"remote,omitempty" jsonschema:"remote name; defaults to origin"`
-	Branch    string `json:"branch,omitempty" jsonschema:"optional branch name"`
-}
-
-func gitPull(manager *workspace.Manager) func(context.Context, *mcp.CallToolRequest, GitRemoteInput) (*mcp.CallToolResult, workspace.CommandResult, error) {
-	return func(ctx context.Context, _ *mcp.CallToolRequest, in GitRemoteInput) (*mcp.CallToolResult, workspace.CommandResult, error) {
-		remote := in.Remote
-		if remote == "" {
-			remote = "origin"
-		}
-		args := []string{"pull", remote}
-		if in.Branch != "" {
-			args = append(args, in.Branch)
-		}
-		out, err := manager.Git(ctx, in.Workspace, args...)
-		return nil, out, err
-	}
-}
-
-type GitCommitInput struct {
-	Workspace string `json:"workspace" jsonschema:"configured workspace name"`
-	Message   string `json:"message" jsonschema:"commit message"`
-	AddAll    *bool  `json:"add_all,omitempty" jsonschema:"stage all changes before committing; defaults to true"`
-}
-
-func gitCommit(manager *workspace.Manager) func(context.Context, *mcp.CallToolRequest, GitCommitInput) (*mcp.CallToolResult, workspace.CommandResult, error) {
-	return func(ctx context.Context, _ *mcp.CallToolRequest, in GitCommitInput) (*mcp.CallToolResult, workspace.CommandResult, error) {
-		if strings.TrimSpace(in.Message) == "" {
-			return nil, workspace.CommandResult{}, errors.New("commit message cannot be empty")
-		}
-		addAll := in.AddAll == nil || *in.AddAll
-		if addAll {
-			stage, err := manager.Git(ctx, in.Workspace, "add", "-A")
-			if err != nil {
-				return nil, stage, err
-			}
-			if stage.ExitCode != 0 {
-				return nil, stage, nil
-			}
-		}
-		out, err := manager.Git(ctx, in.Workspace, "commit", "-m", in.Message)
-		return nil, out, err
-	}
-}
-
-func gitPush(manager *workspace.Manager) func(context.Context, *mcp.CallToolRequest, GitRemoteInput) (*mcp.CallToolResult, workspace.CommandResult, error) {
-	return func(ctx context.Context, _ *mcp.CallToolRequest, in GitRemoteInput) (*mcp.CallToolResult, workspace.CommandResult, error) {
-		remote := in.Remote
-		if remote == "" {
-			remote = "origin"
-		}
-		args := []string{"push", remote}
-		if in.Branch != "" {
-			args = append(args, in.Branch)
-		}
-		out, err := manager.Git(ctx, in.Workspace, args...)
-		return nil, out, err
-	}
-}
-
-type ExecInput struct {
-	Workspace      string            `json:"workspace" jsonschema:"configured workspace name"`
-	Command        string            `json:"command" jsonschema:"program name or executable path"`
-	Args           []string          `json:"args,omitempty" jsonschema:"program arguments"`
-	Environment    map[string]string `json:"environment,omitempty" jsonschema:"additional environment variables for this process"`
-	TimeoutSeconds int               `json:"timeout_seconds,omitempty" jsonschema:"execution timeout in seconds; defaults to 300"`
-}
-
-func runExec(manager *workspace.Manager) func(context.Context, *mcp.CallToolRequest, ExecInput) (*mcp.CallToolResult, workspace.CommandResult, error) {
-	return func(ctx context.Context, _ *mcp.CallToolRequest, in ExecInput) (*mcp.CallToolResult, workspace.CommandResult, error) {
-		out, err := manager.Exec(ctx, in.Workspace, in.Command, in.Args, in.Environment, in.TimeoutSeconds)
+func imageRead(runtime *core.Runtime) func(context.Context, *mcp.CallToolRequest, imageReadInput) (*mcp.CallToolResult, core.ImageReadResult, error) {
+	return func(_ context.Context, _ *mcp.CallToolRequest, in imageReadInput) (*mcp.CallToolResult, core.ImageReadResult, error) {
+		data, metadata, err := runtime.ReadImage(in.Root, in.Path, in.MaxBytes)
 		if err != nil {
-			return nil, out, fmt.Errorf("execute in workspace: %w", err)
+			return nil, core.ImageReadResult{}, err
 		}
-		return nil, out, nil
+		result := &mcp.CallToolResult{Content: []mcp.Content{&mcp.ImageContent{Data: data, MIMEType: metadata.MIMEType}}}
+		return result, metadata, nil
+	}
+}
+
+type processRunInput struct {
+	Root           string            `json:"root" jsonschema:"configured root name"`
+	Program        string            `json:"program" jsonschema:"installed program name or executable path; no shell parsing is performed"`
+	Args           []string          `json:"args,omitempty" jsonschema:"program argument array"`
+	Directory      string            `json:"directory,omitempty" jsonschema:"working directory relative to the root; defaults to the root"`
+	Environment    map[string]string `json:"environment,omitempty" jsonschema:"environment variables added or overridden for the child process"`
+	Stdin          string            `json:"stdin,omitempty" jsonschema:"text sent to standard input"`
+	TimeoutSeconds int               `json:"timeout_seconds,omitempty" jsonschema:"timeout from 1 to 86400 seconds; defaults to 300"`
+	MaxOutputBytes int               `json:"max_output_bytes,omitempty" jsonschema:"separate stdout and stderr limit from 1 to 16777216 bytes; defaults to 1048576"`
+}
+
+func processRun(runtime *core.Runtime) func(context.Context, *mcp.CallToolRequest, processRunInput) (*mcp.CallToolResult, core.ProcessResult, error) {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in processRunInput) (*mcp.CallToolResult, core.ProcessResult, error) {
+		result, err := runtime.RunProcess(ctx, in.Root, core.ProcessOptions{
+			Program: in.Program, Args: in.Args, Directory: in.Directory, Environment: in.Environment,
+			Stdin: in.Stdin, TimeoutSeconds: in.TimeoutSeconds, MaxOutputBytes: in.MaxOutputBytes,
+		})
+		if err != nil {
+			return nil, result, fmt.Errorf("run process: %w", err)
+		}
+		return nil, result, nil
 	}
 }

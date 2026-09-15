@@ -1,12 +1,16 @@
 # Binaries
 /bin/
-/wmcp.exe
-/wmcp
+/lrmcp.exe
+/lrmcp
 
 # Local configuration and secrets
 /config.yaml
 *.local.yaml
 .env
+
+# Local scratch data
+/tmp/
+/.pytest_cache/
 
 # Editors and operating systems
 .idea/
