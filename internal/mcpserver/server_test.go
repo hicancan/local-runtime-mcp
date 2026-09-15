@@ -44,11 +44,13 @@ func TestToolCatalogAndIdentity(t *testing.T) {
 		"filesystem_read_text": {true, false, true, false}, "filesystem_write_text": {false, true, true, false},
 		"filesystem_edit_text": {false, true, true, false}, "filesystem_search_text": {true, false, true, false},
 		"image_read": {true, false, true, false}, "process_run": {false, true, false, true},
-		"browser_status": {true, false, true, false}, "browser_tabs": {true, false, true, false},
+		"process_continue": {false, true, false, true},
+		"browser_status":   {true, false, true, false}, "browser_tabs": {true, false, true, false},
 		"browser_open": {false, false, false, true}, "browser_close": {false, true, true, false},
 		"browser_navigate": {false, false, false, true}, "browser_snapshot": {true, false, true, true},
 		"browser_screenshot": {true, false, true, true}, "browser_action": {false, true, false, true},
-		"computer_screenshot": {true, false, true, false}, "computer_action": {false, true, false, false},
+		"computer_targets": {true, false, true, false}, "computer_state": {true, false, true, false},
+		"computer_action": {false, true, false, false},
 	}
 	if len(listed.Tools) != len(expected) {
 		t.Fatalf("tool count = %d, want %d", len(listed.Tools), len(expected))
@@ -62,8 +64,25 @@ func TestToolCatalogAndIdentity(t *testing.T) {
 		if registered.Title == "" || got == nil || got.DestructiveHint == nil || got.OpenWorldHint == nil {
 			t.Fatalf("tool %q has incomplete metadata: %+v", registered.Name, registered)
 		}
+		if registered.InputSchema == nil || registered.OutputSchema == nil {
+			t.Fatalf("tool %q has incomplete schemas", registered.Name)
+		}
 		if got.ReadOnlyHint != want.readOnly || *got.DestructiveHint != want.destructive || got.IdempotentHint != want.idempotent || *got.OpenWorldHint != want.openWorld {
 			t.Fatalf("tool %q annotations = %+v, want %+v", registered.Name, got, want)
+		}
+		if registered.Name == "browser_action" || registered.Name == "computer_action" {
+			data, err := json.Marshal(registered.InputSchema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var schema struct {
+				Properties map[string]struct {
+					Enum []string `json:"enum"`
+				} `json:"properties"`
+			}
+			if err := json.Unmarshal(data, &schema); err != nil || len(schema.Properties["kind"].Enum) < 9 {
+				t.Fatalf("tool %q lacks a closed action enum: %s (%v)", registered.Name, data, err)
+			}
 		}
 	}
 }
@@ -84,11 +103,11 @@ func TestFilesystemImageAndProcessTools(t *testing.T) {
 	if readResult.Content != "hello from MCP\n" {
 		t.Fatalf("unexpected read: %+v", readResult)
 	}
-	callOK(t, session, "filesystem_edit_text", map[string]any{"path": note, "old_text": "hello", "new_text": "hi"})
+	callOK(t, session, "filesystem_edit_text", map[string]any{"path": note, "edits": []map[string]any{{"old_text": "hello", "new_text": "hi"}}})
 	callOK(t, session, "filesystem_stat", map[string]any{"path": note})
 	callOK(t, session, "filesystem_list", map[string]any{"path": root})
 	search := callOK(t, session, "filesystem_search_text", map[string]any{"path": root, "query": "hi"})
-	var searched searchTextOutput
+	var searched filesystem.SearchResult
 	decodeStructured(t, search, &searched)
 	if len(searched.Matches) != 1 {
 		t.Fatalf("unexpected search: %+v", searched)
@@ -136,7 +155,7 @@ func connect(t *testing.T) *mcp.ClientSession {
 		t.Fatal(err)
 	}
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
-	go func() { _ = New(bridge, nil).Run(ctx, serverTransport) }()
+	go func() { _ = New(ctx, bridge, nil).Run(ctx, serverTransport) }()
 	client := mcp.NewClient(&mcp.Implementation{Name: "lrmcp-test", Version: Version}, nil)
 	session, err := client.Connect(ctx, clientTransport, nil)
 	if err != nil {

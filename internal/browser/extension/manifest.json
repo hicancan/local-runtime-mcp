@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Local Runtime MCP Browser Bridge",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "description": "Lets Local Runtime MCP control the current Chromium browser through an authenticated local bridge.",
   "permissions": [
     "debugger",

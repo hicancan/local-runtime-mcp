@@ -60,7 +60,7 @@ func stdio(ctx context.Context, args []string, stdin io.Reader, stdout, stderr i
 		return err
 	}
 	defer bridge.Close(context.Background())
-	err = mcpserver.New(bridge, computer.New()).Run(ctx, &mcp.IOTransport{Reader: noCloseReader{stdin}, Writer: noCloseWriter{stdout}})
+	err = mcpserver.New(ctx, bridge, computer.New()).Run(ctx, &mcp.IOTransport{Reader: noCloseReader{stdin}, Writer: noCloseWriter{stdout}})
 	return normalizeCancellation(err)
 }
 
@@ -93,7 +93,7 @@ func tunnel(ctx context.Context, args []string, stderr io.Writer) error {
 	defer bridge.Close(context.Background())
 	serverTransport, tunnelTransport := mcp.NewInMemoryTransports()
 	serverErrors := make(chan error, 1)
-	go func() { serverErrors <- mcpserver.New(bridge, computer.New()).Run(ctx, serverTransport) }()
+	go func() { serverErrors <- mcpserver.New(ctx, bridge, computer.New()).Run(ctx, serverTransport) }()
 	client, err := tunnelclient.New(tunnelclient.Config{TunnelID: *tunnelID, APIKey: apiKey}, tunnelTransport)
 	if err != nil {
 		return fmt.Errorf("create tunnel client: %w", err)

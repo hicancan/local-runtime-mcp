@@ -21,7 +21,7 @@ import (
 	"github.com/hicancan/local-runtime-mcp/internal/config"
 )
 
-const ExtensionVersion = "3.0.0"
+const ExtensionVersion = "4.0.0"
 
 type Bridge struct {
 	configured bool
@@ -73,32 +73,59 @@ type SnapshotElement struct {
 }
 
 type Snapshot struct {
-	TabID    int               `json:"tab_id"`
-	Title    string            `json:"title"`
-	URL      string            `json:"url"`
-	Text     string            `json:"text"`
-	Elements []SnapshotElement `json:"elements"`
+	TabID             int               `json:"tab_id"`
+	SnapshotID        string            `json:"snapshot_id"`
+	Title             string            `json:"title"`
+	URL               string            `json:"url"`
+	Text              string            `json:"text"`
+	TextTruncated     bool              `json:"text_truncated"`
+	Elements          []SnapshotElement `json:"elements"`
+	ElementsTruncated bool              `json:"elements_truncated"`
+}
+
+type ScreenshotOptions struct {
+	TabID    int  `json:"tab_id" jsonschema:"positive browser tab ID"`
+	FullPage bool `json:"full_page,omitempty" jsonschema:"capture the entire scrollable page instead of the viewport"`
+	ClipX    int  `json:"clip_x,omitempty" jsonschema:"non-negative page X coordinate for a clipped capture"`
+	ClipY    int  `json:"clip_y,omitempty" jsonschema:"non-negative page Y coordinate for a clipped capture"`
+	ClipW    int  `json:"clip_width,omitempty" jsonschema:"positive clipped-capture width; requires clip_height"`
+	ClipH    int  `json:"clip_height,omitempty" jsonschema:"positive clipped-capture height; requires clip_width"`
 }
 
 type ScreenshotInfo struct {
-	TabID    int    `json:"tab_id"`
-	Title    string `json:"title"`
-	URL      string `json:"url"`
-	Width    int    `json:"width"`
-	Height   int    `json:"height"`
-	MIMEType string `json:"mime_type"`
+	TabID        int    `json:"tab_id"`
+	ScreenshotID string `json:"screenshot_id"`
+	Title        string `json:"title"`
+	URL          string `json:"url"`
+	X            int    `json:"x"`
+	Y            int    `json:"y"`
+	Width        int    `json:"width"`
+	Height       int    `json:"height"`
+	FullPage     bool   `json:"full_page"`
+	MIMEType     string `json:"mime_type"`
 }
 
 type Action struct {
-	Kind     string `json:"kind"`
-	TabID    int    `json:"tab_id"`
-	Selector string `json:"selector,omitempty"`
-	Ref      string `json:"ref,omitempty"`
-	Text     string `json:"text,omitempty"`
-	Key      string `json:"key,omitempty"`
-	ScrollX  int    `json:"scroll_x,omitempty"`
-	ScrollY  int    `json:"scroll_y,omitempty"`
-	Script   string `json:"script,omitempty"`
+	Kind         string   `json:"kind" jsonschema:"browser operation to perform"`
+	TabID        int      `json:"tab_id" jsonschema:"positive browser tab ID"`
+	Selector     string   `json:"selector,omitempty" jsonschema:"CSS selector in the top document; prefer ref after a snapshot"`
+	Ref          string   `json:"ref,omitempty" jsonschema:"versioned element reference from the latest browser_snapshot"`
+	ScreenshotID string   `json:"screenshot_id,omitempty" jsonschema:"viewport screenshot ID required for coordinate targeting"`
+	X            int      `json:"x,omitempty" jsonschema:"viewport X coordinate associated with screenshot_id"`
+	Y            int      `json:"y,omitempty" jsonschema:"viewport Y coordinate associated with screenshot_id"`
+	ToX          int      `json:"to_x,omitempty" jsonschema:"drag destination viewport X coordinate"`
+	ToY          int      `json:"to_y,omitempty" jsonschema:"drag destination viewport Y coordinate"`
+	Button       string   `json:"button,omitempty" jsonschema:"mouse button; defaults to left"`
+	Text         string   `json:"text,omitempty" jsonschema:"text for type_text or set_value"`
+	Key          string   `json:"key,omitempty" jsonschema:"key or modifier combination such as Control+L"`
+	ScrollX      int      `json:"scroll_x,omitempty" jsonschema:"horizontal wheel delta; positive scrolls right"`
+	ScrollY      int      `json:"scroll_y,omitempty" jsonschema:"vertical wheel delta; positive scrolls down"`
+	Option       string   `json:"option,omitempty" jsonschema:"select option value, visible text, or label"`
+	Checked      *bool    `json:"checked,omitempty" jsonschema:"desired checkbox or radio state"`
+	Files        []string `json:"files,omitempty" jsonschema:"absolute machine paths assigned to a file input"`
+	Accept       *bool    `json:"accept,omitempty" jsonschema:"whether to accept an open JavaScript dialog"`
+	PromptText   string   `json:"prompt_text,omitempty" jsonschema:"text supplied to an accepted prompt dialog"`
+	Script       string   `json:"script,omitempty" jsonschema:"JavaScript expression evaluated in the page main world"`
 }
 
 type ActionResult struct {
@@ -195,12 +222,21 @@ func (b *Bridge) Snapshot(ctx context.Context, tabID, maxElements, maxText int) 
 	return result, err
 }
 
-func (b *Bridge) Screenshot(ctx context.Context, tabID int) ([]byte, ScreenshotInfo, error) {
+func (b *Bridge) Screenshot(ctx context.Context, options ScreenshotOptions) ([]byte, ScreenshotInfo, error) {
 	var result struct {
 		Data string         `json:"data_base64"`
 		Info ScreenshotInfo `json:"info"`
 	}
-	if err := b.call(ctx, "page.screenshot", map[string]any{"tab_id": tabID}, &result); err != nil {
+	if options.TabID <= 0 {
+		return nil, ScreenshotInfo{}, errors.New("tab_id must be positive")
+	}
+	if options.FullPage && (options.ClipW != 0 || options.ClipH != 0 || options.ClipX != 0 || options.ClipY != 0) {
+		return nil, ScreenshotInfo{}, errors.New("full_page and clip fields are mutually exclusive")
+	}
+	if (options.ClipW == 0) != (options.ClipH == 0) || options.ClipW < 0 || options.ClipH < 0 || options.ClipX < 0 || options.ClipY < 0 {
+		return nil, ScreenshotInfo{}, errors.New("clip requires positive clip_width and clip_height with non-negative coordinates")
+	}
+	if err := b.call(ctx, "page.screenshot", options, &result); err != nil {
 		return nil, ScreenshotInfo{}, err
 	}
 	data, err := decodeBase64(result.Data)
@@ -278,6 +314,10 @@ func (b *Bridge) poll(writer http.ResponseWriter, request *http.Request) {
 		http.Error(writer, "instance_id is required", http.StatusBadRequest)
 		return
 	}
+	if peer.ExtensionVersion != ExtensionVersion {
+		http.Error(writer, "browser extension version does not match lrmcp; run browser-setup and reload the extension", http.StatusUpgradeRequired)
+		return
+	}
 	b.mu.Lock()
 	if b.connectedLocked() && b.peer.InstanceID != "" && b.peer.InstanceID != peer.InstanceID {
 		b.mu.Unlock()
@@ -346,22 +386,48 @@ func validateAction(action Action) error {
 	if action.TabID <= 0 {
 		return errors.New("tab_id must be positive")
 	}
+	targeted := func() bool { return action.Selector != "" || action.Ref != "" || action.ScreenshotID != "" }
+	if action.Button != "" && action.Button != "left" && action.Button != "middle" && action.Button != "right" {
+		return errors.New("button must be left, middle, or right")
+	}
 	switch action.Kind {
-	case "click":
-		if action.Selector == "" && action.Ref == "" {
-			return errors.New("click requires selector or ref")
+	case "click", "double_click", "hover", "drag":
+		if !targeted() {
+			return fmt.Errorf("%s requires selector, ref, or screenshot_id coordinates", action.Kind)
 		}
-	case "type":
-		if action.Selector == "" && action.Ref == "" {
-			return errors.New("type requires selector or ref")
+		if action.ScreenshotID != "" && (action.X < 0 || action.Y < 0) {
+			return errors.New("screenshot coordinates cannot be negative")
 		}
-	case "key":
+	case "type_text", "set_value":
+		if action.Selector == "" && action.Ref == "" {
+			return fmt.Errorf("%s requires selector or ref", action.Kind)
+		}
+		if action.Text == "" {
+			return fmt.Errorf("%s requires text", action.Kind)
+		}
+	case "press_key":
 		if action.Key == "" {
-			return errors.New("key action requires key")
+			return errors.New("press_key requires key")
 		}
 	case "scroll":
 		if action.ScrollX == 0 && action.ScrollY == 0 {
 			return errors.New("scroll requires scroll_x or scroll_y")
+		}
+	case "select":
+		if (action.Selector == "" && action.Ref == "") || action.Option == "" {
+			return errors.New("select requires selector or ref and option")
+		}
+	case "check":
+		if (action.Selector == "" && action.Ref == "") || action.Checked == nil {
+			return errors.New("check requires selector or ref and checked")
+		}
+	case "upload_files":
+		if (action.Selector == "" && action.Ref == "") || len(action.Files) == 0 {
+			return errors.New("upload_files requires selector or ref and files")
+		}
+	case "handle_dialog":
+		if action.Accept == nil {
+			return errors.New("handle_dialog requires accept")
 		}
 	case "evaluate":
 		if action.Script == "" {

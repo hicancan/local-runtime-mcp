@@ -78,4 +78,12 @@ func TestSaveRoundTrip(t *testing.T) {
 	if got.Browser != want.Browser {
 		t.Fatalf("round trip = %+v, want %+v", got.Browser, want.Browser)
 	}
+	want.Browser.Listen = "127.0.0.1:9415"
+	if _, err := Save(path, want); err != nil {
+		t.Fatalf("replace existing configuration: %v", err)
+	}
+	got, err = Load(path)
+	if err != nil || got.Browser != want.Browser {
+		t.Fatalf("replaced round trip = %+v, %v", got.Browser, err)
+	}
 }

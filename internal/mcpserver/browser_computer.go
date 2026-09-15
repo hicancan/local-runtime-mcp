@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/hicancan/local-runtime-mcp/internal/browser"
 	"github.com/hicancan/local-runtime-mcp/internal/computer"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -14,15 +15,26 @@ func registerBrowserTools(server *mcp.Server, bridge *browser.Bridge) {
 	mcp.AddTool(server, tool("browser_tabs", "List browser tabs", "List controllable tabs in the Chromium profile running the bundled extension.", true, false, true, false), browserTabs(bridge))
 	mcp.AddTool(server, tool("browser_open", "Open browser tab", "Open a URL in a new browser tab.", false, false, false, true), browserOpen(bridge))
 	mcp.AddTool(server, tool("browser_close", "Close browser tab", "Close a browser tab by its numeric ID.", false, true, true, false), browserClose(bridge))
-	mcp.AddTool(server, tool("browser_navigate", "Navigate browser tab", "Navigate an existing browser tab to a URL.", false, false, false, true), browserNavigate(bridge))
-	mcp.AddTool(server, tool("browser_snapshot", "Read browser page", "Return visible page text and referenced interactive elements for reliable browser actions.", true, false, true, true), browserSnapshot(bridge))
-	mcp.AddTool(server, tool("browser_screenshot", "Capture browser viewport", "Return the current tab viewport as native PNG image content.", true, false, true, true), browserScreenshot(bridge))
-	mcp.AddTool(server, tool("browser_action", "Act on browser page", "Click or type into a referenced element, press a key, scroll, evaluate JavaScript, or navigate browser history.", false, true, false, true), browserAction(bridge))
+	mcp.AddTool(server, tool("browser_navigate", "Navigate browser tab", "Navigate an existing browser tab to an absolute URL and wait until loading finishes.", false, false, false, true), browserNavigate(bridge))
+	mcp.AddTool(server, tool("browser_snapshot", "Read browser page", "Return bounded visible text and versioned references for interactive elements, including open shadow roots and accessible same-origin frames.", true, false, true, true), browserSnapshot(bridge))
+	mcp.AddTool(server, tool("browser_screenshot", "Capture browser page", "Return a viewport, full-page, or clipped native PNG. Viewport screenshots yield IDs for coordinate actions.", true, false, true, true), browserScreenshot(bridge))
+	browserActionTool := inputTool[browser.Action](tool("browser_action", "Act on browser page", "Use a versioned element ref, CSS selector, or viewport screenshot coordinates to control a page; also supports keys, scrolling, files, dialogs, history, and JavaScript.", false, true, false, true), func(schema *jsonschema.Schema) {
+		schema.Properties["kind"].Enum = enum("click", "double_click", "hover", "drag", "type_text", "set_value", "press_key", "scroll", "select", "check", "upload_files", "handle_dialog", "back", "forward", "reload", "evaluate")
+		schema.Properties["button"].Enum = enum("left", "middle", "right")
+		schema.Properties["tab_id"].Minimum = jsonschema.Ptr(1.0)
+	})
+	mcp.AddTool(server, browserActionTool, browserAction(bridge))
 }
 
 func registerComputerTools(server *mcp.Server, controller computer.Controller) {
-	mcp.AddTool(server, tool("computer_screenshot", "Capture desktop", "Return the current desktop as native PNG image content with virtual-screen coordinates.", true, false, true, false), computerScreenshot(controller))
-	mcp.AddTool(server, tool("computer_action", "Control desktop", "Move, click, or drag the pointer; type Unicode text; press a key combination; or scroll the desktop.", false, true, false, false), computerAction(controller))
+	mcp.AddTool(server, tool("computer_targets", "List desktop targets", "List currently open top-level windows that can be targeted. This does not list installed applications.", true, false, true, false), computerTargets(controller))
+	mcp.AddTool(server, tool("computer_state", "Read desktop state", "Return the desktop or one selected window as native PNG plus a state ID. On Windows, optional accessibility data exposes visible native controls.", true, false, true, false), computerState(controller))
+	computerActionTool := inputTool[computer.Action](tool("computer_action", "Control desktop", "Activate a window; move, click, double-click, or drag; type or replace text; press a key combination; or scroll. Coordinates are relative to the image returned by computer_state.", false, true, false, false), func(schema *jsonschema.Schema) {
+		schema.Properties["kind"].Enum = enum("activate", "move", "click", "double_click", "drag", "type_text", "set_value", "press_key", "scroll")
+		schema.Properties["button"].Enum = enum("left", "middle", "right")
+		schema.Properties["window_id"].Minimum = jsonschema.Ptr(0.0)
+	})
+	mcp.AddTool(server, computerActionTool, computerAction(controller))
 }
 
 func requireBridge(bridge *browser.Bridge) error {
@@ -132,12 +144,12 @@ func browserSnapshot(bridge *browser.Bridge) func(context.Context, *mcp.CallTool
 	}
 }
 
-func browserScreenshot(bridge *browser.Bridge) func(context.Context, *mcp.CallToolRequest, browserTabInput) (*mcp.CallToolResult, browser.ScreenshotInfo, error) {
-	return func(ctx context.Context, _ *mcp.CallToolRequest, in browserTabInput) (*mcp.CallToolResult, browser.ScreenshotInfo, error) {
+func browserScreenshot(bridge *browser.Bridge) func(context.Context, *mcp.CallToolRequest, browser.ScreenshotOptions) (*mcp.CallToolResult, browser.ScreenshotInfo, error) {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in browser.ScreenshotOptions) (*mcp.CallToolResult, browser.ScreenshotInfo, error) {
 		if err := requireBridge(bridge); err != nil {
 			return nil, browser.ScreenshotInfo{}, err
 		}
-		data, info, err := bridge.Screenshot(ctx, in.TabID)
+		data, info, err := bridge.Screenshot(ctx, in)
 		if err != nil {
 			return nil, browser.ScreenshotInfo{}, err
 		}
@@ -155,16 +167,26 @@ func browserAction(bridge *browser.Bridge) func(context.Context, *mcp.CallToolRe
 	}
 }
 
-func computerScreenshot(controller computer.Controller) func(context.Context, *mcp.CallToolRequest, emptyInput) (*mcp.CallToolResult, computer.ScreenshotInfo, error) {
-	return func(ctx context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, computer.ScreenshotInfo, error) {
+func computerTargets(controller computer.Controller) func(context.Context, *mcp.CallToolRequest, emptyInput) (*mcp.CallToolResult, computer.TargetsResult, error) {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, computer.TargetsResult, error) {
 		if controller == nil {
-			return nil, computer.ScreenshotInfo{}, errors.New("computer control is unavailable on this platform")
+			return nil, computer.TargetsResult{}, errors.New("computer control is unavailable on this platform")
 		}
-		data, info, err := controller.Screenshot(ctx)
+		result, err := controller.Targets(ctx)
+		return nil, result, err
+	}
+}
+
+func computerState(controller computer.Controller) func(context.Context, *mcp.CallToolRequest, computer.StateOptions) (*mcp.CallToolResult, computer.State, error) {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in computer.StateOptions) (*mcp.CallToolResult, computer.State, error) {
+		if controller == nil {
+			return nil, computer.State{}, errors.New("computer control is unavailable on this platform")
+		}
+		data, state, err := controller.State(ctx, in)
 		if err != nil {
-			return nil, computer.ScreenshotInfo{}, err
+			return nil, computer.State{}, err
 		}
-		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.ImageContent{Data: data, MIMEType: info.MIMEType}}}, info, nil
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.ImageContent{Data: data, MIMEType: state.MIMEType}}}, state, nil
 	}
 }
 

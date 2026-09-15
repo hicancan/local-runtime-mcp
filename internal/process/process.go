@@ -2,6 +2,8 @@ package process
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +20,9 @@ const (
 	defaultProcessTimeout = 300
 	defaultOutputBytes    = 1 << 20
 	maxOutputBytes        = 16 << 20
+	defaultYieldMS        = 10_000
+	defaultContinueMS     = 1_000
+	completedRetention    = 10 * time.Minute
 )
 
 var environmentName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -28,11 +33,23 @@ type Options struct {
 	Directory      string            `json:"directory,omitempty"`
 	Environment    map[string]string `json:"environment,omitempty"`
 	Stdin          string            `json:"stdin,omitempty"`
+	KeepStdinOpen  bool              `json:"keep_stdin_open,omitempty"`
 	TimeoutSeconds int               `json:"timeout_seconds,omitempty"`
 	MaxOutputBytes int               `json:"max_output_bytes,omitempty"`
+	YieldTimeMS    int               `json:"yield_time_ms,omitempty"`
+}
+
+type ContinueOptions struct {
+	SessionID   string `json:"session_id"`
+	Stdin       string `json:"stdin,omitempty"`
+	CloseStdin  bool   `json:"close_stdin,omitempty"`
+	Terminate   bool   `json:"terminate,omitempty"`
+	YieldTimeMS int    `json:"yield_time_ms,omitempty"`
 }
 
 type Result struct {
+	SessionID       string   `json:"session_id,omitempty"`
+	Running         bool     `json:"running"`
 	Program         string   `json:"program"`
 	Args            []string `json:"args,omitempty"`
 	Directory       string   `json:"directory"`
@@ -45,124 +62,347 @@ type Result struct {
 	TimedOut        bool     `json:"timed_out"`
 }
 
-func Run(ctx context.Context, options Options) (Result, error) {
+type processControl interface {
+	Kill() error
+	Close() error
+}
+
+type Manager struct {
+	ctx      context.Context
+	mu       sync.Mutex
+	sessions map[string]*session
+}
+
+type session struct {
+	id        string
+	program   string
+	args      []string
+	directory string
+	cmd       *exec.Cmd
+	control   processControl
+	stdin     io.WriteCloser
+	stdout    *streamBuffer
+	stderr    *streamBuffer
+	started   time.Time
+	done      chan struct{}
+
+	mu        sync.Mutex
+	exitCode  int
+	timedOut  bool
+	stdinDone bool
+}
+
+func NewManager(ctx context.Context) *Manager {
+	manager := &Manager{ctx: ctx, sessions: make(map[string]*session)}
+	go func() {
+		<-ctx.Done()
+		manager.closeAll()
+	}()
+	return manager
+}
+
+func (m *Manager) Run(callContext context.Context, options Options) (Result, error) {
+	directory, timeout, outputLimit, yield, err := validateOptions(options)
+	if err != nil {
+		return Result{}, err
+	}
+
+	command := exec.Command(options.Program, options.Args...)
+	command.Dir = directory
+	command.Env = append([]string{}, os.Environ()...)
+	for name, value := range options.Environment {
+		command.Env = append(command.Env, name+"="+value)
+	}
+
+	entry := &session{
+		id: newSessionID(), program: options.Program, args: append([]string(nil), options.Args...), directory: filepath.Clean(directory),
+		cmd: command, stdout: newStreamBuffer(outputLimit), stderr: newStreamBuffer(outputLimit), started: time.Now(), done: make(chan struct{}), exitCode: -1,
+	}
+	command.Stdout, command.Stderr = entry.stdout, entry.stderr
+	if options.Stdin != "" || options.KeepStdinOpen {
+		entry.stdin, err = command.StdinPipe()
+		if err != nil {
+			return Result{}, fmt.Errorf("create process stdin: %w", err)
+		}
+	}
+	entry.control, err = startManaged(command)
+	if err != nil {
+		return Result{}, fmt.Errorf("start process: %w", err)
+	}
+
+	m.mu.Lock()
+	m.sessions[entry.id] = entry
+	m.mu.Unlock()
+	go func() {
+		entry.wait()
+		timer := time.NewTimer(completedRetention)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			m.remove(entry.id)
+		case <-m.ctx.Done():
+			m.remove(entry.id)
+		}
+	}()
+	go entry.watch(m.ctx, time.Duration(timeout)*time.Second)
+
+	if entry.stdin != nil && options.Stdin != "" {
+		if _, err := io.WriteString(entry.stdin, options.Stdin); err != nil {
+			entry.terminate(false)
+			<-entry.done
+			m.remove(entry.id)
+			return Result{}, fmt.Errorf("write process stdin: %w", err)
+		}
+	}
+	if entry.stdin != nil && !options.KeepStdinOpen {
+		_ = entry.closeStdin()
+	}
+
+	timer := time.NewTimer(time.Duration(yield) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-entry.done:
+		m.remove(entry.id)
+		return entry.result(false), nil
+	case <-timer.C:
+		return entry.result(true), nil
+	case <-callContext.Done():
+		entry.terminate(false)
+		<-entry.done
+		m.remove(entry.id)
+		return Result{}, callContext.Err()
+	}
+}
+
+func (m *Manager) Continue(callContext context.Context, options ContinueOptions) (Result, error) {
+	if strings.TrimSpace(options.SessionID) == "" {
+		return Result{}, errors.New("session_id cannot be empty")
+	}
+	yield := options.YieldTimeMS
+	if yield == 0 {
+		yield = defaultContinueMS
+	}
+	if yield < 1 || yield > 60_000 {
+		return Result{}, errors.New("yield_time_ms must be between 1 and 60000")
+	}
+	m.mu.Lock()
+	entry := m.sessions[options.SessionID]
+	m.mu.Unlock()
+	if entry == nil {
+		return Result{}, errors.New("process session was not found or has already been collected")
+	}
+	if options.Stdin != "" {
+		entry.mu.Lock()
+		stdin, closed := entry.stdin, entry.stdinDone
+		if stdin == nil || closed {
+			entry.mu.Unlock()
+			return Result{}, errors.New("process stdin is not open; start it with keep_stdin_open")
+		}
+		_, writeErr := io.WriteString(stdin, options.Stdin)
+		entry.mu.Unlock()
+		if writeErr != nil {
+			return Result{}, fmt.Errorf("write process stdin: %w", writeErr)
+		}
+	}
+	if options.CloseStdin {
+		if err := entry.closeStdin(); err != nil {
+			return Result{}, err
+		}
+	}
+	if options.Terminate {
+		entry.terminate(false)
+	}
+
+	timer := time.NewTimer(time.Duration(yield) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-entry.done:
+		m.remove(entry.id)
+		return entry.result(false), nil
+	case <-timer.C:
+		return entry.result(true), nil
+	case <-callContext.Done():
+		return Result{}, callContext.Err()
+	}
+}
+
+func (m *Manager) remove(id string) {
+	m.mu.Lock()
+	delete(m.sessions, id)
+	m.mu.Unlock()
+}
+
+func (m *Manager) closeAll() {
+	m.mu.Lock()
+	sessions := make([]*session, 0, len(m.sessions))
+	for _, entry := range m.sessions {
+		sessions = append(sessions, entry)
+	}
+	m.mu.Unlock()
+	for _, entry := range sessions {
+		entry.terminate(false)
+	}
+}
+
+func (s *session) wait() {
+	err := s.cmd.Wait()
+	s.mu.Lock()
+	if err == nil {
+		s.exitCode = 0
+	} else {
+		var exitError *exec.ExitError
+		if errors.As(err, &exitError) {
+			s.exitCode = exitError.ExitCode()
+		}
+	}
+	s.mu.Unlock()
+	_ = s.control.Close()
+	close(s.done)
+}
+
+func (s *session) watch(ctx context.Context, timeout time.Duration) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-s.done:
+	case <-ctx.Done():
+		s.terminate(false)
+	case <-timer.C:
+		s.terminate(true)
+	}
+}
+
+func (s *session) terminate(timedOut bool) {
+	s.mu.Lock()
+	if timedOut {
+		s.timedOut = true
+	}
+	s.mu.Unlock()
+	_ = s.control.Kill()
+}
+
+func (s *session) closeStdin() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stdin == nil || s.stdinDone {
+		return nil
+	}
+	s.stdinDone = true
+	return s.stdin.Close()
+}
+
+func (s *session) result(running bool) Result {
+	stdout, stdoutTruncated := s.stdout.Drain()
+	stderr, stderrTruncated := s.stderr.Drain()
+	s.mu.Lock()
+	exitCode, timedOut := s.exitCode, s.timedOut
+	s.mu.Unlock()
+	result := Result{
+		Running: running, Program: s.program, Args: append([]string(nil), s.args...), Directory: s.directory,
+		ExitCode: exitCode, Stdout: stdout, Stderr: stderr, StdoutTruncated: stdoutTruncated,
+		StderrTruncated: stderrTruncated, DurationMS: time.Since(s.started).Milliseconds(), TimedOut: timedOut,
+	}
+	if running {
+		result.SessionID = s.id
+	}
+	return result
+}
+
+func validateOptions(options Options) (string, int, int, int, error) {
 	if strings.TrimSpace(options.Program) == "" {
-		return Result{}, errors.New("program cannot be empty")
+		return "", 0, 0, 0, errors.New("program cannot be empty")
 	}
 	directory := options.Directory
 	if directory == "" {
 		var err error
 		directory, err = os.Getwd()
 		if err != nil {
-			return Result{}, fmt.Errorf("find current working directory: %w", err)
+			return "", 0, 0, 0, fmt.Errorf("find current working directory: %w", err)
 		}
 	}
 	directory, err := filepath.Abs(directory)
 	if err != nil {
-		return Result{}, fmt.Errorf("resolve process directory: %w", err)
+		return "", 0, 0, 0, fmt.Errorf("resolve process directory: %w", err)
 	}
 	info, err := os.Stat(directory)
 	if err != nil {
-		return Result{}, err
+		return "", 0, 0, 0, err
 	}
 	if !info.IsDir() {
-		return Result{}, errors.New("process directory must be a directory")
+		return "", 0, 0, 0, errors.New("process directory must be a directory")
 	}
 	timeout := options.TimeoutSeconds
 	if timeout == 0 {
 		timeout = defaultProcessTimeout
 	}
 	if timeout < 1 || timeout > 86_400 {
-		return Result{}, errors.New("timeout_seconds must be between 1 and 86400")
+		return "", 0, 0, 0, errors.New("timeout_seconds must be between 1 and 86400")
 	}
 	outputLimit := options.MaxOutputBytes
 	if outputLimit == 0 {
 		outputLimit = defaultOutputBytes
 	}
 	if outputLimit < 1 || outputLimit > maxOutputBytes {
-		return Result{}, fmt.Errorf("max_output_bytes must be between 1 and %d", maxOutputBytes)
+		return "", 0, 0, 0, fmt.Errorf("max_output_bytes must be between 1 and %d", maxOutputBytes)
+	}
+	yield := options.YieldTimeMS
+	if yield == 0 {
+		yield = defaultYieldMS
+	}
+	if yield < 1 || yield > 60_000 {
+		return "", 0, 0, 0, errors.New("yield_time_ms must be between 1 and 60000")
 	}
 	for name := range options.Environment {
 		if !environmentName.MatchString(name) {
-			return Result{}, fmt.Errorf("invalid environment variable name %q", name)
+			return "", 0, 0, 0, fmt.Errorf("invalid environment variable name %q", name)
 		}
 	}
-
-	processContext, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
-	defer cancel()
-	command := exec.CommandContext(processContext, options.Program, options.Args...)
-	command.Dir = directory
-	command.Env = append([]string{}, os.Environ()...)
-	for name, value := range options.Environment {
-		command.Env = append(command.Env, name+"="+value)
-	}
-	command.Stdin = strings.NewReader(options.Stdin)
-	stdout := newLimitedBuffer(outputLimit)
-	stderr := newLimitedBuffer(outputLimit)
-	command.Stdout = stdout
-	command.Stderr = stderr
-
-	started := time.Now()
-	runErr := command.Run()
-	result := Result{
-		Program: options.Program, Args: options.Args, Directory: filepath.Clean(directory),
-		Stdout: stdout.String(), Stderr: stderr.String(), StdoutTruncated: stdout.Truncated(),
-		StderrTruncated: stderr.Truncated(), DurationMS: time.Since(started).Milliseconds(),
-	}
-	if processContext.Err() == context.DeadlineExceeded {
-		result.ExitCode, result.TimedOut = -1, true
-		return result, nil
-	}
-	if ctx.Err() != nil {
-		result.ExitCode = -1
-		return result, ctx.Err()
-	}
-	if runErr == nil {
-		return result, nil
-	}
-	var exitErr *exec.ExitError
-	if errors.As(runErr, &exitErr) {
-		result.ExitCode = exitErr.ExitCode()
-		return result, nil
-	}
-	return result, fmt.Errorf("start process: %w", runErr)
+	return directory, timeout, outputLimit, yield, nil
 }
 
-type limitedBuffer struct {
+func newSessionID() string {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err == nil {
+		return hex.EncodeToString(value[:])
+	}
+	return fmt.Sprintf("%d", time.Now().UnixNano())
+}
+
+type streamBuffer struct {
 	mu        sync.Mutex
 	data      []byte
 	limit     int
 	truncated bool
 }
 
-func newLimitedBuffer(limit int) *limitedBuffer {
-	return &limitedBuffer{data: make([]byte, 0, min(limit, 64*1024)), limit: limit}
+func newStreamBuffer(limit int) *streamBuffer {
+	return &streamBuffer{data: make([]byte, 0, min(limit, 64*1024)), limit: limit}
 }
 
-func (b *limitedBuffer) Write(data []byte) (int, error) {
+func (b *streamBuffer) Write(data []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	remaining := b.limit - len(b.data)
-	if remaining > 0 {
-		amount := min(len(data), remaining)
-		b.data = append(b.data, data[:amount]...)
+	if len(data) >= b.limit {
+		b.data = append(b.data[:0], data[len(data)-b.limit:]...)
+		b.truncated = true
+		return len(data), nil
 	}
-	if len(data) > remaining {
+	if overflow := len(b.data) + len(data) - b.limit; overflow > 0 {
+		copy(b.data, b.data[overflow:])
+		b.data = b.data[:len(b.data)-overflow]
 		b.truncated = true
 	}
+	b.data = append(b.data, data...)
 	return len(data), nil
 }
 
-func (b *limitedBuffer) String() string {
+func (b *streamBuffer) Drain() (string, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return string(b.data)
+	value, truncated := string(b.data), b.truncated
+	b.data = b.data[:0]
+	b.truncated = false
+	return value, truncated
 }
 
-func (b *limitedBuffer) Truncated() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.truncated
-}
-
-var _ io.Writer = (*limitedBuffer)(nil)
+var _ io.Writer = (*streamBuffer)(nil)

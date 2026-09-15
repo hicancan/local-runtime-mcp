@@ -43,7 +43,7 @@ func TestBridgeRoundTrip(t *testing.T) {
 	if len(tabs) != 1 || tabs[0].ID != 7 || tabs[0].Title != "Example" {
 		t.Fatalf("unexpected tabs: %+v", tabs)
 	}
-	data, info, err := bridge.Screenshot(ctx, 7)
+	data, info, err := bridge.Screenshot(ctx, ScreenshotOptions{TabID: 7})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestBridgeRoundTrip(t *testing.T) {
 
 func fakeExtension(ctx context.Context, address string, errorsChannel chan<- error) {
 	for {
-		body := bytes.NewBufferString(`{"instance_id":"test-instance","browser":"test","extension_version":"3.0.0"}`)
+		body := bytes.NewBufferString(`{"instance_id":"test-instance","browser":"test","extension_version":"4.0.0"}`)
 		request, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+address+"/v1/poll", body)
 		request.Header.Set("Authorization", "Bearer "+testToken)
 		request.Header.Set("Content-Type", "application/json")
@@ -155,7 +155,7 @@ func TestBridgeRejectsSecondExtensionInstance(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = bridge.Close(context.Background()) })
 	poll := func(requestContext context.Context, instance string) (*http.Response, error) {
-		body := bytes.NewBufferString(`{"instance_id":"` + instance + `"}`)
+		body := bytes.NewBufferString(`{"instance_id":"` + instance + `","extension_version":"` + ExtensionVersion + `"}`)
 		request, _ := http.NewRequestWithContext(requestContext, http.MethodPost, "http://"+bridge.Status().Address+"/v1/poll", body)
 		request.Header.Set("Authorization", "Bearer "+testToken)
 		request.Header.Set("Content-Type", "application/json")
@@ -189,8 +189,32 @@ func TestBridgeRejectsSecondExtensionInstance(t *testing.T) {
 	}
 }
 
+func TestBridgeRejectsOldExtension(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bridge, err := Start(ctx, config.Browser{Listen: "127.0.0.1:0", Token: testToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bridge.Close(context.Background()) })
+	body := bytes.NewBufferString(`{"instance_id":"old","extension_version":"3.0.0"}`)
+	request, _ := http.NewRequest(http.MethodPost, "http://"+bridge.Status().Address+"/v1/poll", body)
+	request.Header.Set("Authorization", "Bearer "+testToken)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusUpgradeRequired || bridge.Status().Connected {
+		t.Fatalf("old extension status=%d bridge=%+v", response.StatusCode, bridge.Status())
+	}
+}
+
 func TestActionValidation(t *testing.T) {
-	valid := []Action{{Kind: "click", TabID: 1, Ref: "r1"}, {Kind: "type", TabID: 1, Selector: "input"}, {Kind: "key", TabID: 1, Key: "Control+L"}, {Kind: "scroll", TabID: 1, ScrollY: 500}, {Kind: "evaluate", TabID: 1, Script: "document.title"}, {Kind: "back", TabID: 1}}
+	checked := true
+	accepted := false
+	valid := []Action{{Kind: "click", TabID: 1, Ref: "q1:e1"}, {Kind: "double_click", TabID: 1, ScreenshotID: "p1", X: 0, Y: 0}, {Kind: "hover", TabID: 1, Selector: "button"}, {Kind: "drag", TabID: 1, Ref: "q1:e1", ToX: 2, ToY: 3}, {Kind: "type_text", TabID: 1, Selector: "input", Text: "x"}, {Kind: "set_value", TabID: 1, Ref: "q1:e1", Text: "x"}, {Kind: "press_key", TabID: 1, Key: "Control+L"}, {Kind: "scroll", TabID: 1, ScrollY: 500}, {Kind: "select", TabID: 1, Selector: "select", Option: "one"}, {Kind: "check", TabID: 1, Ref: "q1:e1", Checked: &checked}, {Kind: "upload_files", TabID: 1, Selector: "input", Files: []string{"C:/x.txt"}}, {Kind: "handle_dialog", TabID: 1, Accept: &accepted}, {Kind: "evaluate", TabID: 1, Script: "document.title"}, {Kind: "back", TabID: 1}}
 	for _, action := range valid {
 		if err := validateAction(action); err != nil {
 			t.Errorf("%+v: %v", action, err)
@@ -198,5 +222,18 @@ func TestActionValidation(t *testing.T) {
 	}
 	if err := validateAction(Action{Kind: "click", TabID: 1}); err == nil {
 		t.Fatal("targetless click should fail")
+	}
+	if err := validateAction(Action{Kind: "check", TabID: 1, Ref: "q1:e1"}); err == nil {
+		t.Fatal("check without checked should fail")
+	}
+}
+
+func TestScreenshotValidation(t *testing.T) {
+	bridge := &Bridge{}
+	if _, _, err := bridge.Screenshot(context.Background(), ScreenshotOptions{TabID: 1, FullPage: true, ClipW: 10, ClipH: 10}); err == nil {
+		t.Fatal("full-page clip should fail")
+	}
+	if _, _, err := bridge.Screenshot(context.Background(), ScreenshotOptions{TabID: 1, ClipW: 10}); err == nil {
+		t.Fatal("incomplete clip should fail")
 	}
 }

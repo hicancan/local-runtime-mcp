@@ -129,7 +129,7 @@ func Save(path string, cfg *Config) (string, error) {
 	if err := temporary.Close(); err != nil {
 		return "", err
 	}
-	if err := os.Rename(temporaryName, resolved); err != nil {
+	if err := replaceFile(temporaryName, resolved); err != nil {
 		return "", err
 	}
 	committed = true
