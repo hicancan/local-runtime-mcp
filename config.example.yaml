@@ -1,12 +1,3 @@
-roots:
-  default:
-    path: ${LRMCP_ROOT}
-    description: Primary filesystem access root
-
 browser:
-  enabled: true
   listen: 127.0.0.1:9315
   token: ${LRMCP_BROWSER_TOKEN}
-
-computer:
-  enabled: true

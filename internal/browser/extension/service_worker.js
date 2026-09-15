@@ -1,6 +1,6 @@
 import { packagedConfig } from './runtime_config.js';
 
-const VERSION = '2.0.0';
+const VERSION = '3.0.0';
 const attachedTabs = new Set();
 let generation = 0;
 
@@ -17,8 +17,13 @@ async function run(currentGeneration) {
   while (currentGeneration === generation) {
     const settings = await chrome.storage.local.get({
       address: packagedConfig.address || '127.0.0.1:9315',
-      token: packagedConfig.token || ''
+      token: packagedConfig.token || '',
+      instanceId: ''
     });
+    if (!settings.instanceId) {
+      settings.instanceId = crypto.randomUUID();
+      await chrome.storage.local.set({ instanceId: settings.instanceId });
+    }
     if (!settings.token || settings.token.length < 32) {
       await delay(2000);
       continue;
@@ -28,16 +33,16 @@ async function run(currentGeneration) {
     try {
       const response = await fetch(`${base}/poll`, {
         method: 'POST', headers,
-        body: JSON.stringify({ browser: navigator.userAgent, extension_version: VERSION })
+        body: JSON.stringify({ instance_id: settings.instanceId, browser: navigator.userAgent, extension_version: VERSION })
       });
       if (response.status === 204) continue;
       if (!response.ok) throw new Error(`bridge returned HTTP ${response.status}`);
       const command = await response.json();
       let payload;
       try {
-        payload = { id: command.id, result: await execute(command.method, command.params || {}) };
+        payload = { id: command.id, instance_id: settings.instanceId, result: await execute(command.method, command.params || {}) };
       } catch (error) {
-        payload = { id: command.id, error: error?.message || String(error) };
+        payload = { id: command.id, instance_id: settings.instanceId, error: error?.message || String(error) };
       }
       const sent = await fetch(`${base}/result`, { method: 'POST', headers, body: JSON.stringify(payload) });
       if (!sent.ok && sent.status !== 404) throw new Error(`result returned HTTP ${sent.status}`);

@@ -158,7 +158,7 @@ func browserAction(bridge *browser.Bridge) func(context.Context, *mcp.CallToolRe
 func computerScreenshot(controller computer.Controller) func(context.Context, *mcp.CallToolRequest, emptyInput) (*mcp.CallToolResult, computer.ScreenshotInfo, error) {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, computer.ScreenshotInfo, error) {
 		if controller == nil {
-			return nil, computer.ScreenshotInfo{}, errors.New("computer control is disabled")
+			return nil, computer.ScreenshotInfo{}, errors.New("computer control is unavailable on this platform")
 		}
 		data, info, err := controller.Screenshot(ctx)
 		if err != nil {
@@ -171,7 +171,7 @@ func computerScreenshot(controller computer.Controller) func(context.Context, *m
 func computerAction(controller computer.Controller) func(context.Context, *mcp.CallToolRequest, computer.Action) (*mcp.CallToolResult, computer.ActionResult, error) {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in computer.Action) (*mcp.CallToolResult, computer.ActionResult, error) {
 		if controller == nil {
-			return nil, computer.ActionResult{}, errors.New("computer control is disabled")
+			return nil, computer.ActionResult{}, errors.New("computer control is unavailable on this platform")
 		}
 		result, err := controller.Act(ctx, in)
 		return nil, result, err

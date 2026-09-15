@@ -21,32 +21,33 @@ import (
 	"github.com/hicancan/local-runtime-mcp/internal/config"
 )
 
-const ExtensionVersion = "2.0.0"
+const ExtensionVersion = "3.0.0"
 
 type Bridge struct {
-	enabled  bool
-	address  string
-	token    string
-	server   *http.Server
-	commands chan command
-	mu       sync.Mutex
-	pending  map[string]chan response
-	lastSeen time.Time
-	peer     Peer
-	sequence atomic.Uint64
+	configured bool
+	address    string
+	token      string
+	server     *http.Server
+	commands   chan command
+	mu         sync.Mutex
+	pending    map[string]chan response
+	lastSeen   time.Time
+	peer       Peer
+	sequence   atomic.Uint64
 }
 
 type Peer struct {
+	InstanceID       string `json:"instance_id,omitempty"`
 	Browser          string `json:"browser,omitempty"`
 	ExtensionVersion string `json:"extension_version,omitempty"`
 }
 
 type Status struct {
-	Enabled   bool      `json:"enabled"`
-	Connected bool      `json:"connected"`
-	Address   string    `json:"address,omitempty"`
-	LastSeen  time.Time `json:"last_seen,omitempty"`
-	Peer      Peer      `json:"peer,omitempty"`
+	Configured bool      `json:"configured"`
+	Connected  bool      `json:"connected"`
+	Address    string    `json:"address,omitempty"`
+	LastSeen   time.Time `json:"last_seen,omitempty"`
+	Peer       Peer      `json:"peer,omitempty"`
 }
 
 type Tab struct {
@@ -114,15 +115,19 @@ type command struct {
 }
 
 type response struct {
-	ID     string          `json:"id"`
-	Result json.RawMessage `json:"result,omitempty"`
-	Error  string          `json:"error,omitempty"`
+	ID         string          `json:"id"`
+	InstanceID string          `json:"instance_id"`
+	Result     json.RawMessage `json:"result,omitempty"`
+	Error      string          `json:"error,omitempty"`
 }
 
 func Start(ctx context.Context, configuration config.Browser) (*Bridge, error) {
-	bridge := &Bridge{enabled: configuration.Enabled, token: configuration.Token, commands: make(chan command), pending: make(map[string]chan response)}
-	if !configuration.Enabled {
+	bridge := &Bridge{configured: configuration.Token != "", token: configuration.Token, commands: make(chan command), pending: make(map[string]chan response)}
+	if !bridge.configured {
 		return bridge, nil
+	}
+	if configuration.Listen == "" {
+		configuration.Listen = config.DefaultListen
 	}
 	listener, err := net.Listen("tcp", configuration.Listen)
 	if err != nil {
@@ -159,7 +164,7 @@ func (b *Bridge) Close(ctx context.Context) error {
 func (b *Bridge) Status() Status {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return Status{Enabled: b.enabled, Connected: b.connectedLocked(), Address: b.address, LastSeen: b.lastSeen, Peer: b.peer}
+	return Status{Configured: b.configured, Connected: b.connectedLocked(), Address: b.address, LastSeen: b.lastSeen, Peer: b.peer}
 }
 
 func (b *Bridge) Tabs(ctx context.Context) ([]Tab, error) {
@@ -212,8 +217,8 @@ func (b *Bridge) Act(ctx context.Context, action Action) (ActionResult, error) {
 }
 
 func (b *Bridge) call(ctx context.Context, method string, params, output any) error {
-	if !b.enabled {
-		return errors.New("browser bridge is disabled; enable browser in the configuration")
+	if !b.configured {
+		return errors.New("browser is not configured; run lrmcp browser-setup")
 	}
 	b.mu.Lock()
 	if !b.connectedLocked() {
@@ -269,7 +274,16 @@ func (b *Bridge) poll(writer http.ResponseWriter, request *http.Request) {
 		http.Error(writer, "invalid peer metadata", http.StatusBadRequest)
 		return
 	}
+	if strings.TrimSpace(peer.InstanceID) == "" {
+		http.Error(writer, "instance_id is required", http.StatusBadRequest)
+		return
+	}
 	b.mu.Lock()
+	if b.connectedLocked() && b.peer.InstanceID != "" && b.peer.InstanceID != peer.InstanceID {
+		b.mu.Unlock()
+		http.Error(writer, "another browser extension instance is connected", http.StatusConflict)
+		return
+	}
 	b.lastSeen = time.Now()
 	b.peer = peer
 	b.mu.Unlock()
@@ -295,11 +309,16 @@ func (b *Bridge) receiveResult(writer http.ResponseWriter, request *http.Request
 		return
 	}
 	var result response
-	if err := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 64<<20)).Decode(&result); err != nil || result.ID == "" {
+	if err := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 64<<20)).Decode(&result); err != nil || result.ID == "" || result.InstanceID == "" {
 		http.Error(writer, "invalid result", http.StatusBadRequest)
 		return
 	}
 	b.mu.Lock()
+	if b.peer.InstanceID == "" || result.InstanceID != b.peer.InstanceID {
+		b.mu.Unlock()
+		http.Error(writer, "browser extension instance does not own this bridge", http.StatusConflict)
+		return
+	}
 	channel := b.pending[result.ID]
 	b.lastSeen = time.Now()
 	b.mu.Unlock()

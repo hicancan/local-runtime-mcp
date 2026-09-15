@@ -1,10 +1,8 @@
-package core
+package filesystem
 
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -23,12 +21,19 @@ const (
 	defaultResults   = 200
 )
 
-func (r *Runtime) List(rootName, path string, maxDepth int, includeHidden bool) ([]FileEntry, error) {
-	root, err := r.Root(rootName)
-	if err != nil {
-		return nil, err
+func resolve(path string) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", errors.New("path cannot be empty")
 	}
-	start, err := r.Resolve(rootName, path)
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve absolute path: %w", err)
+	}
+	return filepath.Clean(abs), nil
+}
+
+func List(path string, maxDepth int, includeHidden bool) ([]FileEntry, error) {
+	start, err := resolve(path)
 	if err != nil {
 		return nil, err
 	}
@@ -45,7 +50,6 @@ func (r *Runtime) List(rootName, path string, maxDepth int, includeHidden bool) 
 	if maxDepth < 1 || maxDepth > 64 {
 		return nil, errors.New("max_depth must be between 1 and 64")
 	}
-	startDepth := depth(relativeSlash(root.Path, start))
 	entries := make([]FileEntry, 0)
 	err = filepath.WalkDir(start, func(current string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -54,8 +58,11 @@ func (r *Runtime) List(rootName, path string, maxDepth int, includeHidden bool) 
 		if current == start {
 			return nil
 		}
-		rel := relativeSlash(root.Path, current)
-		currentDepth := depth(rel) - startDepth
+		rel, err := filepath.Rel(start, current)
+		if err != nil {
+			return err
+		}
+		currentDepth := strings.Count(filepath.ToSlash(rel), "/") + 1
 		if currentDepth > maxDepth {
 			if entry.IsDir() {
 				return filepath.SkipDir
@@ -72,21 +79,14 @@ func (r *Runtime) List(rootName, path string, maxDepth int, includeHidden bool) 
 		if err != nil {
 			return err
 		}
-		entries = append(entries, FileEntry{Path: rel, Type: fileType(info), Size: info.Size(), ModTime: info.ModTime()})
-		if info.Mode()&os.ModeSymlink != 0 && entry.IsDir() {
-			return filepath.SkipDir
-		}
+		entries = append(entries, FileEntry{Path: filepath.Clean(current), Type: fileType(info), Size: info.Size(), ModTime: info.ModTime()})
 		return nil
 	})
 	return entries, err
 }
 
-func (r *Runtime) Stat(rootName, path string) (FileInfo, error) {
-	root, err := r.Root(rootName)
-	if err != nil {
-		return FileInfo{}, err
-	}
-	resolved, err := r.Resolve(rootName, path)
+func Stat(path string) (FileInfo, error) {
+	resolved, err := resolve(path)
 	if err != nil {
 		return FileInfo{}, err
 	}
@@ -94,7 +94,7 @@ func (r *Runtime) Stat(rootName, path string) (FileInfo, error) {
 	if err != nil {
 		return FileInfo{}, err
 	}
-	result := FileInfo{Path: relativeSlash(root.Path, resolved), Type: fileType(info), Size: info.Size(), ModTime: info.ModTime()}
+	result := FileInfo{Path: resolved, Type: fileType(info), Size: info.Size(), ModTime: info.ModTime()}
 	if !info.Mode().IsRegular() {
 		return result, nil
 	}
@@ -108,25 +108,12 @@ func (r *Runtime) Stat(rootName, path string) (FileInfo, error) {
 	if err != nil && !errors.Is(err, io.EOF) {
 		return FileInfo{}, err
 	}
-	prefix = prefix[:read]
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return FileInfo{}, err
-	}
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return FileInfo{}, err
-	}
-	result.SHA256 = hex.EncodeToString(hash.Sum(nil))
-	result.MIMEType = detectMIME(resolved, prefix)
+	result.MIMEType = detectMIME(resolved, prefix[:read])
 	return result, nil
 }
 
-func (r *Runtime) ReadText(rootName, path string, maxBytes int) (TextReadResult, error) {
-	root, err := r.Root(rootName)
-	if err != nil {
-		return TextReadResult{}, err
-	}
-	resolved, err := r.Resolve(rootName, path)
+func ReadText(path string, maxBytes int) (TextReadResult, error) {
+	resolved, err := resolve(path)
 	if err != nil {
 		return TextReadResult{}, err
 	}
@@ -162,27 +149,13 @@ func (r *Runtime) ReadText(rootName, path string, maxBytes int) (TextReadResult,
 	if !utf8.Valid(data) || bytes.IndexByte(data, 0) >= 0 {
 		return TextReadResult{}, errors.New("file is not UTF-8 text")
 	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return TextReadResult{}, err
-	}
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return TextReadResult{}, err
-	}
-	return TextReadResult{Path: relativeSlash(root.Path, resolved), Content: string(data), Size: info.Size(), SHA256: hex.EncodeToString(hash.Sum(nil)), Truncated: truncated}, nil
+	return TextReadResult{Path: resolved, Content: string(data), Size: info.Size(), Truncated: truncated}, nil
 }
 
-func (r *Runtime) WriteText(rootName, path, content, expectedSHA string, createOnly bool) (TextWriteResult, error) {
-	root, err := r.Root(rootName)
+func WriteText(path, content string, createOnly bool) (TextWriteResult, error) {
+	resolved, err := resolve(path)
 	if err != nil {
 		return TextWriteResult{}, err
-	}
-	resolved, err := r.Resolve(rootName, path)
-	if err != nil {
-		return TextWriteResult{}, err
-	}
-	if strings.TrimSpace(path) == "" {
-		return TextWriteResult{}, errors.New("path cannot be empty")
 	}
 	data := []byte(content)
 	if !utf8.Valid(data) {
@@ -190,43 +163,29 @@ func (r *Runtime) WriteText(rootName, path, content, expectedSHA string, createO
 	}
 	created := false
 	mode := os.FileMode(0o644)
-	existing, readErr := os.ReadFile(resolved)
+	info, statErr := os.Stat(resolved)
 	switch {
-	case readErr == nil:
+	case statErr == nil:
 		if createOnly {
 			return TextWriteResult{}, errors.New("file already exists")
-		}
-		info, err := os.Stat(resolved)
-		if err != nil {
-			return TextWriteResult{}, err
 		}
 		if !info.Mode().IsRegular() {
 			return TextWriteResult{}, errors.New("write path must be a regular file")
 		}
 		mode = info.Mode().Perm()
-		if expectedSHA != "" && !strings.EqualFold(expectedSHA, digest(existing)) {
-			return TextWriteResult{}, errors.New("file changed: expected_sha256 does not match")
-		}
-	case errors.Is(readErr, os.ErrNotExist):
+	case errors.Is(statErr, os.ErrNotExist):
 		created = true
-		if expectedSHA != "" {
-			return TextWriteResult{}, errors.New("file does not exist for expected_sha256 check")
-		}
 	default:
-		return TextWriteResult{}, readErr
+		return TextWriteResult{}, statErr
 	}
 	if err := atomicWrite(resolved, data, mode); err != nil {
 		return TextWriteResult{}, err
 	}
-	return TextWriteResult{Path: relativeSlash(root.Path, resolved), Bytes: len(data), SHA256: digest(data), Created: created}, nil
+	return TextWriteResult{Path: resolved, Bytes: len(data), Created: created}, nil
 }
 
-func (r *Runtime) EditText(rootName, path, oldText, newText, expectedSHA string, replaceAll bool) (TextEditResult, error) {
-	root, err := r.Root(rootName)
-	if err != nil {
-		return TextEditResult{}, err
-	}
-	resolved, err := r.Resolve(rootName, path)
+func EditText(path, oldText, newText string, replaceAll bool) (TextEditResult, error) {
+	resolved, err := resolve(path)
 	if err != nil {
 		return TextEditResult{}, err
 	}
@@ -250,10 +209,6 @@ func (r *Runtime) EditText(rootName, path, oldText, newText, expectedSHA string,
 	if !utf8.Valid(data) || bytes.IndexByte(data, 0) >= 0 {
 		return TextEditResult{}, errors.New("file is not UTF-8 text")
 	}
-	previousSHA := digest(data)
-	if expectedSHA != "" && !strings.EqualFold(expectedSHA, previousSHA) {
-		return TextEditResult{}, errors.New("file changed: expected_sha256 does not match")
-	}
 	count := strings.Count(string(data), oldText)
 	if count == 0 {
 		return TextEditResult{}, errors.New("old_text was not found")
@@ -261,25 +216,19 @@ func (r *Runtime) EditText(rootName, path, oldText, newText, expectedSHA string,
 	if !replaceAll && count != 1 {
 		return TextEditResult{}, fmt.Errorf("old_text matched %d times; provide a unique value or set replace_all", count)
 	}
-	replacements := count
-	limit := -1
+	replacements, limit := count, -1
 	if !replaceAll {
-		replacements = 1
-		limit = 1
+		replacements, limit = 1, 1
 	}
 	updated := []byte(strings.Replace(string(data), oldText, newText, limit))
 	if err := atomicWrite(resolved, updated, info.Mode().Perm()); err != nil {
 		return TextEditResult{}, err
 	}
-	return TextEditResult{Path: relativeSlash(root.Path, resolved), Bytes: len(updated), SHA256: digest(updated), PreviousSHA256: previousSHA, Replacements: replacements}, nil
+	return TextEditResult{Path: resolved, Bytes: len(updated), Replacements: replacements}, nil
 }
 
-func (r *Runtime) SearchText(rootName, path, query string, regex, caseSensitive, includeHidden bool, maxResults int) ([]SearchMatch, error) {
-	root, err := r.Root(rootName)
-	if err != nil {
-		return nil, err
-	}
-	start, err := r.Resolve(rootName, path)
+func SearchText(path, query string, regex, caseSensitive, includeHidden bool, maxResults int) ([]SearchMatch, error) {
+	start, err := resolve(path)
 	if err != nil {
 		return nil, err
 	}
@@ -308,11 +257,8 @@ func (r *Runtime) SearchText(rootName, path, query string, regex, caseSensitive,
 		if walkErr != nil {
 			return walkErr
 		}
-		if current == start && !entry.IsDir() {
-			return searchFile(root.Path, current, re, maxResults, &matches)
-		}
 		if entry.IsDir() {
-			if current != start && ((!includeHidden && strings.HasPrefix(entry.Name(), ".")) || entry.Name() == ".git") {
+			if current != start && !includeHidden && strings.HasPrefix(entry.Name(), ".") {
 				return filepath.SkipDir
 			}
 			return nil
@@ -320,12 +266,12 @@ func (r *Runtime) SearchText(rootName, path, query string, regex, caseSensitive,
 		if len(matches) >= maxResults || entry.Type()&os.ModeSymlink != 0 || (!includeHidden && strings.HasPrefix(entry.Name(), ".")) {
 			return nil
 		}
-		return searchFile(root.Path, current, re, maxResults, &matches)
+		return searchFile(current, re, maxResults, &matches)
 	})
 	return matches, err
 }
 
-func searchFile(root, path string, re *regexp.Regexp, limit int, matches *[]SearchMatch) error {
+func searchFile(path string, re *regexp.Regexp, limit int, matches *[]SearchMatch) error {
 	info, err := os.Stat(path)
 	if err != nil || !info.Mode().IsRegular() || info.Size() > maxTextBytes {
 		return nil
@@ -344,16 +290,12 @@ func searchFile(root, path string, re *regexp.Regexp, limit int, matches *[]Sear
 		if !utf8.Valid(data) || bytes.IndexByte(data, 0) >= 0 {
 			return nil
 		}
-		locations := re.FindAllIndex(data, -1)
-		for _, location := range locations {
-			*matches = append(*matches, SearchMatch{Path: relativeSlash(root, path), Line: line, Column: utf8.RuneCount(data[:location[0]]) + 1, Text: scanner.Text()})
+		for _, location := range re.FindAllIndex(data, -1) {
+			*matches = append(*matches, SearchMatch{Path: path, Line: line, Column: utf8.RuneCount(data[:location[0]]) + 1, Text: scanner.Text()})
 			if len(*matches) >= limit {
 				return nil
 			}
 		}
-	}
-	if err := scanner.Err(); err != nil && !errors.Is(err, bufio.ErrTooLong) {
-		return nil
 	}
 	return nil
 }
@@ -395,11 +337,6 @@ func atomicWrite(path string, data []byte, mode os.FileMode) error {
 	return nil
 }
 
-func digest(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
-}
-
 func detectMIME(path string, data []byte) string {
 	if value := mime.TypeByExtension(strings.ToLower(filepath.Ext(path))); value != "" {
 		return value
@@ -418,11 +355,4 @@ func fileType(info os.FileInfo) string {
 	default:
 		return "other"
 	}
-}
-
-func depth(path string) int {
-	if path == "" {
-		return 0
-	}
-	return strings.Count(filepath.ToSlash(path), "/") + 1
 }

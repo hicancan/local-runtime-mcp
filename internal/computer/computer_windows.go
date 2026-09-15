@@ -185,8 +185,7 @@ func onInputDesktop(action func() error) error {
 	const access = 0x0001 | 0x0080 | 0x0100
 	inputDesktop, _, callErr := openInputDesktop.Call(0, 0, access)
 	if inputDesktop == 0 {
-		_ = callErr
-		return action()
+		return fmt.Errorf("OpenInputDesktop failed; lrmcp must run in the current interactive Windows session: %w", callErr)
 	}
 	defer closeDesktop.Call(inputDesktop)
 	if inputDesktop != original {

@@ -1,4 +1,4 @@
-package core
+package process
 
 import (
 	"context"
@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -21,38 +22,69 @@ const (
 
 var environmentName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-func (r *Runtime) RunProcess(ctx context.Context, rootName string, options ProcessOptions) (ProcessResult, error) {
+type Options struct {
+	Program        string            `json:"program"`
+	Args           []string          `json:"args,omitempty"`
+	Directory      string            `json:"directory,omitempty"`
+	Environment    map[string]string `json:"environment,omitempty"`
+	Stdin          string            `json:"stdin,omitempty"`
+	TimeoutSeconds int               `json:"timeout_seconds,omitempty"`
+	MaxOutputBytes int               `json:"max_output_bytes,omitempty"`
+}
+
+type Result struct {
+	Program         string   `json:"program"`
+	Args            []string `json:"args,omitempty"`
+	Directory       string   `json:"directory"`
+	ExitCode        int      `json:"exit_code"`
+	Stdout          string   `json:"stdout"`
+	Stderr          string   `json:"stderr"`
+	StdoutTruncated bool     `json:"stdout_truncated"`
+	StderrTruncated bool     `json:"stderr_truncated"`
+	DurationMS      int64    `json:"duration_ms"`
+	TimedOut        bool     `json:"timed_out"`
+}
+
+func Run(ctx context.Context, options Options) (Result, error) {
 	if strings.TrimSpace(options.Program) == "" {
-		return ProcessResult{}, errors.New("program cannot be empty")
+		return Result{}, errors.New("program cannot be empty")
 	}
-	directory, err := r.Resolve(rootName, options.Directory)
+	directory := options.Directory
+	if directory == "" {
+		var err error
+		directory, err = os.Getwd()
+		if err != nil {
+			return Result{}, fmt.Errorf("find current working directory: %w", err)
+		}
+	}
+	directory, err := filepath.Abs(directory)
 	if err != nil {
-		return ProcessResult{}, err
+		return Result{}, fmt.Errorf("resolve process directory: %w", err)
 	}
 	info, err := os.Stat(directory)
 	if err != nil {
-		return ProcessResult{}, err
+		return Result{}, err
 	}
 	if !info.IsDir() {
-		return ProcessResult{}, errors.New("process directory must be a directory")
+		return Result{}, errors.New("process directory must be a directory")
 	}
 	timeout := options.TimeoutSeconds
 	if timeout == 0 {
 		timeout = defaultProcessTimeout
 	}
 	if timeout < 1 || timeout > 86_400 {
-		return ProcessResult{}, errors.New("timeout_seconds must be between 1 and 86400")
+		return Result{}, errors.New("timeout_seconds must be between 1 and 86400")
 	}
 	outputLimit := options.MaxOutputBytes
 	if outputLimit == 0 {
 		outputLimit = defaultOutputBytes
 	}
 	if outputLimit < 1 || outputLimit > maxOutputBytes {
-		return ProcessResult{}, fmt.Errorf("max_output_bytes must be between 1 and %d", maxOutputBytes)
+		return Result{}, fmt.Errorf("max_output_bytes must be between 1 and %d", maxOutputBytes)
 	}
 	for name := range options.Environment {
 		if !environmentName.MatchString(name) {
-			return ProcessResult{}, fmt.Errorf("invalid environment variable name %q", name)
+			return Result{}, fmt.Errorf("invalid environment variable name %q", name)
 		}
 	}
 
@@ -72,18 +104,13 @@ func (r *Runtime) RunProcess(ctx context.Context, rootName string, options Proce
 
 	started := time.Now()
 	runErr := command.Run()
-	duration := time.Since(started).Milliseconds()
-	result := ProcessResult{
-		Program: options.Program, Args: options.Args, Root: rootName,
-		Directory: options.Directory, Stdout: stdout.String(), Stderr: stderr.String(),
-		StdoutTruncated: stdout.Truncated(), StderrTruncated: stderr.Truncated(), DurationMS: duration,
-	}
-	if result.Directory == "" {
-		result.Directory = "."
+	result := Result{
+		Program: options.Program, Args: options.Args, Directory: filepath.Clean(directory),
+		Stdout: stdout.String(), Stderr: stderr.String(), StdoutTruncated: stdout.Truncated(),
+		StderrTruncated: stderr.Truncated(), DurationMS: time.Since(started).Milliseconds(),
 	}
 	if processContext.Err() == context.DeadlineExceeded {
-		result.ExitCode = -1
-		result.TimedOut = true
+		result.ExitCode, result.TimedOut = -1, true
 		return result, nil
 	}
 	if ctx.Err() != nil {
@@ -91,7 +118,6 @@ func (r *Runtime) RunProcess(ctx context.Context, rootName string, options Proce
 		return result, ctx.Err()
 	}
 	if runErr == nil {
-		result.ExitCode = 0
 		return result, nil
 	}
 	var exitErr *exec.ExitError

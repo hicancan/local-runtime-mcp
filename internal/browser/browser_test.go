@@ -21,7 +21,7 @@ const testToken = "0123456789abcdef0123456789abcdef"
 func TestBridgeRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bridge, err := Start(ctx, config.Browser{Enabled: true, Listen: "127.0.0.1:0", Token: testToken})
+	bridge, err := Start(ctx, config.Browser{Listen: "127.0.0.1:0", Token: testToken})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestBridgeRoundTrip(t *testing.T) {
 
 func fakeExtension(ctx context.Context, address string, errorsChannel chan<- error) {
 	for {
-		body := bytes.NewBufferString(`{"browser":"test","extension_version":"2.0.0"}`)
+		body := bytes.NewBufferString(`{"instance_id":"test-instance","browser":"test","extension_version":"3.0.0"}`)
 		request, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+address+"/v1/poll", body)
 		request.Header.Set("Authorization", "Bearer "+testToken)
 		request.Header.Set("Content-Type", "application/json")
@@ -91,7 +91,7 @@ func fakeExtension(ctx context.Context, address string, errorsChannel chan<- err
 		default:
 			result = map[string]bool{"success": true}
 		}
-		payload, _ := json.Marshal(map[string]any{"id": command.ID, "result": result})
+		payload, _ := json.Marshal(map[string]any{"id": command.ID, "instance_id": "test-instance", "result": result})
 		resultRequest, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+address+"/v1/result", bytes.NewReader(payload))
 		resultRequest.Header.Set("Authorization", "Bearer "+testToken)
 		resultRequest.Header.Set("Content-Type", "application/json")
@@ -108,7 +108,7 @@ func fakeExtension(ctx context.Context, address string, errorsChannel chan<- err
 func TestBridgeRejectsMissingToken(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bridge, err := Start(ctx, config.Browser{Enabled: true, Listen: "127.0.0.1:0", Token: testToken})
+	bridge, err := Start(ctx, config.Browser{Listen: "127.0.0.1:0", Token: testToken})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,6 +138,54 @@ func TestInstallExtension(t *testing.T) {
 	}
 	if !bytes.Contains(manifest, []byte(`"debugger"`)) || !bytes.Contains(worker, []byte("Page.captureScreenshot")) {
 		t.Fatal("installed extension is missing browser-control capabilities")
+	}
+	for _, forbidden := range [][]byte{[]byte(`"activeTab"`), []byte(`"downloads"`), []byte(`"scripting"`), []byte(`"<all_urls>"`)} {
+		if bytes.Contains(manifest, forbidden) {
+			t.Fatalf("installed extension contains unnecessary permission %s", forbidden)
+		}
+	}
+}
+
+func TestBridgeRejectsSecondExtensionInstance(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bridge, err := Start(ctx, config.Browser{Listen: "127.0.0.1:0", Token: testToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bridge.Close(context.Background()) })
+	poll := func(requestContext context.Context, instance string) (*http.Response, error) {
+		body := bytes.NewBufferString(`{"instance_id":"` + instance + `"}`)
+		request, _ := http.NewRequestWithContext(requestContext, http.MethodPost, "http://"+bridge.Status().Address+"/v1/poll", body)
+		request.Header.Set("Authorization", "Bearer "+testToken)
+		request.Header.Set("Content-Type", "application/json")
+		return http.DefaultClient.Do(request)
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		response, err := poll(ctx, "first")
+		if response != nil {
+			response.Body.Close()
+		}
+		firstDone <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	for !bridge.Status().Connected && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	second, err := poll(context.Background(), "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Body.Close()
+	if second.StatusCode != http.StatusConflict {
+		t.Fatalf("second instance status = %d, want %d", second.StatusCode, http.StatusConflict)
+	}
+	cancel()
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("first poll did not stop after cancellation")
 	}
 }
 

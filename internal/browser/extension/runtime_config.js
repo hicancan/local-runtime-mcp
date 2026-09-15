@@ -1,2 +1,2 @@
-// Rewritten by `lrmcp browser extension --config ...` when configuration is supplied.
+// Rewritten by `lrmcp browser-setup`.
 export const packagedConfig = { address: '', token: '' };

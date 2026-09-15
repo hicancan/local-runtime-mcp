@@ -7,130 +7,75 @@ import (
 	"testing"
 )
 
-func TestLoadResolvesRelativeRoot(t *testing.T) {
-	dir := t.TempDir()
-	root := filepath.Join(dir, "data")
-	if err := os.Mkdir(root, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	configPath := filepath.Join(dir, "config.yaml")
-	if err := os.WriteFile(configPath, []byte("roots:\n  demo:\n    path: ./data\n    description: Demo\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load(configPath)
+func TestLoadMissingReturnsDefault(t *testing.T) {
+	cfg, err := Load(filepath.Join(t.TempDir(), "missing.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := cfg.Roots["demo"].Path; got != want {
-		t.Fatalf("path = %q, want %q", got, want)
+	if cfg.Browser.Listen != DefaultListen || cfg.Browser.Token != "" {
+		t.Fatalf("unexpected default: %+v", cfg)
 	}
 }
 
-func TestLoadExpandsEnvironment(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("LRMCP_TEST_ROOT", root)
+func TestLoadExpandsBrowserToken(t *testing.T) {
+	t.Setenv("LRMCP_TEST_TOKEN", "0123456789abcdef0123456789abcdef")
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte("roots:\n  demo:\n    path: ${LRMCP_TEST_ROOT}\n"), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte("browser:\n  listen: 127.0.0.1:9315\n  token: ${LRMCP_TEST_TOKEN}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Roots["demo"].Path != want {
-		t.Fatalf("path = %q, want %q", cfg.Roots["demo"].Path, want)
+	if cfg.Browser.Token != os.Getenv("LRMCP_TEST_TOKEN") {
+		t.Fatalf("unexpected token: %q", cfg.Browser.Token)
 	}
 }
 
 func TestLoadRejectsUnsetEnvironment(t *testing.T) {
-	_ = os.Unsetenv("LRMCP_MISSING_ROOT")
+	_ = os.Unsetenv("LRMCP_MISSING_TOKEN")
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte("roots:\n  demo:\n    path: ${LRMCP_MISSING_ROOT}\n"), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte("browser:\n  token: ${LRMCP_MISSING_TOKEN}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "unset environment variable") {
-		t.Fatalf("Load error = %v, want unset environment variable", err)
+		t.Fatalf("Load error = %v", err)
 	}
 }
 
-func TestLoadRejectsLegacyWorkspaceConfiguration(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte("workspaces:\n  demo:\n    root: .\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Load(path); err == nil {
-		t.Fatal("Load accepted removed workspace configuration")
+func TestLoadRejectsRemovedAndUnsafeConfiguration(t *testing.T) {
+	for name, content := range map[string]string{
+		"roots":  "roots:\n  demo:\n    path: .\n",
+		"legacy": "workspaces:\n  demo:\n    root: .\n",
+		"unsafe": "browser:\n  listen: 0.0.0.0:9315\n  token: 0123456789abcdef0123456789abcdef\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatal("Load accepted removed or unsafe configuration")
+			}
+		})
 	}
 }
 
-func TestLoadBrowserAndComputer(t *testing.T) {
-	directory := t.TempDir()
-	path := filepath.Join(directory, "config.yaml")
-	t.Setenv("LRMCP_TEST_TOKEN", "0123456789abcdef0123456789abcdef")
-	content := "roots:\n  test:\n    path: .\nbrowser:\n  enabled: true\n  listen: 127.0.0.1:9315\n  token: ${LRMCP_TEST_TOKEN}\ncomputer:\n  enabled: true\n"
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load(path)
+func TestSaveRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "config.yaml")
+	want := &Config{Browser: Browser{Listen: "localhost:9315", Token: "0123456789abcdef0123456789abcdef"}}
+	resolved, err := Save(path, want)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.Browser.Enabled || cfg.Browser.Token != os.Getenv("LRMCP_TEST_TOKEN") || !cfg.Computer.Enabled {
-		t.Fatalf("unexpected config: %+v", cfg)
+	if resolved != path {
+		t.Fatalf("resolved path = %q, want %q", resolved, path)
 	}
-}
-
-func TestLoadRejectsUnsafeBrowserConfig(t *testing.T) {
-	directory := t.TempDir()
-	path := filepath.Join(directory, "config.yaml")
-	content := "roots:\n  test:\n    path: .\nbrowser:\n  enabled: true\n  listen: 0.0.0.0:9315\n  token: 0123456789abcdef0123456789abcdef\n"
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Load(path); err == nil {
-		t.Fatal("expected non-loopback browser bridge to be rejected")
-	}
-}
-
-func TestLoadDefaultsToCurrentDirectory(t *testing.T) {
-	home := t.TempDir()
-	root := t.TempDir()
-	t.Setenv(ConfigEnvironment, "")
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
-	previous, err := os.Getwd()
+	got, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chdir(root); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(previous) })
-
-	cfg, err := Load("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	want, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := cfg.Roots["default"].Path; got != want {
-		t.Fatalf("path = %q, want %q", got, want)
-	}
-}
-
-func TestLoadRejectsMissingExplicitConfiguration(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "missing.yaml")
-	if _, err := Load(path); err == nil {
-		t.Fatal("Load succeeded with a missing explicit configuration")
+	if got.Browser != want.Browser {
+		t.Fatalf("round trip = %+v, want %+v", got.Browser, want.Browser)
 	}
 }
