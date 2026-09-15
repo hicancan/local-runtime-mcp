@@ -52,6 +52,10 @@ func TestToolCatalogAndIdentity(t *testing.T) {
 		"computer_targets": {true, false, true, false}, "computer_state": {true, false, true, false},
 		"computer_action": {false, true, false, false},
 	}
+	type propertySchema struct {
+		Enum []string `json:"enum"`
+	}
+	schemas := make(map[string]map[string]propertySchema, len(expected))
 	if len(listed.Tools) != len(expected) {
 		t.Fatalf("tool count = %d, want %d", len(listed.Tools), len(expected))
 	}
@@ -70,20 +74,40 @@ func TestToolCatalogAndIdentity(t *testing.T) {
 		if got.ReadOnlyHint != want.readOnly || *got.DestructiveHint != want.destructive || got.IdempotentHint != want.idempotent || *got.OpenWorldHint != want.openWorld {
 			t.Fatalf("tool %q annotations = %+v, want %+v", registered.Name, got, want)
 		}
-		if registered.Name == "browser_action" || registered.Name == "computer_action" {
-			data, err := json.Marshal(registered.InputSchema)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var schema struct {
-				Properties map[string]struct {
-					Enum []string `json:"enum"`
-				} `json:"properties"`
-			}
-			if err := json.Unmarshal(data, &schema); err != nil || len(schema.Properties["kind"].Enum) < 9 {
-				t.Fatalf("tool %q lacks a closed action enum: %s (%v)", registered.Name, data, err)
+		data, err := json.Marshal(registered.InputSchema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var schema struct {
+			Properties map[string]propertySchema `json:"properties"`
+		}
+		if err := json.Unmarshal(data, &schema); err != nil {
+			t.Fatalf("decode input schema for %q: %v", registered.Name, err)
+		}
+		schemas[registered.Name] = schema.Properties
+	}
+	assertEnum(t, schemas["browser_navigate"]["kind"].Enum, []string{"url", "back", "forward", "reload"})
+	assertEnum(t, schemas["browser_action"]["kind"].Enum, []string{"click", "double_click", "hover", "drag", "type_text", "set_value", "press_key", "scroll", "select", "check", "upload_files", "handle_dialog", "evaluate"})
+	assertEnum(t, schemas["computer_action"]["kind"].Enum, []string{"activate", "move", "click", "double_click", "drag", "type_text", "set_value", "press_key", "scroll"})
+	if _, ok := schemas["filesystem_write_text"]["create_parents"]; !ok {
+		t.Fatal("filesystem_write_text is missing explicit create_parents")
+	}
+	for toolName, forbidden := range map[string][]string{
+		"computer_state":  {"include_accessibility"},
+		"computer_action": {"element_ref"},
+	} {
+		for _, name := range forbidden {
+			if _, ok := schemas[toolName][name]; ok {
+				t.Fatalf("tool %q still exposes removed field %q", toolName, name)
 			}
 		}
+	}
+}
+
+func assertEnum(t *testing.T, got, want []string) {
+	t.Helper()
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("enum = %q, want %q", got, want)
 	}
 }
 
@@ -91,7 +115,7 @@ func TestFilesystemImageAndProcessTools(t *testing.T) {
 	root := t.TempDir()
 	session := connect(t)
 	note := filepath.Join(root, "docs", "note.txt")
-	write := callOK(t, session, "filesystem_write_text", map[string]any{"path": note, "content": "hello from MCP\n", "create_only": true})
+	write := callOK(t, session, "filesystem_write_text", map[string]any{"path": note, "content": "hello from MCP\n", "create_only": true, "create_parents": true})
 	var written filesystem.TextWriteResult
 	decodeStructured(t, write, &written)
 	if !written.Created || written.Path != note {

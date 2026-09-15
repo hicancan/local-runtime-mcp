@@ -23,64 +23,75 @@ import (
 )
 
 const (
-	mouseLeftDown   = 0x0002
-	mouseLeftUp     = 0x0004
-	mouseRightDown  = 0x0008
-	mouseRightUp    = 0x0010
-	mouseMiddleDown = 0x0020
-	mouseMiddleUp   = 0x0040
-	mouseWheel      = 0x0800
-	mouseHWheel     = 0x1000
-	keyUp           = 0x0002
-	keyUnicode      = 0x0004
-	inputKeyboard   = 1
-	maxElements     = 2000
+	inputMouse              = 0
+	inputKeyboard           = 1
+	mouseLeftDown           = 0x0002
+	mouseLeftUp             = 0x0004
+	mouseRightDown          = 0x0008
+	mouseRightUp            = 0x0010
+	mouseMiddleDown         = 0x0020
+	mouseMiddleUp           = 0x0040
+	mouseWheel              = 0x0800
+	mouseHWheel             = 0x1000
+	keyUp                   = 0x0002
+	keyUnicode              = 0x0004
+	perMonitorAwareV2       = ^uintptr(3) // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 (-4)
+	maximumRememberedStates = 64
 )
 
 var (
-	user32                   = syscall.NewLazyDLL("user32.dll")
-	getCursorPos             = user32.NewProc("GetCursorPos")
-	setCursorPos             = user32.NewProc("SetCursorPos")
-	mouseEvent               = user32.NewProc("mouse_event")
-	keybdEvent               = user32.NewProc("keybd_event")
-	sendInput                = user32.NewProc("SendInput")
-	setProcessDPIAware       = user32.NewProc("SetProcessDPIAware")
-	openInputDesktop         = user32.NewProc("OpenInputDesktop")
-	setThreadDesktop         = user32.NewProc("SetThreadDesktop")
-	getThreadDesktop         = user32.NewProc("GetThreadDesktop")
-	closeDesktop             = user32.NewProc("CloseDesktop")
-	enumWindows              = user32.NewProc("EnumWindows")
-	enumChildWindows         = user32.NewProc("EnumChildWindows")
-	isWindowVisible          = user32.NewProc("IsWindowVisible")
-	isWindowEnabled          = user32.NewProc("IsWindowEnabled")
-	getWindowTextLength      = user32.NewProc("GetWindowTextLengthW")
-	getWindowText            = user32.NewProc("GetWindowTextW")
-	getClassName             = user32.NewProc("GetClassNameW")
-	getWindowRect            = user32.NewProc("GetWindowRect")
-	getWindowThreadProcessID = user32.NewProc("GetWindowThreadProcessId")
-	getForegroundWindow      = user32.NewProc("GetForegroundWindow")
-	setForegroundWindow      = user32.NewProc("SetForegroundWindow")
-	bringWindowToTop         = user32.NewProc("BringWindowToTop")
-	setFocus                 = user32.NewProc("SetFocus")
-	attachThreadInput        = user32.NewProc("AttachThreadInput")
-	showWindow               = user32.NewProc("ShowWindow")
-	getCurrentThreadID       = syscall.NewLazyDLL("kernel32.dll").NewProc("GetCurrentThreadId")
+	user32                        = syscall.NewLazyDLL("user32.dll")
+	kernel32                      = syscall.NewLazyDLL("kernel32.dll")
+	getCursorPos                  = user32.NewProc("GetCursorPos")
+	setCursorPos                  = user32.NewProc("SetCursorPos")
+	sendInput                     = user32.NewProc("SendInput")
+	setProcessDPIAwarenessContext = user32.NewProc("SetProcessDpiAwarenessContext")
+	openInputDesktop              = user32.NewProc("OpenInputDesktop")
+	setThreadDesktop              = user32.NewProc("SetThreadDesktop")
+	getThreadDesktop              = user32.NewProc("GetThreadDesktop")
+	closeDesktop                  = user32.NewProc("CloseDesktop")
+	enumWindows                   = user32.NewProc("EnumWindows")
+	isWindow                      = user32.NewProc("IsWindow")
+	isWindowVisible               = user32.NewProc("IsWindowVisible")
+	getWindowTextLength           = user32.NewProc("GetWindowTextLengthW")
+	getWindowText                 = user32.NewProc("GetWindowTextW")
+	getWindowRect                 = user32.NewProc("GetWindowRect")
+	getWindowThreadProcessID      = user32.NewProc("GetWindowThreadProcessId")
+	getForegroundWindow           = user32.NewProc("GetForegroundWindow")
+	setForegroundWindow           = user32.NewProc("SetForegroundWindow")
+	bringWindowToTop              = user32.NewProc("BringWindowToTop")
+	setFocus                      = user32.NewProc("SetFocus")
+	attachThreadInput             = user32.NewProc("AttachThreadInput")
+	showWindow                    = user32.NewProc("ShowWindow")
+	getCurrentThreadID            = kernel32.NewProc("GetCurrentThreadId")
 )
 
 type nativeController struct {
-	sequence atomic.Uint64
-	mu       sync.Mutex
-	states   map[string]stateRecord
+	sequence  atomic.Uint64
+	epoch     atomic.Uint64
+	operation sync.Mutex
+	mu        sync.Mutex
+	states    map[string]stateRecord
 }
 
 type stateRecord struct {
-	windowID int64
-	bounds   Rectangle
-	elements map[string]Rectangle
+	epoch      uint64
+	windowID   int64
+	pid        uint32
+	foreground uintptr
+	bounds     Rectangle
 }
 
 type point struct{ X, Y int32 }
 type winRect struct{ Left, Top, Right, Bottom int32 }
+
+type mouseInput struct {
+	DX, DY    int32
+	MouseData uint32
+	Flags     uint32
+	Time      uint32
+	ExtraInfo uintptr
+}
 
 type keyboardInput struct {
 	VirtualKey uint16
@@ -90,6 +101,7 @@ type keyboardInput struct {
 	ExtraInfo  uintptr
 }
 
+// input holds the largest Win32 INPUT union member on 64-bit Windows.
 type input struct {
 	Type    uint32
 	Padding uint32
@@ -97,18 +109,20 @@ type input struct {
 }
 
 func New() Controller {
-	_, _, _ = setProcessDPIAware.Call()
-	return &nativeController{states: make(map[string]stateRecord)}
+	_, _, _ = setProcessDPIAwarenessContext.Call(perMonitorAwareV2)
+	controller := &nativeController{states: make(map[string]stateRecord)}
+	controller.epoch.Store(1)
+	return controller
 }
-
-func (*nativeController) Backend() string { return "windows-native" }
 
 func (c *nativeController) Targets(context.Context) (TargetsResult, error) {
 	var windows []Window
 	err := onInputDesktop(func() error {
+		foreground, _, _ := getForegroundWindow.Call()
 		var callbackError error
 		callback := syscall.NewCallback(func(handle uintptr, _ uintptr) uintptr {
-			if visible, _, _ := isWindowVisible.Call(handle); visible == 0 {
+			visible, _, _ := isWindowVisible.Call(handle)
+			if visible == 0 {
 				return 1
 			}
 			title := windowText(handle)
@@ -116,13 +130,11 @@ func (c *nativeController) Targets(context.Context) (TargetsResult, error) {
 			if title == "" || !ok || bounds.Width <= 0 || bounds.Height <= 0 {
 				return 1
 			}
-			var pid uint32
-			_, _, callErr := getWindowThreadProcessID.Call(handle, uintptr(unsafe.Pointer(&pid)))
-			if callErr != syscall.Errno(0) && pid == 0 {
-				callbackError = callErr
+			pid, err := windowPID(handle)
+			if err != nil {
+				callbackError = err
 				return 0
 			}
-			foreground, _, _ := getForegroundWindow.Call()
 			windows = append(windows, Window{ID: int64(handle), PID: int(pid), Title: title, Bounds: bounds, Active: handle == foreground})
 			return 1
 		})
@@ -144,20 +156,26 @@ func (c *nativeController) Targets(context.Context) (TargetsResult, error) {
 		}
 		return strings.ToLower(windows[i].Title) < strings.ToLower(windows[j].Title)
 	})
-	return TargetsResult{Backend: c.Backend(), Windows: windows}, nil
+	return TargetsResult{Windows: windows}, nil
 }
 
 func (c *nativeController) State(_ context.Context, options StateOptions) ([]byte, State, error) {
+	c.operation.Lock()
+	defer c.operation.Unlock()
 	var data []byte
 	var state State
 	err := onInputDesktop(func() error {
-		bounds, title, err := selectedBounds(options.WindowID)
+		bounds, title, pid, foreground, err := selectedTarget(options.WindowID)
 		if err != nil {
 			return err
 		}
 		frame, err := screenshot.CaptureRect(image.Rect(bounds.X, bounds.Y, bounds.X+bounds.Width, bounds.Y+bounds.Height))
 		if err != nil {
-			return fmt.Errorf("capture desktop rectangle %+v: %w", bounds, err)
+			return fmt.Errorf("capture interactive desktop rectangle %+v: %w", bounds, err)
+		}
+		after, _, _ := getForegroundWindow.Call()
+		if after != foreground {
+			return errors.New("foreground window changed during capture; call computer_state again")
 		}
 		var encoded bytes.Buffer
 		if err := png.Encode(&encoded, frame); err != nil {
@@ -165,21 +183,14 @@ func (c *nativeController) State(_ context.Context, options StateOptions) ([]byt
 		}
 		cursor := point{}
 		_, _, _ = getCursorPos.Call(uintptr(unsafe.Pointer(&cursor)))
-		stateID := fmt.Sprintf("s%d", c.sequence.Add(1))
+		epoch := c.epoch.Load()
+		stateID := fmt.Sprintf("s%d-%d", epoch, c.sequence.Add(1))
 		state = State{
-			Backend: c.Backend(), StateID: stateID, WindowID: options.WindowID, Title: title,
+			StateID: stateID, WindowID: options.WindowID, Title: title,
 			OriginX: bounds.X, OriginY: bounds.Y, Width: bounds.Width, Height: bounds.Height,
 			CursorX: int(cursor.X) - bounds.X, CursorY: int(cursor.Y) - bounds.Y, MIMEType: "image/png",
 		}
-		elementBounds := make(map[string]Rectangle)
-		if options.IncludeAccessibility {
-			accessibility := enumerateControls(uintptr(options.WindowID), bounds)
-			state.Accessibility = &accessibility
-			for _, element := range accessibility.Elements {
-				elementBounds[element.Ref] = element.Bounds
-			}
-		}
-		c.remember(stateID, stateRecord{windowID: options.WindowID, bounds: bounds, elements: elementBounds})
+		c.remember(stateID, stateRecord{epoch: epoch, windowID: options.WindowID, pid: pid, foreground: foreground, bounds: bounds})
 		data = encoded.Bytes()
 		return nil
 	})
@@ -187,67 +198,45 @@ func (c *nativeController) State(_ context.Context, options StateOptions) ([]byt
 }
 
 func (c *nativeController) Act(_ context.Context, action Action) (ActionResult, error) {
+	c.operation.Lock()
+	defer c.operation.Unlock()
 	if err := Validate(action); err != nil {
 		return ActionResult{}, err
 	}
 	err := onInputDesktop(func() error {
+		if action.Kind == "activate" {
+			return activateWindow(uintptr(action.WindowID))
+		}
 		bounds, err := c.actionBounds(action)
 		if err != nil {
 			return err
 		}
-		if action.Kind == "activate" {
-			if action.WindowID == 0 {
-				return errors.New("activate requires window_id")
-			}
-			return activateWindow(uintptr(action.WindowID))
+		translated, err := translateAction(action, bounds)
+		if err != nil {
+			return err
 		}
-		if action.WindowID != 0 {
-			if err := activateWindow(uintptr(action.WindowID)); err != nil {
-				return err
-			}
-		}
-		if action.ElementRef != "" {
-			record, _ := c.lookup(action.StateID)
-			element, ok := record.elements[action.ElementRef]
-			if !ok {
-				return errors.New("element_ref is not present in the referenced state")
-			}
-			action.X = bounds.X + element.X + element.Width/2
-			action.Y = bounds.Y + element.Y + element.Height/2
-			action.ToX += bounds.X
-			action.ToY += bounds.Y
-			if action.Kind == "type_text" || action.Kind == "set_value" || action.Kind == "press_key" {
-				if err := c.act(Action{Kind: "click", X: action.X, Y: action.Y}); err != nil {
-					return err
-				}
-			}
-		} else {
-			action.X += bounds.X
-			action.Y += bounds.Y
-			action.ToX += bounds.X
-			action.ToY += bounds.Y
-		}
-		return c.act(action)
+		return c.act(translated)
 	})
 	if err != nil {
 		return ActionResult{}, err
 	}
-	return ActionResult{Backend: c.Backend(), Kind: action.Kind, WindowID: action.WindowID, Success: true}, nil
+	c.invalidate()
+	return ActionResult{Kind: action.Kind, WindowID: action.WindowID, Success: true}, nil
 }
 
 func (c *nativeController) actionBounds(action Action) (Rectangle, error) {
-	current, _, err := selectedBounds(action.WindowID)
+	record, ok := c.lookup(action.StateID)
+	if !ok || record.epoch != c.epoch.Load() {
+		return Rectangle{}, errors.New("state_id is unknown or stale; call computer_state again")
+	}
+	if record.windowID != action.WindowID {
+		return Rectangle{}, errors.New("window_id does not match the referenced computer state")
+	}
+	current, _, pid, foreground, err := selectedTarget(action.WindowID)
 	if err != nil {
 		return Rectangle{}, err
 	}
-	if action.StateID == "" {
-		return current, nil
-	}
-	record, ok := c.lookup(action.StateID)
-	if !ok {
-		return Rectangle{}, errors.New("state_id is unknown or expired; call computer_state again")
-	}
-	if record.windowID != action.WindowID || record.bounds != current {
+	if record.bounds != current || record.pid != pid || record.foreground != foreground {
 		return Rectangle{}, errors.New("computer state is stale; call computer_state again")
 	}
 	return current, nil
@@ -256,7 +245,7 @@ func (c *nativeController) actionBounds(action Action) (Rectangle, error) {
 func (c *nativeController) remember(id string, record stateRecord) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.states) >= 64 {
+	if len(c.states) >= maximumRememberedStates {
 		c.states = make(map[string]stateRecord)
 	}
 	c.states[id] = record
@@ -269,23 +258,41 @@ func (c *nativeController) lookup(id string) (stateRecord, bool) {
 	return record, ok
 }
 
-func selectedBounds(windowID int64) (Rectangle, string, error) {
+func (c *nativeController) invalidate() {
+	c.epoch.Add(1)
+	c.mu.Lock()
+	c.states = make(map[string]stateRecord)
+	c.mu.Unlock()
+}
+
+func selectedTarget(windowID int64) (Rectangle, string, uint32, uintptr, error) {
+	foreground, _, _ := getForegroundWindow.Call()
 	if windowID != 0 {
-		bounds, ok := windowBounds(uintptr(windowID))
-		if !ok {
-			return Rectangle{}, "", errors.New("window_id is not an available window")
+		handle := uintptr(windowID)
+		valid, _, _ := isWindow.Call(handle)
+		visible, _, _ := isWindowVisible.Call(handle)
+		if valid == 0 || visible == 0 {
+			return Rectangle{}, "", 0, 0, errors.New("window_id is not an available visible window")
 		}
-		return bounds, windowText(uintptr(windowID)), nil
+		if foreground != handle {
+			return Rectangle{}, "", 0, 0, errors.New("selected window is not foreground; activate it, then call computer_state again")
+		}
+		bounds, ok := windowBounds(handle)
+		if !ok || bounds.Width <= 0 || bounds.Height <= 0 {
+			return Rectangle{}, "", 0, 0, errors.New("selected window has no capturable bounds")
+		}
+		pid, err := windowPID(handle)
+		return bounds, windowText(handle), pid, foreground, err
 	}
 	displays := screenshot.NumActiveDisplays()
 	if displays < 1 {
-		return Rectangle{}, "", errors.New("no active display was found")
+		return Rectangle{}, "", 0, 0, errors.New("no active display was found")
 	}
 	bounds := screenshot.GetDisplayBounds(0)
 	for display := 1; display < displays; display++ {
 		bounds = bounds.Union(screenshot.GetDisplayBounds(display))
 	}
-	return Rectangle{X: bounds.Min.X, Y: bounds.Min.Y, Width: bounds.Dx(), Height: bounds.Dy()}, "", nil
+	return Rectangle{X: bounds.Min.X, Y: bounds.Min.Y, Width: bounds.Dx(), Height: bounds.Dy()}, "", 0, foreground, nil
 }
 
 func windowBounds(handle uintptr) (Rectangle, bool) {
@@ -295,6 +302,15 @@ func windowBounds(handle uintptr) (Rectangle, bool) {
 		return Rectangle{}, false
 	}
 	return Rectangle{X: int(value.Left), Y: int(value.Top), Width: int(value.Right - value.Left), Height: int(value.Bottom - value.Top)}, true
+}
+
+func windowPID(handle uintptr) (uint32, error) {
+	var pid uint32
+	_, _, callErr := getWindowThreadProcessID.Call(handle, uintptr(unsafe.Pointer(&pid)))
+	if pid == 0 {
+		return 0, fmt.Errorf("GetWindowThreadProcessId failed: %w", callErr)
+	}
+	return pid, nil
 }
 
 func windowText(handle uintptr) string {
@@ -307,47 +323,12 @@ func windowText(handle uintptr) string {
 	return syscall.UTF16ToString(buffer[:written])
 }
 
-func className(handle uintptr) string {
-	buffer := make([]uint16, 256)
-	written, _, _ := getClassName.Call(handle, uintptr(unsafe.Pointer(&buffer[0])), uintptr(len(buffer)))
-	if written == 0 {
-		return "control"
-	}
-	return strings.ToLower(syscall.UTF16ToString(buffer[:written]))
-}
-
-func enumerateControls(windowID uintptr, parent Rectangle) AccessibilityState {
-	result := AccessibilityState{Elements: []Element{}}
-	if windowID == 0 {
-		return result
-	}
-	callback := syscall.NewCallback(func(handle uintptr, _ uintptr) uintptr {
-		if len(result.Elements) >= maxElements {
-			result.Truncated = true
-			return 0
-		}
-		bounds, ok := windowBounds(handle)
-		if !ok || bounds.Width <= 0 || bounds.Height <= 0 {
-			return 1
-		}
-		visible, _, _ := isWindowVisible.Call(handle)
-		if visible == 0 {
-			return 1
-		}
-		enabled, _, _ := isWindowEnabled.Call(handle)
-		ref := fmt.Sprintf("e%d", len(result.Elements)+1)
-		result.Elements = append(result.Elements, Element{
-			Ref: ref, Role: className(handle), Name: windowText(handle), Enabled: enabled != 0,
-			Bounds: Rectangle{X: bounds.X - parent.X, Y: bounds.Y - parent.Y, Width: bounds.Width, Height: bounds.Height},
-		})
-		return 1
-	})
-	_, _, _ = enumChildWindows.Call(windowID, callback, 0)
-	return result
-}
-
 func activateWindow(handle uintptr) error {
 	const restore = 9
+	valid, _, _ := isWindow.Call(handle)
+	if valid == 0 {
+		return errors.New("window_id is not an available window")
+	}
 	currentThread, _, _ := getCurrentThreadID.Call()
 	foreground, _, _ := getForegroundWindow.Call()
 	foregroundThread, _, _ := getWindowThreadProcessID.Call(foreground, 0)
@@ -367,15 +348,41 @@ func activateWindow(handle uintptr) error {
 	if ok == 0 && active != handle {
 		return fmt.Errorf("SetForegroundWindow failed: %w", callErr)
 	}
+	if active != handle {
+		return errors.New("window did not become foreground")
+	}
 	return nil
+}
+
+func translateAction(action Action, bounds Rectangle) (Action, error) {
+	translate := func(valueX, valueY *int, label string) (*int, *int, error) {
+		if valueX == nil && valueY == nil {
+			return nil, nil, nil
+		}
+		if valueX == nil || valueY == nil || *valueX < 0 || *valueY < 0 || *valueX >= bounds.Width || *valueY >= bounds.Height {
+			return nil, nil, fmt.Errorf("%s coordinates are outside the referenced state", label)
+		}
+		x, y := bounds.X+*valueX, bounds.Y+*valueY
+		return &x, &y, nil
+	}
+	var err error
+	action.X, action.Y, err = translate(action.X, action.Y, "action")
+	if err != nil {
+		return Action{}, err
+	}
+	action.ToX, action.ToY, err = translate(action.ToX, action.ToY, "drag destination")
+	if err != nil {
+		return Action{}, err
+	}
+	return action, nil
 }
 
 func (c *nativeController) act(action Action) error {
 	switch action.Kind {
 	case "move":
-		return moveCursor(action.X, action.Y)
+		return moveCursor(*action.X, *action.Y)
 	case "click", "double_click":
-		if err := moveCursor(action.X, action.Y); err != nil {
+		if err := moveCursor(*action.X, *action.Y); err != nil {
 			return err
 		}
 		count := 1
@@ -390,24 +397,36 @@ func (c *nativeController) act(action Action) error {
 			down, up = mouseMiddleDown, mouseMiddleUp
 		}
 		for range count {
-			mouseEvent.Call(uintptr(down), 0, 0, 0, 0)
-			mouseEvent.Call(uintptr(up), 0, 0, 0, 0)
+			if err := sendMouse(down, 0); err != nil {
+				return err
+			}
+			if err := sendMouse(up, 0); err != nil {
+				return err
+			}
 		}
 	case "drag":
-		if err := moveCursor(action.X, action.Y); err != nil {
+		if err := moveCursor(*action.X, *action.Y); err != nil {
 			return err
 		}
-		mouseEvent.Call(mouseLeftDown, 0, 0, 0, 0)
+		down, up := uint32(mouseLeftDown), uint32(mouseLeftUp)
+		if action.Button == "right" {
+			down, up = mouseRightDown, mouseRightUp
+		} else if action.Button == "middle" {
+			down, up = mouseMiddleDown, mouseMiddleUp
+		}
+		if err := sendMouse(down, 0); err != nil {
+			return err
+		}
 		for step := 1; step <= 20; step++ {
-			x := action.X + (action.ToX-action.X)*step/20
-			y := action.Y + (action.ToY-action.Y)*step/20
+			x := *action.X + (*action.ToX-*action.X)*step/20
+			y := *action.Y + (*action.ToY-*action.Y)*step/20
 			if err := moveCursor(x, y); err != nil {
-				mouseEvent.Call(mouseLeftUp, 0, 0, 0, 0)
+				_ = sendMouse(up, 0)
 				return err
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
-		mouseEvent.Call(mouseLeftUp, 0, 0, 0, 0)
+		return sendMouse(up, 0)
 	case "type_text":
 		return typeUnicode(action.Text)
 	case "set_value":
@@ -418,16 +437,18 @@ func (c *nativeController) act(action Action) error {
 	case "press_key":
 		return pressCombination(action.Key)
 	case "scroll":
-		if action.X != 0 || action.Y != 0 {
-			if err := moveCursor(action.X, action.Y); err != nil {
+		if action.X != nil {
+			if err := moveCursor(*action.X, *action.Y); err != nil {
 				return err
 			}
 		}
 		if action.ScrollY != 0 {
-			mouseEvent.Call(mouseWheel, 0, 0, uintptr(uint32(int32(-action.ScrollY))), 0)
+			if err := sendMouse(mouseWheel, int32(-action.ScrollY)); err != nil {
+				return err
+			}
 		}
 		if action.ScrollX != 0 {
-			mouseEvent.Call(mouseHWheel, 0, 0, uintptr(uint32(int32(action.ScrollX))), 0)
+			return sendMouse(mouseHWheel, int32(action.ScrollX))
 		}
 	}
 	return nil
@@ -462,26 +483,31 @@ func moveCursor(x, y int) error {
 	return nil
 }
 
+func sendMouse(flags uint32, data int32) error {
+	value := mouseInput{MouseData: uint32(data), Flags: flags}
+	return sendNativeInput(inputMouse, unsafe.Pointer(&value), unsafe.Sizeof(value))
+}
+
 func typeUnicode(text string) error {
 	for _, code := range utf16.Encode([]rune(text)) {
-		if err := sendUnicode(code, false); err != nil {
+		if err := sendKeyboard(0, code, keyUnicode); err != nil {
 			return err
 		}
-		if err := sendUnicode(code, true); err != nil {
+		if err := sendKeyboard(0, code, keyUnicode|keyUp); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func sendUnicode(code uint16, release bool) error {
-	flags := uint32(keyUnicode)
-	if release {
-		flags |= keyUp
-	}
-	keyboard := keyboardInput{ScanCode: code, Flags: flags}
-	entry := input{Type: inputKeyboard}
-	raw := unsafe.Slice((*byte)(unsafe.Pointer(&keyboard)), int(unsafe.Sizeof(keyboard)))
+func sendKeyboard(virtualKey, scanCode uint16, flags uint32) error {
+	value := keyboardInput{VirtualKey: virtualKey, ScanCode: scanCode, Flags: flags}
+	return sendNativeInput(inputKeyboard, unsafe.Pointer(&value), unsafe.Sizeof(value))
+}
+
+func sendNativeInput(kind uint32, data unsafe.Pointer, size uintptr) error {
+	entry := input{Type: kind}
+	raw := unsafe.Slice((*byte)(data), int(size))
 	copy(entry.Data[:], raw)
 	written, _, callErr := sendInput.Call(1, uintptr(unsafe.Pointer(&entry)), unsafe.Sizeof(entry))
 	if written != 1 {
@@ -492,14 +518,14 @@ func sendUnicode(code uint16, release bool) error {
 
 func pressCombination(value string) error {
 	parts := strings.Split(strings.ToUpper(strings.TrimSpace(value)), "+")
-	keys := make([]byte, 0, len(parts))
+	keys := make([]uint16, 0, len(parts))
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
 		key, ok := virtualKeys[part]
 		if !ok && len(part) == 1 {
 			character := part[0]
 			if (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') {
-				key, ok = character, true
+				key, ok = uint16(character), true
 			}
 		}
 		if !ok {
@@ -508,15 +534,19 @@ func pressCombination(value string) error {
 		keys = append(keys, key)
 	}
 	for _, key := range keys {
-		keybdEvent.Call(uintptr(key), 0, 0, 0)
+		if err := sendKeyboard(key, 0, 0); err != nil {
+			return err
+		}
 	}
 	for index := len(keys) - 1; index >= 0; index-- {
-		keybdEvent.Call(uintptr(keys[index]), 0, keyUp, 0)
+		if err := sendKeyboard(keys[index], 0, keyUp); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-var virtualKeys = map[string]byte{
+var virtualKeys = map[string]uint16{
 	"BACKSPACE": 0x08, "TAB": 0x09, "ENTER": 0x0D, "SHIFT": 0x10, "CTRL": 0x11,
 	"CONTROL": 0x11, "ALT": 0x12, "ESC": 0x1B, "ESCAPE": 0x1B, "SPACE": 0x20,
 	"PAGEUP": 0x21, "PAGEDOWN": 0x22, "END": 0x23, "HOME": 0x24, "LEFT": 0x25,

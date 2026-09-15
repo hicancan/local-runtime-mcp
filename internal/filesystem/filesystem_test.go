@@ -10,7 +10,10 @@ import (
 func TestTextLifecycleAndCompareAndSwap(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "nested", "note.txt")
-	written, err := WriteText(path, "one\ntwo\nthree\n", WriteTextOptions{CreateOnly: true})
+	if _, err := WriteText(path, "one\n", WriteTextOptions{CreateOnly: true}); err == nil {
+		t.Fatal("write unexpectedly created missing parents")
+	}
+	written, err := WriteText(path, "one\ntwo\nthree\n", WriteTextOptions{CreateOnly: true, CreateParents: true})
 	if err != nil || !written.Created || len(written.SHA256) != 64 {
 		t.Fatalf("initial write = %+v, %v", written, err)
 	}
@@ -38,6 +41,28 @@ func TestTextLifecycleAndCompareAndSwap(t *testing.T) {
 	unchanged, _ = os.ReadFile(path)
 	if string(unchanged) != "ONE\nTWO\nthree\n" {
 		t.Fatalf("failed batch edit was not atomic: %q", unchanged)
+	}
+}
+
+func TestMutationsRejectFinalSymlink(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.txt")
+	link := filepath.Join(root, "link.txt")
+	if err := os.WriteFile(target, []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symbolic links unavailable: %v", err)
+	}
+	if _, err := WriteText(link, "changed", WriteTextOptions{}); err == nil {
+		t.Fatal("write followed a final symbolic link")
+	}
+	if _, err := EditText(link, EditTextOptions{Edits: []TextEdit{{OldText: "original", NewText: "changed"}}}); err == nil {
+		t.Fatal("edit followed a final symbolic link")
+	}
+	data, err := os.ReadFile(target)
+	if err != nil || string(data) != "original" {
+		t.Fatalf("symlink mutation changed target: %q, %v", data, err)
 	}
 }
 

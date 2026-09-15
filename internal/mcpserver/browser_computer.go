@@ -15,11 +15,15 @@ func registerBrowserTools(server *mcp.Server, bridge *browser.Bridge) {
 	mcp.AddTool(server, tool("browser_tabs", "List browser tabs", "List controllable tabs in the Chromium profile running the bundled extension.", true, false, true, false), browserTabs(bridge))
 	mcp.AddTool(server, tool("browser_open", "Open browser tab", "Open a URL in a new browser tab.", false, false, false, true), browserOpen(bridge))
 	mcp.AddTool(server, tool("browser_close", "Close browser tab", "Close a browser tab by its numeric ID.", false, true, true, false), browserClose(bridge))
-	mcp.AddTool(server, tool("browser_navigate", "Navigate browser tab", "Navigate an existing browser tab to an absolute URL and wait until loading finishes.", false, false, false, true), browserNavigate(bridge))
+	navigationTool := inputTool[browser.Navigation](tool("browser_navigate", "Navigate browser tab", "Navigate an existing tab to a URL, through history, or by reloading, then wait until loading finishes.", false, false, false, true), func(schema *jsonschema.Schema) {
+		schema.Properties["kind"].Enum = enum("url", "back", "forward", "reload")
+		schema.Properties["tab_id"].Minimum = jsonschema.Ptr(1.0)
+	})
+	mcp.AddTool(server, navigationTool, browserNavigate(bridge))
 	mcp.AddTool(server, tool("browser_snapshot", "Read browser page", "Return bounded visible text and versioned references for interactive elements, including open shadow roots and accessible same-origin frames.", true, false, true, true), browserSnapshot(bridge))
 	mcp.AddTool(server, tool("browser_screenshot", "Capture browser page", "Return a viewport, full-page, or clipped native PNG. Viewport screenshots yield IDs for coordinate actions.", true, false, true, true), browserScreenshot(bridge))
-	browserActionTool := inputTool[browser.Action](tool("browser_action", "Act on browser page", "Use a versioned element ref, CSS selector, or viewport screenshot coordinates to control a page; also supports keys, scrolling, files, dialogs, history, and JavaScript.", false, true, false, true), func(schema *jsonschema.Schema) {
-		schema.Properties["kind"].Enum = enum("click", "double_click", "hover", "drag", "type_text", "set_value", "press_key", "scroll", "select", "check", "upload_files", "handle_dialog", "back", "forward", "reload", "evaluate")
+	browserActionTool := inputTool[browser.Action](tool("browser_action", "Act on browser page", "Use one versioned element ref, CSS selector, or viewport screenshot coordinate target to control a page; also supports keys, scrolling, files, dialogs, and JavaScript.", false, true, false, true), func(schema *jsonschema.Schema) {
+		schema.Properties["kind"].Enum = enum("click", "double_click", "hover", "drag", "type_text", "set_value", "press_key", "scroll", "select", "check", "upload_files", "handle_dialog", "evaluate")
 		schema.Properties["button"].Enum = enum("left", "middle", "right")
 		schema.Properties["tab_id"].Minimum = jsonschema.Ptr(1.0)
 	})
@@ -28,8 +32,8 @@ func registerBrowserTools(server *mcp.Server, bridge *browser.Bridge) {
 
 func registerComputerTools(server *mcp.Server, controller computer.Controller) {
 	mcp.AddTool(server, tool("computer_targets", "List desktop targets", "List currently open top-level windows that can be targeted. This does not list installed applications.", true, false, true, false), computerTargets(controller))
-	mcp.AddTool(server, tool("computer_state", "Read desktop state", "Return the desktop or one selected window as native PNG plus a state ID. On Windows, optional accessibility data exposes visible native controls.", true, false, true, false), computerState(controller))
-	computerActionTool := inputTool[computer.Action](tool("computer_action", "Control desktop", "Activate a window; move, click, double-click, or drag; type or replace text; press a key combination; or scroll. Coordinates are relative to the image returned by computer_state.", false, true, false, false), func(schema *jsonschema.Schema) {
+	mcp.AddTool(server, tool("computer_state", "Read desktop state", "Return the current virtual desktop or foreground selected window as native PNG plus a state ID.", true, false, true, false), computerState(controller))
+	computerActionTool := inputTool[computer.Action](tool("computer_action", "Control desktop", "Activate a window, or act on the exact foreground desktop state returned by computer_state. Every non-activation action requires state_id and invalidates all prior states.", false, true, false, false), func(schema *jsonschema.Schema) {
 		schema.Properties["kind"].Enum = enum("activate", "move", "click", "double_click", "drag", "type_text", "set_value", "press_key", "scroll")
 		schema.Properties["button"].Enum = enum("left", "middle", "right")
 		schema.Properties["window_id"].Minimum = jsonschema.Ptr(0.0)
@@ -101,17 +105,12 @@ func browserClose(bridge *browser.Bridge) func(context.Context, *mcp.CallToolReq
 	}
 }
 
-type browserNavigateInput struct {
-	TabID int    `json:"tab_id" jsonschema:"positive browser tab ID"`
-	URL   string `json:"url" jsonschema:"absolute URL to navigate to"`
-}
-
-func browserNavigate(bridge *browser.Bridge) func(context.Context, *mcp.CallToolRequest, browserNavigateInput) (*mcp.CallToolResult, browser.Tab, error) {
-	return func(ctx context.Context, _ *mcp.CallToolRequest, in browserNavigateInput) (*mcp.CallToolResult, browser.Tab, error) {
+func browserNavigate(bridge *browser.Bridge) func(context.Context, *mcp.CallToolRequest, browser.Navigation) (*mcp.CallToolResult, browser.Tab, error) {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in browser.Navigation) (*mcp.CallToolResult, browser.Tab, error) {
 		if err := requireBridge(bridge); err != nil {
 			return nil, browser.Tab{}, err
 		}
-		result, err := bridge.Navigate(ctx, in.TabID, in.URL)
+		result, err := bridge.Navigate(ctx, in)
 		return nil, result, err
 	}
 }

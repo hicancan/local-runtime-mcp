@@ -233,9 +233,12 @@ func WriteText(path, content string, options WriteTextOptions) (TextWriteResult,
 	}
 	created := false
 	mode := os.FileMode(0o644)
-	info, statErr := os.Stat(resolved)
+	info, statErr := os.Lstat(resolved)
 	switch {
 	case statErr == nil:
+		if info.Mode()&os.ModeSymlink != 0 {
+			return TextWriteResult{}, errors.New("write path cannot be a symbolic link")
+		}
 		if options.CreateOnly {
 			return TextWriteResult{}, errors.New("file already exists")
 		}
@@ -260,6 +263,9 @@ func WriteText(path, content string, options WriteTextOptions) (TextWriteResult,
 	default:
 		return TextWriteResult{}, statErr
 	}
+	if err := ensureParent(resolved, options.CreateParents); err != nil {
+		return TextWriteResult{}, err
+	}
 	if err := atomicWrite(resolved, data, mode); err != nil {
 		return TextWriteResult{}, err
 	}
@@ -277,9 +283,12 @@ func EditText(path string, options EditTextOptions) (TextEditResult, error) {
 	if len(options.Edits) > 1_000 {
 		return TextEditResult{}, errors.New("edits cannot contain more than 1000 items")
 	}
-	info, err := os.Stat(resolved)
+	info, err := os.Lstat(resolved)
 	if err != nil {
 		return TextEditResult{}, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return TextEditResult{}, errors.New("edit path cannot be a symbolic link")
 	}
 	if !info.Mode().IsRegular() {
 		return TextEditResult{}, errors.New("edit path must be a regular file")
@@ -447,9 +456,6 @@ func hashReader(reader io.Reader) (string, error) {
 }
 
 func atomicWrite(path string, data []byte, mode os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
 	temporary, err := os.CreateTemp(filepath.Dir(path), ".lrmcp-write-*")
 	if err != nil {
 		return err
@@ -480,6 +486,27 @@ func atomicWrite(path string, data []byte, mode os.FileMode) error {
 		return err
 	}
 	committed = true
+	return nil
+}
+
+func ensureParent(path string, create bool) error {
+	parent := filepath.Dir(path)
+	info, err := os.Stat(parent)
+	if err == nil {
+		if !info.IsDir() {
+			return errors.New("write parent must be a directory")
+		}
+		return nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if !create {
+		return errors.New("write parent does not exist; set create_parents to create it")
+	}
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return fmt.Errorf("create write parent: %w", err)
+	}
 	return nil
 }
 

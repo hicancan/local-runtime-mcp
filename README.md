@@ -1,8 +1,8 @@
 # Local Runtime MCP
 
-`local-runtime-mcp` gives an MCP client direct access to the machine on which `lrmcp` is running. “Local” is relative to that process: the same binary can run on a laptop, workstation, VM, or remote server, and each running instance represents exactly one machine.
+`local-runtime-mcp` exposes the machine running `lrmcp` to an MCP client. “Local” is relative to the process: the same binary can run on a laptop, workstation, VM, or server, and one running instance represents exactly one machine.
 
-The executable has one capability API—MCP. Its small command line selects a transport, prepares the browser extension, or prints diagnostics; it does not duplicate the MCP tools.
+There is one executable, one MCP server, and five public capability domains. The CLI exists only to start a transport and prepare the browser extension; it is not a second automation API.
 
 ## Architecture
 
@@ -11,96 +11,132 @@ flowchart LR
     Cloud["Cloud AI / ChatGPT"] -->|"OpenAI Tunnel"| Tunnel["lrmcp tunnel"]
     Client["Local MCP client"] -->|"stdio"| Stdio["lrmcp"]
 
-    Tunnel --> Server["MCP server\n20 static tools"]
-    Stdio --> Server
+    Tunnel --> MCP["MCP server\n20 static tools"]
+    Stdio --> MCP
 
-    Server --> Process["process\nrun · continue"]
-    Server --> Filesystem["filesystem\nlist · stat · read · search · edit · write"]
-    Server --> Image["image\nread"]
-    Server --> Computer["computer\ntargets · state · action"]
-    Server --> Browser["browser\nstatus · tabs · open · close\nnavigate · snapshot · screenshot · action"]
+    MCP --> Process["process\nrun · continue"]
+    MCP --> Filesystem["filesystem\nlist · stat · read · search · write · edit"]
+    MCP --> Image["image\nread"]
+    MCP --> Computer["computer\ntargets · state · action"]
+    MCP --> Browser["browser\nstatus · tabs · open · close\nnavigate · snapshot · screenshot · action"]
 
     Process --> Machine["machine running lrmcp"]
     Filesystem --> Machine
     Image --> Machine
 
-    Computer --> OS["current interactive desktop\nWindows native / experimental macOS and Linux"]
+    Computer --> Desktop["current interactive Windows desktop\nWin32 capture + SendInput"]
 
     Browser --> Bridge["authenticated loopback bridge\none extension instance"]
     Bridge --> Extension["bundled Chromium MV3 extension"]
     Extension --> CDP["chrome.debugger / CDP"]
-    CDP --> Tabs["tabs in that browser profile"]
+    CDP --> Profile["tabs in that browser profile"]
 ```
 
-There is no generic core layer, capability registry, dynamic plug-in system, host router, workspace model, root sandbox, or compatibility layer. The five domains are ordinary compile-time Go packages registered directly on one MCP server. Transport changes how a client reaches that server; it does not change the tools.
+The boundaries are concrete:
 
-## The 20 MCP tools
+- `process` owns executing programs and process sessions.
+- `filesystem` owns path-addressed text and metadata.
+- `image` is the native image-content boundary; it does not duplicate file operations.
+- `computer` owns physical desktop pixels and input.
+- `browser` owns semantic web-page state and browser actions through one extension path.
+- stdio and OpenAI Tunnel are transports to the same MCP server, not capability implementations.
+
+There is deliberately no generic core layer, capability registry, dynamic plug-in system, host router, workspace model, root sandbox, or compatibility layer. The five domains are compile-time Go packages registered directly on one server.
+
+## MCP tools
 
 ### Process (2)
 
-| Tool | Function |
+| Tool | Contract |
 | --- | --- |
-| `process_run` | Start an installed executable directly—never through implicit shell parsing—with an argument array, working directory, environment overrides, initial stdin, lifetime timeout, retained-output bounds, and initial wait. A completed process returns its exit result; a longer process returns a session ID. |
-| `process_continue` | Read incremental stdout/stderr, write or close stdin, wait again, or terminate the complete process tree associated with a session. Completed abandoned sessions expire automatically. |
+| `process_run` | Starts an executable directly with `program`, an argument array, working directory, environment overrides, initial stdin, lifetime timeout, retained-output bounds, and initial wait. It never inserts an implicit shell. A completed process returns its exit result; a running process returns a session ID. |
+| `process_continue` | Reads incremental stdout/stderr, writes or closes stdin, waits again, or terminates the complete process tree for a session. |
 
-Windows processes are placed in a kill-on-close Job Object. Unix processes run in their own process group. Cancellation, timeout, termination, and server shutdown therefore apply to the process tree, not only its root process.
+On Windows, child processes enter a kill-on-close Job Object. On Unix, they run in a process group. Cancellation, timeout, explicit termination, and server shutdown therefore apply to the process tree rather than only its root.
 
 ### Filesystem (6)
 
-Paths may be absolute or relative to the `lrmcp` process working directory. Returned paths are absolute. There is deliberately no workspace root or artificial path sandbox.
+Paths may be absolute or relative to the `lrmcp` working directory. Returned paths are absolute. There is no invented workspace root.
 
-| Tool | Function |
+| Tool | Contract |
 | --- | --- |
-| `filesystem_list` | Walk a directory without following symlinks, with maximum depth, entry count, and hidden-name controls. Returns explicit `truncated` and `skipped` signals. |
-| `filesystem_stat` | Inspect a path without following its final symlink. Returns type, size, time, MIME information, symlink target, and optional SHA-256. |
-| `filesystem_read_text` | Read complete UTF-8 lines from a one-based starting line, bounded by line count and bytes. Returns the next line cursor, truncation state, and optional full-file SHA-256. Images and arbitrary binary data do not pass through this tool. |
-| `filesystem_search_text` | Search one file or a directory tree using literal text or a Go regular expression, with case/hidden controls and a result bound. Binary, oversized, and unreadable files are counted as skipped. |
-| `filesystem_edit_text` | Apply an ordered batch of exact replacements in memory and commit once. Ambiguous matches fail unless `replace_all` is explicit; if any edit fails, none are written. An expected SHA-256 provides an optional optimistic concurrency check. |
-| `filesystem_write_text` | Atomically create or replace a complete UTF-8 file. Supports create-only and optional expected-SHA-256 modes and returns the new hash. |
+| `filesystem_list` | Walks a directory without following symbolic links. Depth, entry count, and hidden names are explicit and bounded; truncation and skipped entries are reported. |
+| `filesystem_stat` | Inspects a path without following its final symbolic link. Returns type, size, timestamps, MIME information, link target, and optional SHA-256. |
+| `filesystem_read_text` | Reads complete UTF-8 lines from a one-based line cursor, bounded independently by line count and bytes. Returns the next cursor, truncation state, and optional full-file SHA-256. |
+| `filesystem_search_text` | Searches a file or tree with literal text or a Go regular expression. Case, hidden names, and result count are explicit. Binary, oversized, and unreadable files are counted as skipped. |
+| `filesystem_write_text` | Atomically creates or replaces a complete UTF-8 file. Supports create-only, expected-SHA-256, and explicit `create_parents`; missing parents fail by default. |
+| `filesystem_edit_text` | Applies an ordered batch of exact replacements in memory and commits once. Ambiguous matches fail unless `replace_all` is explicit; any failed edit aborts the whole batch. Optional expected-SHA-256 provides optimistic concurrency. |
+
+`filesystem_write_text` and `filesystem_edit_text` reject a final symbolic-link target. This prevents a mutation request for one path from silently replacing the file named by that link. Images and arbitrary binary data never pass through the text reader.
 
 ### Image (1)
 
-| Tool | Function |
+| Tool | Contract |
 | --- | --- |
-| `image_read` | Return a PNG, JPEG, GIF, or WebP path as native MCP image content plus MIME type and dimensions. Both encoded bytes and decoded pixel count are bounded independently. |
+| `image_read` | Returns a PNG, JPEG, GIF, or WebP path as native MCP image content plus MIME type and dimensions. Encoded bytes and decoded pixel count have separate bounds. |
 
-The separate image domain is intentional: an image is model-visible native image content, not text encoded into a filesystem response.
+This domain exists because model-visible image content is a different modality from filesystem text, not because it owns a second path namespace.
 
 ### Computer (3)
 
-| Tool | Function |
+| Tool | Contract |
 | --- | --- |
-| `computer_targets` | List currently open top-level windows. It does not list installed applications; launching a program belongs to `process_run`. |
-| `computer_state` | Capture the complete virtual desktop or one selected window as native PNG and return a `state_id`, dimensions, origin, cursor position, and optional visible native-control references. |
-| `computer_action` | Activate a window; move, click, double-click, drag, type, replace focused text, press a key combination, or scroll. It can target state-relative coordinates or a native-control reference. |
+| `computer_targets` | Lists open top-level windows. It does not list installed applications; program launch belongs to `process_run`. |
+| `computer_state` | Captures the complete virtual desktop (`window_id: 0`) or one currently foreground window as native PNG. Returns a `state_id`, target identity, bounds, image origin, and cursor position. |
+| `computer_action` | Activates a window, or moves, clicks, double-clicks, drags, types, replaces focused text, presses a key combination, or scrolls against an exact prior state. |
 
-Coordinates are relative to the image returned by `computer_state`. Supplying its `state_id` rejects an action when the selected bounds changed, preventing clicks based on stale geometry. A control reference always requires its originating state.
+Computer control has strict physical-state invariants:
 
-Windows uses native Win32 window discovery, capture, keyboard, and pointer input. Window capture reflects the pixels currently visible on the interactive desktop; it does not claim to see through an occluding window. The optional native-control tree covers HWND controls, not every UI Automation provider. `lrmcp` must run in the signed-in interactive Windows session.
+1. `activate` requires `window_id`, does not accept `state_id`, and invalidates every prior state.
+2. Every other action requires `state_id` from `computer_state`.
+3. A selected window must already be foreground when its state is captured. The implementation never auto-activates a different window and then reuses old geometry.
+4. The state binds the target window handle, process, foreground window, bounds, and global action epoch.
+5. Every successful physical action invalidates all earlier states. Observe again before acting again.
+6. Coordinates are relative to the returned image and are translated only after bounds validation.
 
-The macOS (`screencapture` + `cliclick`) and Linux (`gnome-screenshot`/`scrot` + `xdotool`) command backends currently provide experimental desktop-wide state and actions. They report window targeting as unsupported instead of pretending to implement it.
+Windows is the only implemented Computer backend in v5. It uses native top-level window discovery, current-desktop pixel capture, per-monitor-v2 DPI awareness, and `SendInput`. Selected-window capture is an honest crop of pixels currently visible on the interactive desktop; a non-foreground window is rejected, and the implementation does not claim to see through occlusion. It also does not claim hidden-window capture or semantic UI Automation support.
+
+On macOS and Linux the three tools remain discoverable but return a clear unsupported-platform error. The former shell-command imitations were removed because partial behavior is worse than an explicit boundary.
 
 ### Browser (8)
 
-| Tool | Function |
+| Tool | Contract |
 | --- | --- |
-| `browser_status` | Report configuration, connection freshness, browser identity, and extension version. |
-| `browser_tabs` | List controllable tabs in the profile containing the extension. |
-| `browser_open` | Open a new tab and wait for loading to finish. |
-| `browser_close` | Close a tab. |
-| `browser_navigate` | Navigate an existing tab and wait for loading to finish. |
-| `browser_snapshot` | Return bounded visible text plus versioned references, accessible names, values, and rectangles for interactive elements. Traversal includes open shadow roots and accessible same-origin frames. |
-| `browser_screenshot` | Capture a viewport, complete scrollable page, or page clip as native PNG. A viewport capture returns a `screenshot_id` for coordinate actions. |
-| `browser_action` | Click, double-click, hover, drag, type, replace text, press keys, scroll, select, check, upload files, handle dialogs, navigate history, or evaluate JavaScript. Targets may be a current snapshot reference, a top-document CSS selector, or current viewport screenshot coordinates. |
+| `browser_status` | Reports bridge configuration, connection freshness, browser identity, and extension version. |
+| `browser_tabs` | Lists controllable tabs in the browser profile containing the extension, excluding browser-internal and extension pages. |
+| `browser_open` | Opens a new tab and waits for loading to complete. |
+| `browser_close` | Closes a tab by ID. |
+| `browser_navigate` | Performs one explicit navigation mode: `url`, `back`, `forward`, or `reload`, then waits for loading. |
+| `browser_snapshot` | Returns bounded visible text and interactive elements with accessible names, values, rectangles, and versioned refs. It traverses open shadow roots and accessible same-origin frames. |
+| `browser_screenshot` | Returns a viewport, full-page, or page-clip native PNG. A viewport capture also returns a `screenshot_id` for coordinate targeting. |
+| `browser_action` | Performs `click`, `double_click`, `hover`, `drag`, `type_text`, `set_value`, `press_key`, `scroll`, `select`, `check`, `upload_files`, `handle_dialog`, or `evaluate`. |
 
-Browser control has exactly one implementation path: the bundled Manifest V3 Chromium extension. The extension uses `chrome.debugger` as its CDP transport and requests `debugger`, `tabs`, and `storage`, plus access only to the loopback bridge. The bridge binds to loopback, uses a generated bearer token, and accepts one extension instance at a time.
+Browser control has exactly one implementation path: the bundled Manifest V3 Chromium extension. It uses `chrome.debugger` as the CDP transport and talks only to the authenticated loopback bridge. This grants semantic DOM control and native page screenshots inside the user’s real browser profile; it is not a second Computer backend.
 
-Snapshot references contain the snapshot ID and fail after a newer snapshot replaces them. Coordinate actions require the exact current viewport screenshot ID and reject out-of-bounds or stale coordinates. CSS selectors remain an explicit escape hatch. `evaluate` is intentionally powerful because this project exposes direct machine control rather than a security sandbox.
+Snapshot and viewport-screenshot observations share one per-tab page epoch:
 
-## Build
+- Several snapshots may coexist in the same unchanged epoch; up to eight ref maps are retained.
+- A ref identifies one element in one retained snapshot. A screenshot ID identifies one exact viewport capture.
+- Navigation, tab loading, or any successful browser action invalidates the page epoch and every observation derived from it.
+- Ref actions, screenshot-coordinate actions, and CSS-selector actions are distinct target modes. Operations requiring a target accept exactly one mode.
+- CSS selectors and `evaluate` are deliberate escape hatches for direct control, not alternate browser backends.
+
+The bridge binds to loopback, authenticates every request with a generated bearer token, enforces the exact extension version, accepts one extension instance at a time, and times out abandoned calls.
+
+## Install
+
+Download the archive for your platform from [Releases](https://github.com/hicancan/local-runtime-mcp/releases), extract `lrmcp`/`lrmcp.exe`, and optionally add its directory to `PATH`.
+
+Or build it:
 
 ```powershell
 go build -o lrmcp.exe ./cmd/lrmcp
+```
+
+Verify the installed binary:
+
+```powershell
+lrmcp version
 ```
 
 ## Browser setup
@@ -113,24 +149,24 @@ browser:
   token: ${LRMCP_BROWSER_TOKEN}
 ```
 
-Generate a token, save the configuration, extract the bundled extension, and package the bridge settings in one command:
+Generate a token when needed, save the configuration, extract the extension embedded in the binary, and package its loopback settings with:
 
 ```powershell
 lrmcp browser-setup
 ```
 
-The command prints the extension directory but never the token. In `edge://extensions` or `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select that directory. Run setup again after upgrading the binary, then reload the unpacked extension so its service worker uses the new code.
+The command prints the extension directory and config path but never the token. In `edge://extensions` or `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select that directory. After upgrading `lrmcp`, run setup again and reload the unpacked extension so the binary and extension versions stay identical.
 
 ## Connect
 
-Run with no subcommand for stdio MCP:
+With no subcommand, `lrmcp` serves MCP over stdio:
 
 ```powershell
 lrmcp
 lrmcp --config C:\path\to\config.yaml
 ```
 
-For a ChatGPT custom connector, obtain its OpenAI Tunnel ID and API key, keep the key in an environment variable, and run:
+For a ChatGPT custom connector, set its OpenAI Tunnel credentials in the process environment and run:
 
 ```powershell
 $env:CONTROL_PLANE_TUNNEL_ID = "..."
@@ -138,30 +174,50 @@ $env:CONTROL_PLANE_API_KEY = "..."
 lrmcp tunnel
 ```
 
-Each additional machine runs its own `lrmcp` process and has its own connector/tunnel identity. This project does not aggregate machines or make the model choose a host inside one MCP server.
+Each machine runs its own `lrmcp` and has its own connector/tunnel identity. The project does not aggregate machines or make the model choose a host inside one MCP server.
 
 ## CLI surface
 
 ```text
-lrmcp [--config PATH]       # MCP over stdio
-lrmcp tunnel [flags]        # MCP over OpenAI Tunnel
-lrmcp browser-setup [flags] # extract/configure the bundled browser extension
+lrmcp [--config PATH]       MCP over stdio
+lrmcp tunnel [flags]        MCP over OpenAI Tunnel
+lrmcp browser-setup [flags] extract/configure the bundled browser extension
 lrmcp version
 lrmcp help
 ```
 
-The CLI remains because a binary needs lifecycle and transport commands. It is not a second capability API and is not a replacement for SSH or native shell commands.
+The CLI is only a lifecycle and transport surface. Once a human or script already has a native shell on a machine, `lrmcp` is not intended to replace that shell or SSH.
 
 ## Development
 
 ```powershell
 go test ./...
-go test -race ./...
 go vet ./...
 go build ./cmd/lrmcp
 ```
 
-Version 4.0 is intentionally breaking. It adds process sessions, bounded/hash-aware filesystem operations, stateful browser references and coordinate control, explicit computer targets/state/actions, and image pixel bounds. It removes `computer_screenshot`, the old single-edit payload, old browser `type`/`key` action names, and all compatibility shims.
+The browser extension has an opt-in, isolated real-Edge test:
+
+```powershell
+$env:LRMCP_BROWSER_E2E = "1"
+go test ./internal/browser -run TestEdgeExtensionEndToEnd -v
+```
+
+The Windows physical-input smoke test is also opt-in because it moves the real pointer:
+
+```powershell
+$env:LRMCP_DESKTOP_SMOKE = "1"
+go test ./internal/computer -run TestWindowsDesktopSmoke -v
+```
+
+CI runs unit tests on Windows, Linux, and macOS, the race detector on Linux, the isolated Edge extension test on Windows, `go vet`, and a complete build.
+
+## v5 breaking changes
+
+- Computer actions now require exact state (except activation), every action invalidates earlier state, fake HWND accessibility was removed, and non-Windows imitation backends were deleted.
+- Browser history moved from `browser_action` to explicit `browser_navigate` modes. Snapshot and viewport-screenshot IDs now share a page epoch, and action target validation is exclusive.
+- Filesystem mutations reject final symlinks. Parent-directory creation is explicit and disabled by default.
+- All old compatibility fields and legacy semantics were removed rather than shimmed.
 
 ## License
 

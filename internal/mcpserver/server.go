@@ -13,7 +13,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const Version = "4.0.0"
+const Version = "5.0.0"
 
 const instructions = "Local Runtime MCP exposes the machine where lrmcp is running. Filesystem and image tools accept direct absolute paths or paths relative to the server process. Process tools execute installed programs directly without shell parsing and return sessions for longer programs. Browser tools use the bundled Chromium extension over an authenticated loopback bridge. Computer tools operate the current interactive desktop and target open windows. Prefer browser tools for web pages, computer tools for native UI, and native image-content tools for images and screenshots."
 
@@ -112,13 +112,14 @@ type writeTextInput struct {
 	Content        string `json:"content" jsonschema:"complete UTF-8 file content"`
 	CreateOnly     bool   `json:"create_only,omitempty" jsonschema:"fail if the target already exists"`
 	ExpectedSHA256 string `json:"expected_sha256,omitempty" jsonschema:"replace only when the existing file has this SHA-256; mutually exclusive with create_only"`
+	CreateParents  bool   `json:"create_parents,omitempty" jsonschema:"create missing parent directories; defaults to false"`
 }
 
 func filesystemWriteText(_ context.Context, _ *mcp.CallToolRequest, in writeTextInput) (*mcp.CallToolResult, filesystem.TextWriteResult, error) {
 	if in.CreateOnly && in.ExpectedSHA256 != "" {
 		return nil, filesystem.TextWriteResult{}, fmt.Errorf("create_only and expected_sha256 are mutually exclusive")
 	}
-	result, err := filesystem.WriteText(in.Path, in.Content, filesystem.WriteTextOptions{CreateOnly: in.CreateOnly, ExpectedSHA256: in.ExpectedSHA256})
+	result, err := filesystem.WriteText(in.Path, in.Content, filesystem.WriteTextOptions{CreateOnly: in.CreateOnly, ExpectedSHA256: in.ExpectedSHA256, CreateParents: in.CreateParents})
 	return nil, result, err
 }
 

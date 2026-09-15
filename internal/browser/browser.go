@@ -21,7 +21,7 @@ import (
 	"github.com/hicancan/local-runtime-mcp/internal/config"
 )
 
-const ExtensionVersion = "4.0.0"
+const ExtensionVersion = "5.0.0"
 
 type Bridge struct {
 	configured bool
@@ -74,6 +74,7 @@ type SnapshotElement struct {
 
 type Snapshot struct {
 	TabID             int               `json:"tab_id"`
+	PageEpoch         string            `json:"page_epoch"`
 	SnapshotID        string            `json:"snapshot_id"`
 	Title             string            `json:"title"`
 	URL               string            `json:"url"`
@@ -94,6 +95,7 @@ type ScreenshotOptions struct {
 
 type ScreenshotInfo struct {
 	TabID        int    `json:"tab_id"`
+	PageEpoch    string `json:"page_epoch"`
 	ScreenshotID string `json:"screenshot_id"`
 	Title        string `json:"title"`
 	URL          string `json:"url"`
@@ -109,12 +111,12 @@ type Action struct {
 	Kind         string   `json:"kind" jsonschema:"browser operation to perform"`
 	TabID        int      `json:"tab_id" jsonschema:"positive browser tab ID"`
 	Selector     string   `json:"selector,omitempty" jsonschema:"CSS selector in the top document; prefer ref after a snapshot"`
-	Ref          string   `json:"ref,omitempty" jsonschema:"versioned element reference from the latest browser_snapshot"`
+	Ref          string   `json:"ref,omitempty" jsonschema:"versioned element reference from a retained browser_snapshot in the current page epoch"`
 	ScreenshotID string   `json:"screenshot_id,omitempty" jsonschema:"viewport screenshot ID required for coordinate targeting"`
-	X            int      `json:"x,omitempty" jsonschema:"viewport X coordinate associated with screenshot_id"`
-	Y            int      `json:"y,omitempty" jsonschema:"viewport Y coordinate associated with screenshot_id"`
-	ToX          int      `json:"to_x,omitempty" jsonschema:"drag destination viewport X coordinate"`
-	ToY          int      `json:"to_y,omitempty" jsonschema:"drag destination viewport Y coordinate"`
+	X            *float64 `json:"x,omitempty" jsonschema:"viewport X coordinate associated with screenshot_id"`
+	Y            *float64 `json:"y,omitempty" jsonschema:"viewport Y coordinate associated with screenshot_id"`
+	ToX          *float64 `json:"to_x,omitempty" jsonschema:"drag destination viewport X coordinate"`
+	ToY          *float64 `json:"to_y,omitempty" jsonschema:"drag destination viewport Y coordinate"`
 	Button       string   `json:"button,omitempty" jsonschema:"mouse button; defaults to left"`
 	Text         string   `json:"text,omitempty" jsonschema:"text for type_text or set_value"`
 	Key          string   `json:"key,omitempty" jsonschema:"key or modifier combination such as Control+L"`
@@ -126,6 +128,12 @@ type Action struct {
 	Accept       *bool    `json:"accept,omitempty" jsonschema:"whether to accept an open JavaScript dialog"`
 	PromptText   string   `json:"prompt_text,omitempty" jsonschema:"text supplied to an accepted prompt dialog"`
 	Script       string   `json:"script,omitempty" jsonschema:"JavaScript expression evaluated in the page main world"`
+}
+
+type Navigation struct {
+	TabID int    `json:"tab_id" jsonschema:"positive browser tab ID"`
+	Kind  string `json:"kind" jsonschema:"navigation operation: url, back, forward, or reload"`
+	URL   string `json:"url,omitempty" jsonschema:"absolute URL required when kind is url"`
 }
 
 type ActionResult struct {
@@ -210,9 +218,24 @@ func (b *Bridge) CloseTab(ctx context.Context, tabID int) error {
 	return b.call(ctx, "tabs.close", map[string]any{"tab_id": tabID}, &struct{}{})
 }
 
-func (b *Bridge) Navigate(ctx context.Context, tabID int, url string) (Tab, error) {
+func (b *Bridge) Navigate(ctx context.Context, navigation Navigation) (Tab, error) {
 	var result Tab
-	err := b.call(ctx, "page.navigate", map[string]any{"tab_id": tabID, "url": url}, &result)
+	if navigation.TabID <= 0 {
+		return result, errors.New("tab_id must be positive")
+	}
+	switch navigation.Kind {
+	case "url":
+		if strings.TrimSpace(navigation.URL) == "" {
+			return result, errors.New("url navigation requires url")
+		}
+	case "back", "forward", "reload":
+		if navigation.URL != "" {
+			return result, errors.New("url is only valid when navigation kind is url")
+		}
+	default:
+		return result, fmt.Errorf("unsupported browser navigation %q", navigation.Kind)
+	}
+	err := b.call(ctx, "page.navigate", navigation, &result)
 	return result, err
 }
 
@@ -256,6 +279,8 @@ func (b *Bridge) call(ctx context.Context, method string, params, output any) er
 	if !b.configured {
 		return errors.New("browser is not configured; run lrmcp browser-setup")
 	}
+	callContext, cancel := context.WithTimeout(ctx, 35*time.Second)
+	defer cancel()
 	b.mu.Lock()
 	if !b.connectedLocked() {
 		b.mu.Unlock()
@@ -276,8 +301,8 @@ func (b *Bridge) call(ctx context.Context, method string, params, output any) er
 	}
 	select {
 	case b.commands <- command{ID: id, Method: method, Params: payload}:
-	case <-ctx.Done():
-		return ctx.Err()
+	case <-callContext.Done():
+		return callContext.Err()
 	}
 	select {
 	case response := <-resultChannel:
@@ -291,8 +316,8 @@ func (b *Bridge) call(ctx context.Context, method string, params, output any) er
 			return fmt.Errorf("decode browser extension response: %w", err)
 		}
 		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+	case <-callContext.Done():
+		return callContext.Err()
 	}
 }
 
@@ -386,20 +411,39 @@ func validateAction(action Action) error {
 	if action.TabID <= 0 {
 		return errors.New("tab_id must be positive")
 	}
-	targeted := func() bool { return action.Selector != "" || action.Ref != "" || action.ScreenshotID != "" }
+	targetCount := func() int {
+		count := 0
+		for _, present := range []bool{action.Selector != "", action.Ref != "", action.ScreenshotID != ""} {
+			if present {
+				count++
+			}
+		}
+		return count
+	}
+	requireScreenshotPoint := func() error {
+		if action.ScreenshotID != "" && (action.X == nil || action.Y == nil || *action.X < 0 || *action.Y < 0) {
+			return errors.New("screenshot targeting requires non-negative x and y")
+		}
+		return nil
+	}
 	if action.Button != "" && action.Button != "left" && action.Button != "middle" && action.Button != "right" {
 		return errors.New("button must be left, middle, or right")
 	}
 	switch action.Kind {
 	case "click", "double_click", "hover", "drag":
-		if !targeted() {
+		if targetCount() != 1 {
 			return fmt.Errorf("%s requires selector, ref, or screenshot_id coordinates", action.Kind)
 		}
-		if action.ScreenshotID != "" && (action.X < 0 || action.Y < 0) {
-			return errors.New("screenshot coordinates cannot be negative")
+		if err := requireScreenshotPoint(); err != nil {
+			return err
+		}
+		if action.Kind == "drag" {
+			if action.ToX == nil || action.ToY == nil || *action.ToX < 0 || *action.ToY < 0 {
+				return errors.New("drag requires non-negative to_x and to_y")
+			}
 		}
 	case "type_text", "set_value":
-		if action.Selector == "" && action.Ref == "" {
+		if targetCount() != 1 || action.ScreenshotID != "" {
 			return fmt.Errorf("%s requires selector or ref", action.Kind)
 		}
 		if action.Text == "" {
@@ -409,20 +453,29 @@ func validateAction(action Action) error {
 		if action.Key == "" {
 			return errors.New("press_key requires key")
 		}
+		if targetCount() > 1 || action.ScreenshotID != "" {
+			return errors.New("press_key accepts at most one selector or ref")
+		}
 	case "scroll":
 		if action.ScrollX == 0 && action.ScrollY == 0 {
 			return errors.New("scroll requires scroll_x or scroll_y")
 		}
+		if targetCount() > 1 {
+			return errors.New("scroll accepts at most one target")
+		}
+		if err := requireScreenshotPoint(); err != nil {
+			return err
+		}
 	case "select":
-		if (action.Selector == "" && action.Ref == "") || action.Option == "" {
+		if targetCount() != 1 || action.ScreenshotID != "" || action.Option == "" {
 			return errors.New("select requires selector or ref and option")
 		}
 	case "check":
-		if (action.Selector == "" && action.Ref == "") || action.Checked == nil {
+		if targetCount() != 1 || action.ScreenshotID != "" || action.Checked == nil {
 			return errors.New("check requires selector or ref and checked")
 		}
 	case "upload_files":
-		if (action.Selector == "" && action.Ref == "") || len(action.Files) == 0 {
+		if targetCount() != 1 || action.ScreenshotID != "" || len(action.Files) == 0 {
 			return errors.New("upload_files requires selector or ref and files")
 		}
 	case "handle_dialog":
@@ -433,7 +486,6 @@ func validateAction(action Action) error {
 		if action.Script == "" {
 			return errors.New("evaluate requires script")
 		}
-	case "back", "forward", "reload":
 	default:
 		return fmt.Errorf("unsupported browser action %q", action.Kind)
 	}

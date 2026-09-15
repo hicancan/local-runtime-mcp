@@ -66,6 +66,7 @@ type ReadTextOptions struct {
 type WriteTextOptions struct {
 	CreateOnly     bool
 	ExpectedSHA256 string
+	CreateParents  bool
 }
 
 type EditTextOptions struct {

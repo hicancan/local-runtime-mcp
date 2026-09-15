@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -62,7 +63,7 @@ func TestBridgeRoundTrip(t *testing.T) {
 
 func fakeExtension(ctx context.Context, address string, errorsChannel chan<- error) {
 	for {
-		body := bytes.NewBufferString(`{"instance_id":"test-instance","browser":"test","extension_version":"4.0.0"}`)
+		body := bytes.NewBufferString(`{"instance_id":"test-instance","browser":"test","extension_version":"5.0.0"}`)
 		request, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+address+"/v1/poll", body)
 		request.Header.Set("Authorization", "Bearer "+testToken)
 		request.Header.Set("Content-Type", "application/json")
@@ -88,6 +89,8 @@ func fakeExtension(ctx context.Context, address string, errorsChannel chan<- err
 			result = []Tab{{ID: 7, Title: "Example", URL: "https://example.com"}}
 		case "page.screenshot":
 			result = map[string]any{"data_base64": base64.StdEncoding.EncodeToString([]byte("png")), "info": ScreenshotInfo{TabID: 7, MIMEType: "image/png"}}
+		case "page.navigate":
+			result = Tab{ID: 7, Title: "Navigated", URL: "https://example.com/next"}
 		default:
 			result = map[string]bool{"success": true}
 		}
@@ -143,6 +146,20 @@ func TestInstallExtension(t *testing.T) {
 		if bytes.Contains(manifest, forbidden) {
 			t.Fatalf("installed extension contains unnecessary permission %s", forbidden)
 		}
+	}
+}
+
+func TestExtensionJavaScriptSyntax(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is unavailable")
+	}
+	directory, err := InstallExtension(filepath.Join(t.TempDir(), "extension"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command(node, "--check", filepath.Join(directory, "service_worker.js")).CombinedOutput(); err != nil {
+		t.Fatalf("extension service worker is not valid JavaScript: %v\n%s", err, output)
 	}
 }
 
@@ -214,7 +231,8 @@ func TestBridgeRejectsOldExtension(t *testing.T) {
 func TestActionValidation(t *testing.T) {
 	checked := true
 	accepted := false
-	valid := []Action{{Kind: "click", TabID: 1, Ref: "q1:e1"}, {Kind: "double_click", TabID: 1, ScreenshotID: "p1", X: 0, Y: 0}, {Kind: "hover", TabID: 1, Selector: "button"}, {Kind: "drag", TabID: 1, Ref: "q1:e1", ToX: 2, ToY: 3}, {Kind: "type_text", TabID: 1, Selector: "input", Text: "x"}, {Kind: "set_value", TabID: 1, Ref: "q1:e1", Text: "x"}, {Kind: "press_key", TabID: 1, Key: "Control+L"}, {Kind: "scroll", TabID: 1, ScrollY: 500}, {Kind: "select", TabID: 1, Selector: "select", Option: "one"}, {Kind: "check", TabID: 1, Ref: "q1:e1", Checked: &checked}, {Kind: "upload_files", TabID: 1, Selector: "input", Files: []string{"C:/x.txt"}}, {Kind: "handle_dialog", TabID: 1, Accept: &accepted}, {Kind: "evaluate", TabID: 1, Script: "document.title"}, {Kind: "back", TabID: 1}}
+	zero, two, three := 0.0, 2.0, 3.0
+	valid := []Action{{Kind: "click", TabID: 1, Ref: "q1:e1"}, {Kind: "double_click", TabID: 1, ScreenshotID: "p1", X: &zero, Y: &zero}, {Kind: "hover", TabID: 1, Selector: "button"}, {Kind: "drag", TabID: 1, Ref: "q1:e1", ToX: &two, ToY: &three}, {Kind: "type_text", TabID: 1, Selector: "input", Text: "x"}, {Kind: "set_value", TabID: 1, Ref: "q1:e1", Text: "x"}, {Kind: "press_key", TabID: 1, Key: "Control+L"}, {Kind: "scroll", TabID: 1, ScrollY: 500}, {Kind: "select", TabID: 1, Selector: "select", Option: "one"}, {Kind: "check", TabID: 1, Ref: "q1:e1", Checked: &checked}, {Kind: "upload_files", TabID: 1, Selector: "input", Files: []string{"C:/x.txt"}}, {Kind: "handle_dialog", TabID: 1, Accept: &accepted}, {Kind: "evaluate", TabID: 1, Script: "document.title"}}
 	for _, action := range valid {
 		if err := validateAction(action); err != nil {
 			t.Errorf("%+v: %v", action, err)
@@ -225,6 +243,19 @@ func TestActionValidation(t *testing.T) {
 	}
 	if err := validateAction(Action{Kind: "check", TabID: 1, Ref: "q1:e1"}); err == nil {
 		t.Fatal("check without checked should fail")
+	}
+	if err := validateAction(Action{Kind: "click", TabID: 1, Ref: "q1:e1", Selector: "button"}); err == nil {
+		t.Fatal("ambiguous target should fail")
+	}
+}
+
+func TestNavigationValidation(t *testing.T) {
+	bridge := &Bridge{}
+	invalid := []Navigation{{TabID: 0, Kind: "reload"}, {TabID: 1, Kind: "url"}, {TabID: 1, Kind: "reload", URL: "https://example.com"}, {TabID: 1, Kind: "unknown"}}
+	for _, navigation := range invalid {
+		if _, err := bridge.Navigate(context.Background(), navigation); err == nil {
+			t.Errorf("expected navigation %+v to fail", navigation)
+		}
 	}
 }
 

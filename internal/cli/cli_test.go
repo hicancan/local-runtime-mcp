@@ -17,7 +17,7 @@ func TestVersionAndRemovedCapabilityCLI(t *testing.T) {
 	if err := Run(context.Background(), []string{"version"}, strings.NewReader(""), &output, &errors); err != nil {
 		t.Fatal(err)
 	}
-	if output.String() != "lrmcp 4.0.0\n" {
+	if output.String() != "lrmcp 5.0.0\n" {
 		t.Fatalf("version output = %q", output.String())
 	}
 	if err := Run(context.Background(), []string{"filesystem"}, strings.NewReader(""), &output, &errors); err == nil {

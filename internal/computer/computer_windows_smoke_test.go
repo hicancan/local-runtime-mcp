@@ -16,7 +16,7 @@ func TestWindowsDesktopSmoke(t *testing.T) {
 	}
 	controller := New()
 	targets, err := controller.Targets(context.Background())
-	if err != nil || targets.Backend != "windows-native" {
+	if err != nil {
 		t.Fatalf("window discovery failed: targets=%+v err=%v", targets, err)
 	}
 	data, info, err := controller.State(context.Background(), StateOptions{})
@@ -26,7 +26,7 @@ func TestWindowsDesktopSmoke(t *testing.T) {
 	if len(data) < 8 || string(data[:8]) != "\x89PNG\r\n\x1a\n" || info.Width < 1 || info.Height < 1 {
 		t.Fatalf("invalid desktop capture: bytes=%d info=%+v", len(data), info)
 	}
-	result, err := controller.Act(context.Background(), Action{Kind: "move", StateID: info.StateID, X: info.CursorX, Y: info.CursorY})
+	result, err := controller.Act(context.Background(), Action{Kind: "move", StateID: info.StateID, X: &info.CursorX, Y: &info.CursorY})
 	if err != nil || !result.Success {
 		t.Fatalf("desktop input smoke test failed: result=%+v err=%v", result, err)
 	}
