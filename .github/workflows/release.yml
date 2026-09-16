@@ -65,8 +65,22 @@ jobs:
           $name = "local-runtime-mcp_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}"
           New-Item -ItemType Directory -Path "dist/$name" -Force | Out-Null
           go build -trimpath -ldflags "-s -w" -o "dist/$name/${{ matrix.executable }}" ./cmd/lrmcp
-          Copy-Item README.md,LICENSE "dist/$name/"
-          Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
+          ./scripts/fetch-cloudflared.ps1 -OperatingSystem "${{ matrix.goos }}" -Architecture "${{ matrix.goarch }}" -DestinationDirectory "dist/$name" -TemporaryDirectory (Join-Path $env:RUNNER_TEMP 'cloudflared-download')
+          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/cloudflare/cloudflared/2026.9.1/LICENSE' -OutFile "dist/$name/cloudflared-LICENSE"
+          Copy-Item README.md,LICENSE,THIRD_PARTY_NOTICES.md "dist/$name/"
+          if ("${{ matrix.goos }}" -eq 'windows') {
+            Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
+          }
+          else {
+            Push-Location "dist/$name"
+            try {
+              zip -q -r "../$name.zip" .
+              if ($LASTEXITCODE -ne 0) { throw 'failed to create release archive' }
+            }
+            finally {
+              Pop-Location
+            }
+          }
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.goos }}-${{ matrix.goarch }}

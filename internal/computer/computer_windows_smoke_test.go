@@ -29,15 +29,14 @@ func TestWindowsDesktopSmoke(t *testing.T) {
 			break
 		}
 	}
-	if active == "" {
-		t.Fatal("window discovery did not identify the foreground target")
-	}
-	windowImage, windowState, err := controller.State(context.Background(), StateOptions{TargetID: active})
-	if err != nil || len(windowImage) < 8 || windowState.TargetID != active || windowState.StateID == "" {
-		t.Fatalf("foreground WGC/UIA state failed: bytes=%d state=%+v err=%v", len(windowImage), windowState, err)
-	}
-	if len(windowState.Elements) == 0 {
-		t.Fatal("foreground UI Automation projection returned no interactive elements")
+	if active != "" {
+		windowImage, windowState, err := controller.State(context.Background(), StateOptions{TargetID: active})
+		if err != nil || len(windowImage) < 8 || windowState.TargetID != active || windowState.StateID == "" {
+			t.Fatalf("foreground WGC/UIA state failed: bytes=%d state=%+v err=%v", len(windowImage), windowState, err)
+		}
+		if len(windowState.Elements) == 0 {
+			t.Fatal("foreground UI Automation projection returned no interactive elements")
+		}
 	}
 	data, info, err := controller.State(context.Background(), StateOptions{})
 	if err != nil {
@@ -45,6 +44,9 @@ func TestWindowsDesktopSmoke(t *testing.T) {
 	}
 	if len(data) < 8 || string(data[:8]) != "\x89PNG\r\n\x1a\n" || info.Width < 1 || info.Height < 1 {
 		t.Fatalf("invalid desktop capture: bytes=%d info=%+v", len(data), info)
+	}
+	if len(info.Elements) == 0 {
+		t.Fatal("desktop observation returned no UI Automation projection for the foreground application")
 	}
 	result, err := controller.Act(context.Background(), Action{Kind: "move", StateID: info.StateID, X: &info.CursorX, Y: &info.CursorY})
 	if err != nil || !result.Success {

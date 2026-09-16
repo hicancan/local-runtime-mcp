@@ -48,3 +48,11 @@ jobs:
         run: go test -race ./...
       - run: go vet ./...
       - run: go build ./cmd/lrmcp
+      - if: runner.os == 'Windows'
+        name: Verify pinned cloudflared companion
+        shell: pwsh
+        run: |
+          $destination = Join-Path $env:RUNNER_TEMP 'cloudflared-smoke'
+          $temporary = Join-Path $env:RUNNER_TEMP 'cloudflared-download'
+          ./scripts/fetch-cloudflared.ps1 -OperatingSystem windows -Architecture amd64 -DestinationDirectory $destination -TemporaryDirectory $temporary
+          & (Join-Path $destination 'cloudflared.exe') version

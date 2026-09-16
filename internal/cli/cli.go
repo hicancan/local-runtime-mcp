@@ -13,11 +13,11 @@ import (
 	"strings"
 
 	"github.com/hicancan/local-runtime-mcp/internal/browser"
-	"github.com/hicancan/local-runtime-mcp/internal/computer"
 	"github.com/hicancan/local-runtime-mcp/internal/config"
+	cloudflareexposure "github.com/hicancan/local-runtime-mcp/internal/exposure/cloudflare"
 	"github.com/hicancan/local-runtime-mcp/internal/mcpserver"
-	"github.com/modelcontextprotocol/go-sdk/mcp"
-	tunnelclient "github.com/openai/tunnel-client"
+	"github.com/hicancan/local-runtime-mcp/internal/runtimehost"
+	"github.com/hicancan/local-runtime-mcp/internal/transport"
 )
 
 func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -25,8 +25,12 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return stdio(ctx, args, stdin, stdout, stderr)
 	}
 	switch args[0] {
-	case "tunnel":
-		return tunnel(ctx, args[1:], stderr)
+	case "connect":
+		return connect(ctx, args[1:], stderr)
+	case "serve":
+		return serve(ctx, args[1:], stderr)
+	case "expose":
+		return expose(ctx, args[1:], stderr)
 	case "browser-setup":
 		return browserSetup(args[1:], stdout, stderr)
 	case "version", "--version", "-v":
@@ -55,63 +59,149 @@ func stdio(ctx context.Context, args []string, stdin io.Reader, stdout, stderr i
 	if err != nil {
 		return err
 	}
-	bridge, err := browser.Start(ctx, cfg.Browser)
+	host, err := runtimehost.Start(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	defer bridge.Close(context.Background())
-	controller := computer.New(ctx)
-	defer controller.Close()
-	err = mcpserver.New(ctx, bridge, controller).Run(ctx, &mcp.IOTransport{Reader: noCloseReader{stdin}, Writer: noCloseWriter{stdout}})
-	return normalizeCancellation(err)
+	defer host.Close(context.Background())
+	return normalizeCancellation(transport.ServeStdio(ctx, host.Server(), stdin, stdout))
 }
 
-func tunnel(ctx context.Context, args []string, stderr io.Writer) error {
-	flags := flagSet("tunnel", stderr)
+func connect(ctx context.Context, args []string, stderr io.Writer) error {
+	if len(args) == 0 || args[0] != "openai" {
+		return errors.New("connect requires the provider name openai")
+	}
+	flags := flagSet("connect openai", stderr)
 	configPath := flags.String("config", "", "configuration file path")
-	tunnelID := flags.String("tunnel-id", os.Getenv("CONTROL_PLANE_TUNNEL_ID"), "OpenAI tunnel ID")
-	apiKeyEnv := flags.String("api-key-env", "CONTROL_PLANE_API_KEY", "environment variable containing the tunnel API key")
-	if err := flags.Parse(args); err != nil {
+	tunnelID := flags.String("tunnel-id", os.Getenv("OPENAI_TUNNEL_ID"), "OpenAI tunnel ID")
+	apiKeyEnv := flags.String("api-key-env", "OPENAI_TUNNEL_API_KEY", "environment variable containing the OpenAI tunnel API key")
+	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
 	}
 	if *tunnelID == "" {
-		return errors.New("tunnel ID is required via --tunnel-id or CONTROL_PLANE_TUNNEL_ID")
+		return errors.New("OpenAI tunnel ID is required via --tunnel-id or OPENAI_TUNNEL_ID")
 	}
 	apiKey := os.Getenv(*apiKeyEnv)
 	if apiKey == "" {
-		return fmt.Errorf("tunnel API key environment variable %s is empty", *apiKeyEnv)
+		return fmt.Errorf("OpenAI tunnel API key environment variable %s is empty", *apiKeyEnv)
 	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return err
 	}
-	bridge, err := browser.Start(ctx, cfg.Browser)
+	host, err := runtimehost.Start(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	defer bridge.Close(context.Background())
-	serverTransport, tunnelTransport := mcp.NewInMemoryTransports()
-	controller := computer.New(ctx)
-	defer controller.Close()
-	serverErrors := make(chan error, 1)
-	go func() { serverErrors <- mcpserver.New(ctx, bridge, controller).Run(ctx, serverTransport) }()
-	client, err := tunnelclient.New(tunnelclient.Config{TunnelID: *tunnelID, APIKey: apiKey}, tunnelTransport)
-	if err != nil {
-		return fmt.Errorf("create tunnel client: %w", err)
+	defer host.Close(context.Background())
+	return normalizeCancellation(transport.ServeOpenAI(ctx, host.Server(), transport.OpenAIConfig{TunnelID: *tunnelID, APIKey: apiKey}))
+}
+
+func serve(ctx context.Context, args []string, stderr io.Writer) error {
+	if len(args) == 0 || args[0] != "http" {
+		return errors.New("serve requires the transport name http")
 	}
-	tunnelErrors := make(chan error, 1)
-	go func() { tunnelErrors <- client.Run(ctx) }()
+	flags := flagSet("serve http", stderr)
+	configPath := flags.String("config", "", "configuration file path")
+	listen := flags.String("listen", transport.DefaultHTTPListen, "loopback Streamable HTTP listen address")
+	hostname := flags.String("hostname", os.Getenv("LRMCP_PUBLIC_HOST"), "optional public hostname accepted from a trusted reverse proxy")
+	tokenFile := flags.String("token-file", os.Getenv("LRMCP_HTTP_TOKEN_FILE"), "file containing the HTTP bearer token")
+	tokenEnv := flags.String("token-env", "LRMCP_HTTP_TOKEN", "environment variable containing the HTTP bearer token")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	token, err := loadSecret(*tokenFile, *tokenEnv)
+	if err != nil {
+		return err
+	}
+	return runHTTP(ctx, *configPath, *listen, *hostname, token, stderr)
+}
+
+func expose(ctx context.Context, args []string, stderr io.Writer) error {
+	if len(args) == 0 || args[0] != "cloudflare" {
+		return errors.New("expose requires the provider name cloudflare")
+	}
+	flags := flagSet("expose cloudflare", stderr)
+	configPath := flags.String("config", "", "configuration file path")
+	listen := flags.String("listen", transport.DefaultHTTPListen, "loopback Streamable HTTP listen address")
+	hostname := flags.String("hostname", os.Getenv("LRMCP_PUBLIC_HOST"), "public hostname routed by Cloudflare Tunnel")
+	httpTokenFile := flags.String("http-token-file", os.Getenv("LRMCP_HTTP_TOKEN_FILE"), "file containing the HTTP bearer token")
+	httpTokenEnv := flags.String("http-token-env", "LRMCP_HTTP_TOKEN", "environment variable containing the HTTP bearer token")
+	cloudflared := flags.String("cloudflared", "", "cloudflared binary path; defaults to a sibling binary or PATH")
+	tunnelTokenFile := flags.String("tunnel-token-file", os.Getenv("TUNNEL_TOKEN_FILE"), "file containing the Cloudflare tunnel token")
+	tunnelTokenEnv := flags.String("tunnel-token-env", "TUNNEL_TOKEN", "environment variable containing the Cloudflare tunnel token")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	if *hostname == "" {
+		return errors.New("Cloudflare exposure requires --hostname or LRMCP_PUBLIC_HOST")
+	}
+	httpToken, err := loadSecret(*httpTokenFile, *httpTokenEnv)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+	host, err := runtimehost.Start(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer host.Close(context.Background())
+	httpServer, err := transport.NewHTTP(host.Server(), transport.HTTPConfig{
+		Listen: *listen, BearerToken: httpToken, PublicHost: *hostname,
+	})
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	httpErrors := make(chan error, 1)
+	cloudflareErrors := make(chan error, 1)
+	go func() { httpErrors <- httpServer.Run(ctx) }()
+	go func() {
+		cloudflareErrors <- cloudflareexposure.Run(ctx, cloudflareexposure.Config{
+			Binary: *cloudflared, TokenFile: *tunnelTokenFile, Token: os.Getenv(*tunnelTokenEnv), Stdout: stderr, Stderr: stderr,
+		})
+	}()
+	fmt.Fprintf(stderr, "Local Runtime MCP exposing https://%s/mcp from %s\n", *hostname, httpServer.Address())
 	select {
-	case err := <-serverErrors:
+	case err := <-httpErrors:
 		return normalizeCancellation(err)
-	case err := <-tunnelErrors:
+	case err := <-cloudflareErrors:
 		return normalizeCancellation(err)
 	case <-ctx.Done():
 		return nil
 	}
+}
+
+func runHTTP(ctx context.Context, configPath, listen, hostname, token string, stderr io.Writer) error {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	host, err := runtimehost.Start(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer host.Close(context.Background())
+	httpServer, err := transport.NewHTTP(host.Server(), transport.HTTPConfig{Listen: listen, BearerToken: token, PublicHost: hostname})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stderr, "Local Runtime MCP serving Streamable HTTP on http://%s/mcp\n", httpServer.Address())
+	return normalizeCancellation(httpServer.Run(ctx))
 }
 
 func browserSetup(args []string, stdout, stderr io.Writer) error {
@@ -183,30 +273,56 @@ func normalizeCancellation(err error) error {
 	return err
 }
 
+func loadSecret(path, environment string) (string, error) {
+	value := os.Getenv(environment)
+	if path != "" && value != "" {
+		return "", fmt.Errorf("provide secret file or environment variable %s, not both", environment)
+	}
+	if path == "" {
+		return strings.TrimSpace(value), nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read secret file: %w", err)
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
 func usage(writer io.Writer) {
 	fmt.Fprint(writer, `Local Runtime MCP (lrmcp)
 
 Usage:
-  lrmcp [--config PATH]                  Serve MCP over stdio
-  lrmcp tunnel [flags]                   Connect this machine to an OpenAI tunnel
+  lrmcp [--config PATH]                  MCP over stdio
+  lrmcp connect openai [flags]           MCP over OpenAI Tunnel
+  lrmcp serve http [flags]               MCP over loopback Streamable HTTP
+  lrmcp expose cloudflare [flags]        Streamable HTTP through Cloudflare Tunnel
   lrmcp browser-setup [flags]            Configure and extract the Chromium extension
   lrmcp version
   lrmcp help
 
-Tunnel flags:
+OpenAI flags:
   --config PATH
-  --tunnel-id ID                         Or CONTROL_PLANE_TUNNEL_ID
-  --api-key-env NAME                     Defaults to CONTROL_PLANE_API_KEY
+  --tunnel-id ID                         Or OPENAI_TUNNEL_ID
+  --api-key-env NAME                     Defaults to OPENAI_TUNNEL_API_KEY
+
+HTTP flags:
+  --config PATH
+  --listen ADDRESS                       Defaults to 127.0.0.1:9316
+  --hostname HOST                        Optional trusted reverse-proxy hostname
+  --token-file PATH                      Or LRMCP_HTTP_TOKEN_FILE
+  --token-env NAME                       Defaults to LRMCP_HTTP_TOKEN
+
+Cloudflare flags:
+  --config PATH
+  --listen ADDRESS                       Defaults to 127.0.0.1:9316
+  --hostname HOST                        Or LRMCP_PUBLIC_HOST
+  --http-token-file PATH                 Or LRMCP_HTTP_TOKEN_FILE
+  --http-token-env NAME                  Defaults to LRMCP_HTTP_TOKEN
+  --cloudflared PATH                     Defaults to sibling companion or PATH
+  --tunnel-token-file PATH               Or TUNNEL_TOKEN_FILE
+  --tunnel-token-env NAME                Defaults to TUNNEL_TOKEN
 
 Source: https://github.com/hicancan/local-runtime-mcp
 License: GNU AGPL v3.0 only
 `)
 }
-
-type noCloseReader struct{ io.Reader }
-
-func (noCloseReader) Close() error { return nil }
-
-type noCloseWriter struct{ io.Writer }
-
-func (noCloseWriter) Close() error { return nil }

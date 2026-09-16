@@ -12,16 +12,19 @@ import (
 	"github.com/hicancan/local-runtime-mcp/internal/config"
 )
 
-func TestVersionAndRemovedCapabilityCLI(t *testing.T) {
+func TestVersionAndRemovedCLI(t *testing.T) {
 	var output, errors bytes.Buffer
 	if err := Run(context.Background(), []string{"version"}, strings.NewReader(""), &output, &errors); err != nil {
 		t.Fatal(err)
 	}
-	if output.String() != "lrmcp 6.0.1\n" {
+	if output.String() != "lrmcp 7.0.0\n" {
 		t.Fatalf("version output = %q", output.String())
 	}
 	if err := Run(context.Background(), []string{"filesystem"}, strings.NewReader(""), &output, &errors); err == nil {
 		t.Fatal("removed filesystem CLI was accepted")
+	}
+	if err := Run(context.Background(), []string{"tunnel"}, strings.NewReader(""), &output, &errors); err == nil {
+		t.Fatal("removed generic tunnel CLI was accepted")
 	}
 }
 
@@ -30,9 +33,17 @@ func TestHelpIncludesSourceAndLicense(t *testing.T) {
 	if err := Run(context.Background(), []string{"help"}, strings.NewReader(""), &output, &errors); err != nil {
 		t.Fatal(err)
 	}
-	for _, value := range []string{"https://github.com/hicancan/local-runtime-mcp", "GNU AGPL v3.0 only"} {
+	for _, value := range []string{
+		"connect openai", "serve http", "expose cloudflare",
+		"https://github.com/hicancan/local-runtime-mcp", "GNU AGPL v3.0 only",
+	} {
 		if !strings.Contains(output.String(), value) {
 			t.Fatalf("help is missing %q: %q", value, output.String())
+		}
+	}
+	for _, removed := range []string{"CONTROL_PLANE_TUNNEL_ID", "CONTROL_PLANE_API_KEY"} {
+		if strings.Contains(output.String(), removed) {
+			t.Fatalf("help retains obsolete name %q", removed)
 		}
 	}
 }
@@ -70,5 +81,24 @@ func TestBrowserSetup(t *testing.T) {
 	}
 	if strings.Contains(output.String(), cfg.Browser.Token) {
 		t.Fatal("browser setup leaked token to stdout")
+	}
+}
+
+func TestLoadSecret(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(path, []byte("  file-secret  \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	value, err := loadSecret(path, "LRMCP_TEST_SECRET")
+	if err != nil || value != "file-secret" {
+		t.Fatalf("loadSecret(file) = %q, %v", value, err)
+	}
+	t.Setenv("LRMCP_TEST_SECRET", "environment-secret")
+	if _, err := loadSecret(path, "LRMCP_TEST_SECRET"); err == nil {
+		t.Fatal("loadSecret accepted two secret sources")
+	}
+	value, err = loadSecret("", "LRMCP_TEST_SECRET")
+	if err != nil || value != "environment-secret" {
+		t.Fatalf("loadSecret(environment) = %q, %v", value, err)
 	}
 }

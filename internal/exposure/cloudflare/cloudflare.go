@@ -1,0 +1,109 @@
+package cloudflare
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+)
+
+type Config struct {
+	Binary    string
+	TokenFile string
+	Token     string
+	Stdout    io.Writer
+	Stderr    io.Writer
+}
+
+func Run(ctx context.Context, cfg Config) error {
+	binary, err := FindBinary(cfg.Binary)
+	if err != nil {
+		return err
+	}
+	tokenFile, cleanup, err := prepareTokenFile(cfg.TokenFile, cfg.Token)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	command := exec.CommandContext(ctx, binary, Arguments(tokenFile)...)
+	command.Stdout = cfg.Stdout
+	command.Stderr = cfg.Stderr
+	configureCommand(command)
+	if err := command.Run(); err != nil && !errors.Is(ctx.Err(), context.Canceled) {
+		return fmt.Errorf("cloudflared: %w", err)
+	}
+	return nil
+}
+
+func Arguments(tokenFile string) []string {
+	return []string{"tunnel", "--no-autoupdate", "run", "--token-file", tokenFile}
+}
+
+func FindBinary(explicit string) (string, error) {
+	name := "cloudflared"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	if explicit != "" {
+		resolved, err := filepath.Abs(explicit)
+		if err != nil {
+			return "", err
+		}
+		if info, err := os.Stat(resolved); err != nil || info.IsDir() {
+			return "", fmt.Errorf("cloudflared binary %q is not a regular file", resolved)
+		}
+		return resolved, nil
+	}
+	if executable, err := os.Executable(); err == nil {
+		sibling := filepath.Join(filepath.Dir(executable), name)
+		if info, err := os.Stat(sibling); err == nil && !info.IsDir() {
+			return sibling, nil
+		}
+	}
+	resolved, err := exec.LookPath(name)
+	if err != nil {
+		return "", errors.New("cloudflared companion was not found beside lrmcp or on PATH")
+	}
+	return resolved, nil
+}
+
+func prepareTokenFile(path, token string) (string, func(), error) {
+	if path != "" && token != "" {
+		return "", func() {}, errors.New("provide a Cloudflare token file or token, not both")
+	}
+	if path != "" {
+		resolved, err := filepath.Abs(path)
+		if err != nil {
+			return "", func() {}, err
+		}
+		info, err := os.Stat(resolved)
+		if err != nil || info.IsDir() {
+			return "", func() {}, fmt.Errorf("Cloudflare token file %q is not a regular file", resolved)
+		}
+		return resolved, func() {}, nil
+	}
+	if strings.TrimSpace(token) == "" {
+		return "", func() {}, errors.New("Cloudflare tunnel token is required")
+	}
+	directory, err := os.MkdirTemp("", "lrmcp-cloudflare-token-")
+	if err != nil {
+		return "", func() {}, err
+	}
+	cleanup := func() { _ = os.RemoveAll(directory) }
+	if err := os.Chmod(directory, 0o700); err != nil {
+		cleanup()
+		return "", func() {}, err
+	}
+	file := filepath.Join(directory, "token")
+	if err := os.WriteFile(file, []byte(strings.TrimSpace(token)), 0o600); err != nil {
+		cleanup()
+		return "", func() {}, err
+	}
+	return file, cleanup, nil
+}

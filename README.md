@@ -1,47 +1,72 @@
 # Local Runtime MCP
 
-Local Runtime MCP lets an MCP client use the machine on which `lrmcp` is running. “Local” describes the relationship to that process, not a laptop-only deployment: the same binary can run on a workstation, VM, or server.
+Local Runtime MCP lets an MCP client use the machine on which `lrmcp` is running. “Local” describes the relationship to that process, not a laptop-only deployment: the same runtime can run on a workstation, VM, or server.
 
-The project has one distributed executable, one MCP server, two transports, and five orthogonal public domains. Its command line is only a lifecycle surface; it is not a second automation API.
+The project has one MCP runtime, three transport adapters, one optional exposure adapter, and five orthogonal public domains. Its command line is only a lifecycle surface; it is not a second automation API.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    Cloud["Cloud AI / ChatGPT"] -->|"OpenAI Tunnel"| Tunnel["lrmcp tunnel"]
-    Client["Local MCP client"] -->|"stdio"| Serve["lrmcp"]
+    subgraph Clients["MCP clients"]
+        Local["local MCP client"]
+        ChatGPT["ChatGPT over OpenAI Tunnel"]
+        Remote["remote HTTP MCP client"]
+    end
 
-    Tunnel --> MCP["Go runtime host\nMCP protocol · lifecycle · transport"]
-    Serve --> MCP
+    subgraph Connectivity["connection plane"]
+        Stdio["transport: stdio"]
+        OpenAI["transport: OpenAI Tunnel"]
+        Edge["Cloudflare edge\nHTTPS hostname"]
+        Cloudflared["exposure: cloudflared\noutbound connector"]
+        HTTP["transport: Streamable HTTP\nloopback /mcp"]
+        Auth["Bearer authentication\nHost + Origin checks"]
+    end
 
-    MCP --> Process["process\nrun · continue"]
-    MCP --> Filesystem["filesystem\nlist · stat · read · search · write · patch"]
-    MCP --> Image["image\nread"]
-    MCP --> Computer["computer\ntargets · state · action"]
-    MCP --> Browser["browser\nstatus · tabs · open · close\nnavigate · snapshot · screenshot · action"]
+    subgraph Runtime["one Local Runtime MCP host"]
+        MCP["MCP protocol · sessions · lifecycle"]
+        Process["process\nrun · continue"]
+        Filesystem["filesystem\nlist · stat · read · search · write · patch"]
+        Image["image\nread"]
+        Computer["computer\ntargets · state · action"]
+        Browser["browser\nstatus · tabs · open · close\nnavigate · snapshot · screenshot · action"]
+    end
 
-    Process --> Machine["machine running lrmcp"]
-    Filesystem --> Machine
-    Image --> Machine
+    Local --> Stdio --> MCP
+    ChatGPT --> OpenAI --> MCP
+    Remote --> Edge --> Cloudflared --> HTTP --> Auth --> MCP
+    Cloudflared -.->|"connector is initiated outbound"| Edge
 
-    Computer --> Worker["embedded Rust worker\nstate machine · WGC · UIA · SendInput"]
+    MCP --> Process --> Machine["machine running lrmcp"]
+    MCP --> Filesystem --> Machine
+    MCP --> Image --> Machine
+
+    MCP --> Computer --> Worker["embedded Rust worker\nstate machine · WGC · UIA · SendInput"]
     Worker --> Desktop["current interactive Windows desktop"]
 
-    Browser --> Bridge["authenticated loopback long poll"]
+    MCP --> Browser --> Bridge["authenticated loopback long poll"]
     Bridge --> Extension["bundled TypeScript Chromium MV3 extension"]
     Extension --> CDP["chrome.debugger / CDP\nAX tree · Page · DOM · Input"]
     CDP --> Profile["tabs in that browser profile"]
 ```
 
-The arrows are the architecture. There is no generic “core”, capability registry, dynamic plug-in framework, workspace root, host router, policy engine, or compatibility layer:
+The layers are deliberately not interchangeable:
 
-- Go owns MCP, transports, lifecycle, bounded data contracts, Process, Filesystem, Image, and the Browser bridge.
+- A **transport** carries MCP messages into the runtime: stdio, OpenAI Tunnel, or Streamable HTTP.
+- An **exposure** makes an existing network transport reachable: Cloudflare Tunnel exposes the loopback HTTP origin but does not implement MCP.
+- A **domain** describes what the runtime can do after a request arrives: Process, Filesystem, Image, Computer, or Browser.
+
+OpenAI Tunnel terminates directly into an in-memory MCP transport. Cloudflare Tunnel terminates into a loopback HTTP origin. They are therefore separate adapters, not implementations of a fictional common `TunnelProvider`.
+
+There is no capability registry, dynamic plug-in framework, workspace root, host router, generic policy engine, or compatibility layer:
+
+- Go owns MCP, transports, lifecycle, HTTP authentication, the Cloudflare child-process boundary, bounded data contracts, Process, Filesystem, Image, and the Browser bridge.
 - Rust owns the complete Windows Computer state machine behind a private framed protocol.
 - TypeScript owns the Chromium extension and CDP session graph.
-- stdio and OpenAI Tunnel are adapters to the same MCP server, never alternate domain implementations.
-- Each running instance represents exactly one machine. Multiple machines use separate instances and connector identities.
+- Every transport reaches the same runtime and the same 20 tools.
+- Each running instance represents exactly one machine. Distinct machines use separate OpenAI connector identities or separate Cloudflare Tunnel UUIDs and hostnames; they are never replicas behind one identity.
 
-The Rust worker is compiled before the Windows Go build and embedded into `lrmcp.exe`. At runtime it is extracted to a private temporary directory and launched hidden. Users still distribute one file, while capture/UIA failures remain isolated from the MCP transport process.
+The Rust worker is compiled before the Windows Go build and embedded into `lrmcp.exe`. At runtime it is extracted to a private temporary directory and launched hidden. The optional, separately licensed `cloudflared` executable remains a supervised companion process so Cloudflare's protocol and update lifecycle never enter the core.
 
 ## Public surface: 20 MCP tools
 
@@ -174,7 +199,7 @@ Each tab has one page epoch. Loading, navigation, or any successful action inval
 
 ## Install
 
-Download an archive from [Releases](https://github.com/hicancan/local-runtime-mcp/releases), extract `lrmcp` or `lrmcp.exe`, and optionally add its directory to `PATH`.
+Download an archive from [Releases](https://github.com/hicancan/local-runtime-mcp/releases), extract it, and optionally add the directory containing `lrmcp` or `lrmcp.exe` to `PATH`. Release archives also contain the pinned `cloudflared` companion; it is used only by `lrmcp expose cloudflare`.
 
 Verify it:
 
@@ -222,7 +247,7 @@ Generate and save a token, extract the exact extension embedded in the binary, a
 lrmcp browser-setup
 ```
 
-The command prints the extension and config paths but never the token. In `edge://extensions` or `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select the printed directory. After upgrading `lrmcp`, run setup again and reload the unpacked extension; server and extension versions must match.
+The command prints the extension and config paths but never the token. In `edge://extensions` or `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select the printed directory. The Browser bridge has its own bundled protocol version; rerun setup and reload the extension only when `browser_status` reports a version mismatch.
 
 ## Connect
 
@@ -233,18 +258,37 @@ lrmcp
 lrmcp --config C:\path\to\config.yaml
 ```
 
-For a ChatGPT custom connector using OpenAI Tunnel:
+For ChatGPT using OpenAI Tunnel:
 
 ```powershell
-$env:CONTROL_PLANE_TUNNEL_ID = "..."
-$env:CONTROL_PLANE_API_KEY = "..."
-lrmcp tunnel
+$env:OPENAI_TUNNEL_ID = "..."
+$env:OPENAI_TUNNEL_API_KEY = "..."
+lrmcp connect openai
 ```
 
+For direct, authenticated Streamable HTTP on loopback:
+
+```powershell
+$env:LRMCP_HTTP_TOKEN_FILE = "$env:USERPROFILE\.lrmcp\http-token"
+lrmcp serve http
+```
+
+For the configured Cloudflare hostname:
+
+```powershell
+$env:LRMCP_HTTP_TOKEN_FILE = "$env:USERPROFILE\.lrmcp\http-token"
+$env:TUNNEL_TOKEN_FILE = "$env:USERPROFILE\.lrmcp\cloudflare-token"
+lrmcp expose cloudflare --hostname mcp.example.com
+```
+
+The resulting MCP endpoint is `https://mcp.example.com/mcp`. The HTTP token file must contain one random secret of at least 32 characters; every request supplies it as `Authorization: Bearer <token>`. `TUNNEL_TOKEN_FILE` authenticates `cloudflared` to Cloudflare; it does **not** authenticate MCP callers. The HTTP server always binds to loopback and has no unauthenticated mode.
+
 ```text
-lrmcp [--config PATH]       MCP over stdio
-lrmcp tunnel [flags]        MCP over OpenAI Tunnel
-lrmcp browser-setup [flags] extract/configure the bundled extension
+lrmcp [--config PATH]           MCP over stdio
+lrmcp connect openai [flags]    MCP over OpenAI Tunnel
+lrmcp serve http [flags]        MCP over loopback Streamable HTTP
+lrmcp expose cloudflare [flags] Streamable HTTP + supervised cloudflared
+lrmcp browser-setup [flags]     extract/configure the bundled extension
 lrmcp version
 lrmcp help
 ```
@@ -281,17 +325,16 @@ $env:LRMCP_DESKTOP_SMOKE = "1"
 go test ./internal/computer -run TestWindowsDesktopSmoke -count=1 -v
 ```
 
-CI builds the TypeScript output on Windows, Linux, and macOS; compiles/lints Rust and builds the embedded worker on Windows; runs Go tests everywhere, the race detector on Linux, real isolated Edge E2E on Windows, `go vet`, and final builds. A `v*` tag builds five release archives and publishes one GitHub release.
+CI builds the TypeScript output on Windows, Linux, and macOS; compiles/lints Rust and builds the embedded worker on Windows; runs Go tests everywhere, the race detector on Linux, real isolated Edge E2E on Windows, `go vet`, final builds, and a checksum-verified `cloudflared` companion smoke test. A `v*` tag builds five release archives with the correct pinned companion and publishes one GitHub release.
 
-## v6 breaking changes
+## v7 breaking changes
 
-- `filesystem_edit_text` was deleted; `filesystem_patch_text` requires immutable-base hunks and `expected_sha256`.
-- Process gained PTY/ConPTY mode and terminal resize without adding another public tool.
-- Image gained bounded crop/resize projection without adding another public tool.
-- Computer moved completely from the Go Win32 implementation to an embedded Rust WGC/UIA worker. Bare numeric `window_id` became opaque `target_id`; state now exposes UIA `element_ref` values.
-- Browser moved from injected DOM traversal to TypeScript + CDP Accessibility trees with flat OOPIF sessions. CSS selector targeting was deleted.
-- No v5 aliases, deprecated fields, migration shims, or alternate backends remain.
+- The ambiguous `lrmcp tunnel` command was deleted; OpenAI is now explicit as `lrmcp connect openai`.
+- `CONTROL_PLANE_TUNNEL_ID` and `CONTROL_PLANE_API_KEY` were deleted; use `OPENAI_TUNNEL_ID` and `OPENAI_TUNNEL_API_KEY`.
+- Streamable HTTP and Cloudflare exposure were added as separate static adapters. Cloudflare is not a second MCP implementation.
+- HTTP requires a bearer token of at least 32 characters, accepts only loopback listeners, validates the request host, and rejects browser-origin requests.
+- No v6 command aliases or environment-variable fallbacks remain.
 
 ## License
 
-[GNU Affero General Public License v3.0 only](LICENSE). Modified versions offered to users over a network must make their corresponding source available under the same license.
+[GNU Affero General Public License v3.0 only](LICENSE). Modified versions offered to users over a network must make their corresponding source available under the same license. The optional unmodified `cloudflared` companion is a separate Apache-2.0 program; see [third-party notices](THIRD_PARTY_NOTICES.md).
