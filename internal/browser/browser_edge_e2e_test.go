@@ -99,7 +99,18 @@ func TestEdgeExtensionEndToEnd(t *testing.T) {
 		t.Fatalf("test page was not controllable: %+v", tabs)
 	}
 
-	snapshot, err := bridge.Snapshot(callContext, tabID, 20, 1000)
+	var snapshot Snapshot
+	snapshotDeadline := time.Now().Add(5 * time.Second)
+	for {
+		snapshot, err = bridge.Snapshot(callContext, tabID, 20, 1000)
+		if err == nil && strings.Contains(snapshot.Text, "Child action") {
+			break
+		}
+		if time.Now().After(snapshotDeadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	if err != nil {
 		bridge.mu.Lock()
 		t.Logf("bridge diagnostics: queued_commands=%d pending=%d last_seen=%s", len(bridge.commands), len(bridge.pending), bridge.lastSeen.Format(time.RFC3339Nano))
