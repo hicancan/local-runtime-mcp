@@ -11,12 +11,26 @@ import (
 
 func TestArgumentsContainOnlyTokenFile(t *testing.T) {
 	path := filepath.Join("private", "token")
-	want := []string{"tunnel", "--no-autoupdate", "run", "--token-file", path}
+	want := []string{"tunnel", "--no-autoupdate", "--loglevel", "error", "run", "--token-file", path}
 	if got := Arguments(path); !reflect.DeepEqual(got, want) {
 		t.Fatalf("Arguments() = %q, want %q", got, want)
 	}
 	if strings.Contains(strings.Join(Arguments(path), " "), "secret-value") {
 		t.Fatal("arguments leaked a token value")
+	}
+}
+
+func TestSanitizedEnvironment(t *testing.T) {
+	values := []string{
+		"Path=/usr/bin",
+		"LRMCP_HTTP_TOKEN=http-secret",
+		"OPENAI_TUNNEL_API_KEY=openai-secret",
+		"CONTROL_PLANE_TUNNEL_ID=obsolete",
+		"CUSTOM_TUNNEL_SECRET=cloudflare-secret",
+	}
+	got := sanitizedEnvironment(values, []string{"custom_tunnel_secret"})
+	if !reflect.DeepEqual(got, []string{"Path=/usr/bin"}) {
+		t.Fatalf("sanitizedEnvironment() = %q", got)
 	}
 }
 

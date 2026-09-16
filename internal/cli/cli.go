@@ -172,7 +172,12 @@ func expose(ctx context.Context, args []string, stderr io.Writer) error {
 	go func() { httpErrors <- httpServer.Run(ctx) }()
 	go func() {
 		cloudflareErrors <- cloudflareexposure.Run(ctx, cloudflareexposure.Config{
-			Binary: *cloudflared, TokenFile: *tunnelTokenFile, Token: os.Getenv(*tunnelTokenEnv), Stdout: stderr, Stderr: stderr,
+			Binary:                    *cloudflared,
+			TokenFile:                 *tunnelTokenFile,
+			Token:                     os.Getenv(*tunnelTokenEnv),
+			SensitiveEnvironmentNames: []string{*httpTokenEnv, *tunnelTokenEnv},
+			Stdout:                    stderr,
+			Stderr:                    stderr,
 		})
 	}()
 	fmt.Fprintf(stderr, "Local Runtime MCP exposing https://%s/mcp from %s\n", *hostname, httpServer.Address())

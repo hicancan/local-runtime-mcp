@@ -13,11 +13,12 @@ import (
 )
 
 type Config struct {
-	Binary    string
-	TokenFile string
-	Token     string
-	Stdout    io.Writer
-	Stderr    io.Writer
+	Binary                    string
+	TokenFile                 string
+	Token                     string
+	SensitiveEnvironmentNames []string
+	Stdout                    io.Writer
+	Stderr                    io.Writer
 }
 
 func Run(ctx context.Context, cfg Config) error {
@@ -32,6 +33,7 @@ func Run(ctx context.Context, cfg Config) error {
 	defer cleanup()
 
 	command := exec.CommandContext(ctx, binary, Arguments(tokenFile)...)
+	command.Env = sanitizedEnvironment(os.Environ(), cfg.SensitiveEnvironmentNames)
 	command.Stdout = cfg.Stdout
 	command.Stderr = cfg.Stderr
 	configureCommand(command)
@@ -42,7 +44,25 @@ func Run(ctx context.Context, cfg Config) error {
 }
 
 func Arguments(tokenFile string) []string {
-	return []string{"tunnel", "--no-autoupdate", "run", "--token-file", tokenFile}
+	return []string{"tunnel", "--no-autoupdate", "--loglevel", "error", "run", "--token-file", tokenFile}
+}
+
+func sanitizedEnvironment(values, explicit []string) []string {
+	remove := make(map[string]struct{}, len(explicit))
+	for _, name := range explicit {
+		remove[strings.ToUpper(strings.TrimSpace(name))] = struct{}{}
+	}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		name, _, ok := strings.Cut(value, "=")
+		upper := strings.ToUpper(name)
+		_, explicitlyRemoved := remove[upper]
+		if !ok || explicitlyRemoved || strings.HasPrefix(upper, "LRMCP_") || strings.HasPrefix(upper, "OPENAI_") || strings.HasPrefix(upper, "CONTROL_PLANE_") {
+			continue
+		}
+		result = append(result, value)
+	}
+	return result
 }
 
 func FindBinary(explicit string) (string, error) {
