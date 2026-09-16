@@ -94,13 +94,9 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 		}
 		return err
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := s.server.Shutdown(shutdownCtx); err != nil {
-			_ = s.server.Close()
-			return err
-		}
-		return nil
+		// This server is stateless: terminal shutdown should take the machine
+		// offline immediately instead of waiting on a client's open HTTP body.
+		return s.server.Close()
 	}
 }
 
