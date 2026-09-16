@@ -23,9 +23,9 @@ func TestArgumentsContainOnlyTokenFile(t *testing.T) {
 func TestSanitizedEnvironment(t *testing.T) {
 	values := []string{
 		"Path=/usr/bin",
-		"LRMCP_HTTP_TOKEN=http-secret",
-		"OPENAI_TUNNEL_API_KEY=openai-secret",
-		"CONTROL_PLANE_TUNNEL_ID=obsolete",
+		"LOCAL_RUNTIME_MCP_HTTP_BEARER_TOKEN=http-secret",
+		"SERVICE_API_KEY=api-secret",
+		"ANOTHER_PASSWORD=password-secret",
 		"CUSTOM_TUNNEL_SECRET=cloudflare-secret",
 	}
 	got := sanitizedEnvironment(values, []string{"custom_tunnel_secret"})
@@ -35,7 +35,7 @@ func TestSanitizedEnvironment(t *testing.T) {
 }
 
 func TestPrepareTokenFile(t *testing.T) {
-	path, cleanup, err := prepareTokenFile("", "  secret-value  ")
+	path, cleanup, err := prepareTokenFile("  secret-value  ")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	computerWorkerVersion = "6.0.1"
+	computerWorkerVersion = "8.0.0"
 	computerCallTimeout   = 30 * time.Second
 )
 

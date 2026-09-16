@@ -11,8 +11,8 @@ import (
 // TestWindowsDesktopSmoke is opt-in because CI runners do not have an
 // interactive desktop. It validates the real signed-in session before release.
 func TestWindowsDesktopSmoke(t *testing.T) {
-	if os.Getenv("LRMCP_DESKTOP_SMOKE") != "1" {
-		t.Skip("set LRMCP_DESKTOP_SMOKE=1 in an interactive Windows session")
+	if os.Getenv("LOCAL_RUNTIME_MCP_DESKTOP_SMOKE") != "1" {
+		t.Skip("set LOCAL_RUNTIME_MCP_DESKTOP_SMOKE=1 in an interactive Windows session")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

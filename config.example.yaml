@@ -1,3 +1,15 @@
 browser:
   listen: 127.0.0.1:9315
-  token: ${LRMCP_BROWSER_TOKEN}
+  token: "replace-with-a-random-token-of-at-least-32-characters"
+
+openai:
+  tunnel_id: "replace-with-your-openai-tunnel-id"
+  api_key: "replace-with-your-openai-tunnel-api-key"
+
+http:
+  listen: 127.0.0.1:9316
+  public_host: mcp.example.com
+  bearer_token: "replace-with-a-random-token-of-at-least-32-characters"
+
+cloudflare:
+  tunnel_token: "replace-with-your-cloudflare-managed-tunnel-token"

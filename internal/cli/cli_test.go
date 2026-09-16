@@ -12,48 +12,41 @@ import (
 	"github.com/hicancan/local-runtime-mcp/internal/config"
 )
 
-func TestVersionAndRemovedCLI(t *testing.T) {
+func TestVersion(t *testing.T) {
 	var output, errors bytes.Buffer
-	if err := Run(context.Background(), []string{"version"}, strings.NewReader(""), &output, &errors); err != nil {
+	executable := filepath.Join(t.TempDir(), "lrmcp.exe")
+	if err := run(context.Background(), []string{"version"}, strings.NewReader(""), &output, &errors, executable); err != nil {
 		t.Fatal(err)
 	}
-	if output.String() != "lrmcp 7.0.1\n" {
+	if output.String() != "lrmcp 8.0.0\n" {
 		t.Fatalf("version output = %q", output.String())
-	}
-	if err := Run(context.Background(), []string{"filesystem"}, strings.NewReader(""), &output, &errors); err == nil {
-		t.Fatal("removed filesystem CLI was accepted")
-	}
-	if err := Run(context.Background(), []string{"tunnel"}, strings.NewReader(""), &output, &errors); err == nil {
-		t.Fatal("removed generic tunnel CLI was accepted")
 	}
 }
 
-func TestHelpIncludesSourceAndLicense(t *testing.T) {
+func TestHelpDescribesConfiguration(t *testing.T) {
 	var output, errors bytes.Buffer
-	if err := Run(context.Background(), []string{"help"}, strings.NewReader(""), &output, &errors); err != nil {
+	executable := filepath.Join(t.TempDir(), "lrmcp.exe")
+	if err := run(context.Background(), []string{"help"}, strings.NewReader(""), &output, &errors, executable); err != nil {
 		t.Fatal(err)
 	}
 	for _, value := range []string{
-		"connect openai", "serve http", "expose cloudflare",
+		"connect openai", "serve http", "expose cloudflare", config.FileName,
+		"command line > LOCAL_RUNTIME_MCP_* environment > YAML > defaults",
 		"https://github.com/hicancan/local-runtime-mcp", "GNU AGPL v3.0 only",
 	} {
 		if !strings.Contains(output.String(), value) {
 			t.Fatalf("help is missing %q: %q", value, output.String())
 		}
 	}
-	for _, removed := range []string{"CONTROL_PLANE_TUNNEL_ID", "CONTROL_PLANE_API_KEY"} {
-		if strings.Contains(output.String(), removed) {
-			t.Fatalf("help retains obsolete name %q", removed)
-		}
-	}
 }
 
-func TestBrowserSetup(t *testing.T) {
-	directory := filepath.Join(t.TempDir(), "browser-extension")
-	configPath := filepath.Join(t.TempDir(), ".lrmcp", "config.yaml")
+func TestBrowserSetupUsesPortablePaths(t *testing.T) {
+	root := t.TempDir()
+	executable := filepath.Join(root, "lrmcp.exe")
+	directory := filepath.Join(root, "custom-extension")
 	var output, errors bytes.Buffer
-	args := []string{"browser-setup", "--config", configPath, "--directory", directory}
-	if err := Run(context.Background(), args, strings.NewReader(""), &output, &errors); err != nil {
+	args := []string{"browser-setup", "--directory", directory}
+	if err := run(context.Background(), args, strings.NewReader(""), &output, &errors, executable); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"manifest.json", "service_worker.js", "runtime_config.js"} {
@@ -61,11 +54,12 @@ func TestBrowserSetup(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	configPath := filepath.Join(root, config.FileName)
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.Browser.Token) != 64 || cfg.Browser.Listen != config.DefaultListen {
+	if len(cfg.Browser.Token) != 64 || cfg.Browser.Listen != config.DefaultBrowser {
 		t.Fatalf("unexpected generated config: %+v", cfg.Browser)
 	}
 	var result struct {
@@ -76,29 +70,10 @@ func TestBrowserSetup(t *testing.T) {
 	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
-	if result.Directory != directory || result.Config != configPath || result.Address != config.DefaultListen {
+	if result.Directory != directory || result.Config != configPath || result.Address != config.DefaultBrowser {
 		t.Fatalf("unexpected setup output: %+v", result)
 	}
 	if strings.Contains(output.String(), cfg.Browser.Token) {
 		t.Fatal("browser setup leaked token to stdout")
-	}
-}
-
-func TestLoadSecret(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "token")
-	if err := os.WriteFile(path, []byte("  file-secret  \n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	value, err := loadSecret(path, "LRMCP_TEST_SECRET")
-	if err != nil || value != "file-secret" {
-		t.Fatalf("loadSecret(file) = %q, %v", value, err)
-	}
-	t.Setenv("LRMCP_TEST_SECRET", "environment-secret")
-	if _, err := loadSecret(path, "LRMCP_TEST_SECRET"); err == nil {
-		t.Fatal("loadSecret accepted two secret sources")
-	}
-	value, err = loadSecret("", "LRMCP_TEST_SECRET")
-	if err != nil || value != "environment-secret" {
-		t.Fatalf("loadSecret(environment) = %q, %v", value, err)
 	}
 }

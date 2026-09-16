@@ -14,7 +14,6 @@ import (
 
 type Config struct {
 	Binary                    string
-	TokenFile                 string
 	Token                     string
 	SensitiveEnvironmentNames []string
 	Stdout                    io.Writer
@@ -26,7 +25,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	tokenFile, cleanup, err := prepareTokenFile(cfg.TokenFile, cfg.Token)
+	tokenFile, cleanup, err := prepareTokenFile(cfg.Token)
 	if err != nil {
 		return err
 	}
@@ -57,12 +56,21 @@ func sanitizedEnvironment(values, explicit []string) []string {
 		name, _, ok := strings.Cut(value, "=")
 		upper := strings.ToUpper(name)
 		_, explicitlyRemoved := remove[upper]
-		if !ok || explicitlyRemoved || strings.HasPrefix(upper, "LRMCP_") || strings.HasPrefix(upper, "OPENAI_") || strings.HasPrefix(upper, "CONTROL_PLANE_") {
+		if !ok || explicitlyRemoved || strings.HasPrefix(upper, "LOCAL_RUNTIME_MCP_") || sensitiveEnvironmentName(upper) {
 			continue
 		}
 		result = append(result, value)
 	}
 	return result
+}
+
+func sensitiveEnvironmentName(name string) bool {
+	for _, suffix := range []string{"_TOKEN", "_TOKEN_FILE", "_API_KEY", "_SECRET", "_PASSWORD"} {
+		if strings.HasSuffix(name, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 func FindBinary(explicit string) (string, error) {
@@ -93,21 +101,7 @@ func FindBinary(explicit string) (string, error) {
 	return resolved, nil
 }
 
-func prepareTokenFile(path, token string) (string, func(), error) {
-	if path != "" && token != "" {
-		return "", func() {}, errors.New("provide a Cloudflare token file or token, not both")
-	}
-	if path != "" {
-		resolved, err := filepath.Abs(path)
-		if err != nil {
-			return "", func() {}, err
-		}
-		info, err := os.Stat(resolved)
-		if err != nil || info.IsDir() {
-			return "", func() {}, fmt.Errorf("Cloudflare token file %q is not a regular file", resolved)
-		}
-		return resolved, func() {}, nil
-	}
+func prepareTokenFile(token string) (string, func(), error) {
 	if strings.TrimSpace(token) == "" {
 		return "", func() {}, errors.New("Cloudflare tunnel token is required")
 	}

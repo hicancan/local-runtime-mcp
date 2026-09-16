@@ -3,67 +3,107 @@ package config
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
-func TestLoadMissingReturnsDefault(t *testing.T) {
-	cfg, err := Load(filepath.Join(t.TempDir(), "missing.yaml"))
+func TestPathForExecutable(t *testing.T) {
+	executable := filepath.Join(t.TempDir(), "portable", "lrmcp.exe")
+	got, err := PathForExecutable(executable)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Browser.Listen != DefaultListen || cfg.Browser.Token != "" {
-		t.Fatalf("unexpected default: %+v", cfg)
+	want := filepath.Join(filepath.Dir(executable), FileName)
+	if got != want {
+		t.Fatalf("PathForExecutable() = %q, want %q", got, want)
 	}
 }
 
-func TestLoadExpandsBrowserToken(t *testing.T) {
-	t.Setenv("LRMCP_TEST_TOKEN", "0123456789abcdef0123456789abcdef")
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte("browser:\n  listen: 127.0.0.1:9315\n  token: ${LRMCP_TEST_TOKEN}\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load(path)
+func TestLoadMissingReturnsDefaults(t *testing.T) {
+	cfg, err := Load(filepath.Join(t.TempDir(), FileName))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Browser.Token != os.Getenv("LRMCP_TEST_TOKEN") {
-		t.Fatalf("unexpected token: %q", cfg.Browser.Token)
+	if cfg.Browser.Listen != DefaultBrowser || cfg.HTTP.Listen != DefaultHTTP {
+		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
 }
 
-func TestLoadRejectsUnsetEnvironment(t *testing.T) {
-	_ = os.Unsetenv("LRMCP_MISSING_TOKEN")
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte("browser:\n  token: ${LRMCP_MISSING_TOKEN}\n"), 0o600); err != nil {
+func TestResolvePrecedence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), FileName)
+	content := `browser:
+  listen: 127.0.0.1:9401
+  token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+openai:
+  tunnel_id: yaml-tunnel
+  api_key: yaml-key
+http:
+  listen: 127.0.0.1:9402
+  public_host: yaml.example.com
+  bearer_token: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+cloudflare:
+  tunnel_token: yaml-cloudflare
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "unset environment variable") {
-		t.Fatalf("Load error = %v", err)
+	t.Setenv(EnvOpenAITunnelID, "environment-tunnel")
+	t.Setenv(EnvHTTPPublicHost, "environment.example.com")
+	cfg, err := Resolve(path, Overrides{
+		OpenAITunnelID: "flag-tunnel",
+		HTTPListen:     "127.0.0.1:9403",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OpenAI.TunnelID != "flag-tunnel" || cfg.HTTP.PublicHost != "environment.example.com" || cfg.Browser.Listen != "127.0.0.1:9401" || cfg.HTTP.Listen != "127.0.0.1:9403" {
+		t.Fatalf("unexpected resolved configuration: %+v", cfg)
 	}
 }
 
-func TestLoadRejectsRemovedAndUnsafeConfiguration(t *testing.T) {
+func TestResolveValidatesFinalValues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), FileName)
+	if err := os.WriteFile(path, []byte("browser:\n  listen: 0.0.0.0:9315\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(EnvBrowserListen, "127.0.0.1:9415")
+	cfg, err := Resolve(path, Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Browser.Listen != "127.0.0.1:9415" {
+		t.Fatalf("browser listen = %q", cfg.Browser.Listen)
+	}
+}
+
+func TestLoadRejectsUnknownAndUnsafeConfiguration(t *testing.T) {
 	for name, content := range map[string]string{
-		"roots":  "roots:\n  demo:\n    path: .\n",
-		"legacy": "workspaces:\n  demo:\n    root: .\n",
-		"unsafe": "browser:\n  listen: 0.0.0.0:9315\n  token: 0123456789abcdef0123456789abcdef\n",
+		"unknown": "workspace: .\n",
+		"browser": "browser:\n  listen: 0.0.0.0:9315\n",
+		"http":    "http:\n  listen: 0.0.0.0:9316\n",
 	} {
 		t.Run(name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "config.yaml")
+			path := filepath.Join(t.TempDir(), FileName)
 			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := Load(path); err == nil {
-				t.Fatal("Load accepted removed or unsafe configuration")
+				t.Fatal("Load accepted invalid configuration")
 			}
 		})
 	}
 }
 
 func TestSaveRoundTrip(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "nested", "config.yaml")
-	want := &Config{Browser: Browser{Listen: "localhost:9315", Token: "0123456789abcdef0123456789abcdef"}}
+	path := filepath.Join(t.TempDir(), "portable", FileName)
+	want := &Config{
+		Browser: Browser{Listen: "localhost:9315", Token: "0123456789abcdef0123456789abcdef"},
+		OpenAI:  OpenAI{TunnelID: "tunnel", APIKey: "key"},
+		HTTP: HTTP{
+			Listen: "127.0.0.1:9316", PublicHost: "mcp.example.com",
+			BearerToken: "abcdef0123456789abcdef0123456789",
+		},
+		Cloudflare: Cloudflare{TunnelToken: "cloudflare"},
+	}
 	resolved, err := Save(path, want)
 	if err != nil {
 		t.Fatal(err)
@@ -75,15 +115,7 @@ func TestSaveRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Browser != want.Browser {
-		t.Fatalf("round trip = %+v, want %+v", got.Browser, want.Browser)
-	}
-	want.Browser.Listen = "127.0.0.1:9415"
-	if _, err := Save(path, want); err != nil {
-		t.Fatalf("replace existing configuration: %v", err)
-	}
-	got, err = Load(path)
-	if err != nil || got.Browser != want.Browser {
-		t.Fatalf("replaced round trip = %+v, %v", got.Browser, err)
+	if *got != *want {
+		t.Fatalf("round trip = %+v, want %+v", got, want)
 	}
 }

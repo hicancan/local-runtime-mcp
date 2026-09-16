@@ -7,21 +7,37 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
 const (
-	ConfigEnvironment = "LRMCP_CONFIG"
-	DefaultListen     = "127.0.0.1:9315"
+	FileName          = "local-runtime-mcp.yaml"
+	DefaultBrowser    = "127.0.0.1:9315"
+	DefaultHTTP       = "127.0.0.1:9316"
+	EnvironmentPrefix = "LOCAL_RUNTIME_MCP_"
 )
 
-// Config contains only the state needed by the optional browser bridge.
-// Files, processes, images, and the desktop use the machine directly.
+const (
+	EnvBrowserListen         = EnvironmentPrefix + "BROWSER_LISTEN"
+	EnvBrowserToken          = EnvironmentPrefix + "BROWSER_TOKEN"
+	EnvOpenAITunnelID        = EnvironmentPrefix + "OPENAI_TUNNEL_ID"
+	EnvOpenAIAPIKey          = EnvironmentPrefix + "OPENAI_API_KEY"
+	EnvHTTPListen            = EnvironmentPrefix + "HTTP_LISTEN"
+	EnvHTTPPublicHost        = EnvironmentPrefix + "HTTP_PUBLIC_HOST"
+	EnvHTTPBearerToken       = EnvironmentPrefix + "HTTP_BEARER_TOKEN"
+	EnvCloudflareTunnelToken = EnvironmentPrefix + "CLOUDFLARE_TUNNEL_TOKEN"
+	EnvCloudflared           = EnvironmentPrefix + "CLOUDFLARED"
+)
+
+// Config is the complete persistent configuration for one portable runtime.
+// It lives beside the executable as local-runtime-mcp.yaml.
 type Config struct {
-	Browser Browser `yaml:"browser,omitempty"`
+	Browser    Browser    `yaml:"browser,omitempty"`
+	OpenAI     OpenAI     `yaml:"openai,omitempty"`
+	HTTP       HTTP       `yaml:"http,omitempty"`
+	Cloudflare Cloudflare `yaml:"cloudflare,omitempty"`
 }
 
 type Browser struct {
@@ -29,37 +45,75 @@ type Browser struct {
 	Token  string `yaml:"token,omitempty"`
 }
 
+type OpenAI struct {
+	TunnelID string `yaml:"tunnel_id,omitempty"`
+	APIKey   string `yaml:"api_key,omitempty"`
+}
+
+type HTTP struct {
+	Listen      string `yaml:"listen,omitempty"`
+	PublicHost  string `yaml:"public_host,omitempty"`
+	BearerToken string `yaml:"bearer_token,omitempty"`
+}
+
+type Cloudflare struct {
+	TunnelToken string `yaml:"tunnel_token,omitempty"`
+	Binary      string `yaml:"binary,omitempty"`
+}
+
+// Overrides contains values explicitly supplied on the command line. Empty
+// values mean that the corresponding flag was not supplied.
+type Overrides struct {
+	BrowserListen         string
+	BrowserToken          string
+	OpenAITunnelID        string
+	OpenAIAPIKey          string
+	HTTPListen            string
+	HTTPPublicHost        string
+	HTTPBearerToken       string
+	CloudflareTunnelToken string
+	Cloudflared           string
+}
+
 func Default() *Config {
-	return &Config{Browser: Browser{Listen: DefaultListen}}
+	return &Config{
+		Browser: Browser{Listen: DefaultBrowser},
+		HTTP:    HTTP{Listen: DefaultHTTP},
+	}
 }
 
-// DefaultPath returns LRMCP_CONFIG or %USERPROFILE%/.lrmcp/config.yaml.
-func DefaultPath() (string, error) {
-	if path := os.Getenv(ConfigEnvironment); path != "" {
-		return filepath.Abs(path)
+// PathForExecutable returns the one configuration path owned by an
+// executable. Passing an empty path resolves the current executable.
+func PathForExecutable(executable string) (string, error) {
+	if executable == "" {
+		var err error
+		executable, err = os.Executable()
+		if err != nil {
+			return "", fmt.Errorf("find executable: %w", err)
+		}
 	}
-	home, err := os.UserHomeDir()
+	resolved, err := filepath.Abs(executable)
 	if err != nil {
-		return "", fmt.Errorf("find user home: %w", err)
+		return "", fmt.Errorf("resolve executable: %w", err)
 	}
-	return filepath.Join(home, ".lrmcp", "config.yaml"), nil
+	return filepath.Join(filepath.Dir(resolved), FileName), nil
 }
 
-func Path(path string) (string, error) {
-	if path == "" {
-		return DefaultPath()
-	}
-	return filepath.Abs(path)
-}
-
-// Load reads the optional browser configuration. A missing file is the valid,
-// browser-unconfigured default rather than a setup error.
+// Load reads a fixed configuration path. A missing file yields built-in
+// defaults, which keeps stdio usable before optional connections are set up.
 func Load(path string) (*Config, error) {
-	resolved, err := Path(path)
+	cfg, err := read(path)
 	if err != nil {
 		return nil, err
 	}
-	b, err := os.ReadFile(resolved)
+	if err := validate(cfg); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+func read(path string) (*Config, error) {
+	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return Default(), nil
 	}
@@ -72,42 +126,43 @@ func Load(path string) (*Config, error) {
 	if err := decoder.Decode(cfg); err != nil {
 		return nil, fmt.Errorf("parse configuration: %w", err)
 	}
-	if cfg.Browser.Listen == "" {
-		cfg.Browser.Listen = DefaultListen
+	applyDefaults(cfg)
+	return cfg, nil
+}
+
+// Resolve applies the single precedence rule used by every entry point:
+// command line overrides environment, environment overrides YAML, and YAML
+// overrides built-in defaults.
+func Resolve(path string, overrides Overrides) (*Config, error) {
+	cfg, err := read(path)
+	if err != nil {
+		return nil, err
 	}
-	token, missing := expandEnvironment(cfg.Browser.Token)
-	if len(missing) > 0 {
-		return nil, fmt.Errorf("browser token references unset environment variable %s", strings.Join(missing, ", "))
-	}
-	cfg.Browser.Token = token
-	if err := validateBrowser(cfg.Browser); err != nil {
+	applyEnvironment(cfg, os.LookupEnv)
+	applyOverrides(cfg, overrides)
+	applyDefaults(cfg)
+	if err := validate(cfg); err != nil {
 		return nil, err
 	}
 	return cfg, nil
 }
 
 func Save(path string, cfg *Config) (string, error) {
-	resolved, err := Path(path)
-	if err != nil {
-		return "", err
-	}
 	if cfg == nil {
 		return "", errors.New("configuration cannot be nil")
 	}
-	if cfg.Browser.Listen == "" {
-		cfg.Browser.Listen = DefaultListen
-	}
-	if err := validateBrowser(cfg.Browser); err != nil {
+	applyDefaults(cfg)
+	if err := validate(cfg); err != nil {
 		return "", err
 	}
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return "", fmt.Errorf("encode configuration: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(resolved), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", err
 	}
-	temporary, err := os.CreateTemp(filepath.Dir(resolved), ".lrmcp-config-*")
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".local-runtime-mcp-*")
 	if err != nil {
 		return "", err
 	}
@@ -129,41 +184,80 @@ func Save(path string, cfg *Config) (string, error) {
 	if err := temporary.Close(); err != nil {
 		return "", err
 	}
-	if err := replaceFile(temporaryName, resolved); err != nil {
+	if err := replaceFile(temporaryName, path); err != nil {
 		return "", err
 	}
 	committed = true
-	return resolved, nil
+	return path, nil
 }
 
-func validateBrowser(browser Browser) error {
-	host, _, err := net.SplitHostPort(browser.Listen)
-	if err != nil {
-		return fmt.Errorf("browser listen address: %w", err)
+func applyEnvironment(cfg *Config, lookup func(string) (string, bool)) {
+	assign := func(name string, target *string) {
+		if value, ok := lookup(name); ok && value != "" {
+			*target = value
+		}
 	}
-	ip := net.ParseIP(host)
-	if !strings.EqualFold(host, "localhost") && (ip == nil || !ip.IsLoopback()) {
-		return errors.New("browser listen address must use a loopback host")
+	assign(EnvBrowserListen, &cfg.Browser.Listen)
+	assign(EnvBrowserToken, &cfg.Browser.Token)
+	assign(EnvOpenAITunnelID, &cfg.OpenAI.TunnelID)
+	assign(EnvOpenAIAPIKey, &cfg.OpenAI.APIKey)
+	assign(EnvHTTPListen, &cfg.HTTP.Listen)
+	assign(EnvHTTPPublicHost, &cfg.HTTP.PublicHost)
+	assign(EnvHTTPBearerToken, &cfg.HTTP.BearerToken)
+	assign(EnvCloudflareTunnelToken, &cfg.Cloudflare.TunnelToken)
+	assign(EnvCloudflared, &cfg.Cloudflare.Binary)
+}
+
+func applyOverrides(cfg *Config, overrides Overrides) {
+	assign := func(value string, target *string) {
+		if value != "" {
+			*target = value
+		}
 	}
-	if browser.Token != "" && len(browser.Token) < 32 {
+	assign(overrides.BrowserListen, &cfg.Browser.Listen)
+	assign(overrides.BrowserToken, &cfg.Browser.Token)
+	assign(overrides.OpenAITunnelID, &cfg.OpenAI.TunnelID)
+	assign(overrides.OpenAIAPIKey, &cfg.OpenAI.APIKey)
+	assign(overrides.HTTPListen, &cfg.HTTP.Listen)
+	assign(overrides.HTTPPublicHost, &cfg.HTTP.PublicHost)
+	assign(overrides.HTTPBearerToken, &cfg.HTTP.BearerToken)
+	assign(overrides.CloudflareTunnelToken, &cfg.Cloudflare.TunnelToken)
+	assign(overrides.Cloudflared, &cfg.Cloudflare.Binary)
+}
+
+func applyDefaults(cfg *Config) {
+	if cfg.Browser.Listen == "" {
+		cfg.Browser.Listen = DefaultBrowser
+	}
+	if cfg.HTTP.Listen == "" {
+		cfg.HTTP.Listen = DefaultHTTP
+	}
+}
+
+func validate(cfg *Config) error {
+	if err := validateLoopback("browser", cfg.Browser.Listen); err != nil {
+		return err
+	}
+	if err := validateLoopback("HTTP", cfg.HTTP.Listen); err != nil {
+		return err
+	}
+	if cfg.Browser.Token != "" && len(cfg.Browser.Token) < 32 {
 		return errors.New("browser token must contain at least 32 characters")
+	}
+	if cfg.HTTP.BearerToken != "" && len(cfg.HTTP.BearerToken) < 32 {
+		return errors.New("HTTP bearer token must contain at least 32 characters")
 	}
 	return nil
 }
 
-func expandEnvironment(value string) (string, []string) {
-	missingSet := make(map[string]struct{})
-	expanded := os.Expand(value, func(name string) string {
-		if resolved, ok := os.LookupEnv(name); ok {
-			return resolved
-		}
-		missingSet[name] = struct{}{}
-		return ""
-	})
-	missing := make([]string, 0, len(missingSet))
-	for name := range missingSet {
-		missing = append(missing, name)
+func validateLoopback(name, address string) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("%s listen address: %w", name, err)
 	}
-	sort.Strings(missing)
-	return expanded, missing
+	ip := net.ParseIP(host)
+	if !strings.EqualFold(host, "localhost") && (ip == nil || !ip.IsLoopback()) {
+		return fmt.Errorf("%s listen address must use a loopback host", name)
+	}
+	return nil
 }

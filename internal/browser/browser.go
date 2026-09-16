@@ -21,7 +21,7 @@ import (
 	"github.com/hicancan/local-runtime-mcp/internal/config"
 )
 
-const ExtensionVersion = "6.0.1"
+const ExtensionVersion = "8.0.0"
 
 type Bridge struct {
 	configured bool
@@ -156,7 +156,7 @@ func Start(ctx context.Context, configuration config.Browser) (*Bridge, error) {
 		return bridge, nil
 	}
 	if configuration.Listen == "" {
-		configuration.Listen = config.DefaultListen
+		configuration.Listen = config.DefaultBrowser
 	}
 	listener, err := net.Listen("tcp", configuration.Listen)
 	if err != nil {
@@ -529,14 +529,6 @@ func ConfigureExtension(directory, address, token string) error {
 		return err
 	}
 	return os.Chmod(path, 0o600)
-}
-
-func DefaultExtensionDirectory() (string, error) {
-	directory, err := os.UserConfigDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(directory, "local-runtime-mcp", "browser-extension"), nil
 }
 
 func decodeBase64(value string) ([]byte, error) {

@@ -1,6 +1,6 @@
 import { packagedConfig } from './runtime_config.js';
 
-const VERSION = '6.0.1';
+const VERSION = '8.0.0';
 const attachedTabs = new Set<number>();
 const childSessions = new Map<number, Set<string>>();
 type Dynamic = Record<string, any>;

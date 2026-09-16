@@ -42,7 +42,7 @@ jobs:
       - if: runner.os == 'Windows'
         shell: pwsh
         env:
-          LRMCP_BROWSER_E2E: '1'
+          LOCAL_RUNTIME_MCP_BROWSER_E2E: '1'
         run: go test ./internal/browser -run TestEdgeExtensionEndToEnd -count=3 -v
       - if: runner.os == 'Linux'
         run: go test -race ./...

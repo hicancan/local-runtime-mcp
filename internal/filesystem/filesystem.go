@@ -492,7 +492,7 @@ func hashReader(reader io.Reader) (string, error) {
 }
 
 func atomicWrite(path string, data []byte, mode os.FileMode) error {
-	temporary, err := os.CreateTemp(filepath.Dir(path), ".lrmcp-write-*")
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".local-runtime-mcp-write-*")
 	if err != nil {
 		return err
 	}
