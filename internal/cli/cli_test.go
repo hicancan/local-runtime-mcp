@@ -17,11 +17,23 @@ func TestVersionAndRemovedCapabilityCLI(t *testing.T) {
 	if err := Run(context.Background(), []string{"version"}, strings.NewReader(""), &output, &errors); err != nil {
 		t.Fatal(err)
 	}
-	if output.String() != "lrmcp 6.0.0\n" {
+	if output.String() != "lrmcp 6.0.1\n" {
 		t.Fatalf("version output = %q", output.String())
 	}
 	if err := Run(context.Background(), []string{"filesystem"}, strings.NewReader(""), &output, &errors); err == nil {
 		t.Fatal("removed filesystem CLI was accepted")
+	}
+}
+
+func TestHelpIncludesSourceAndLicense(t *testing.T) {
+	var output, errors bytes.Buffer
+	if err := Run(context.Background(), []string{"help"}, strings.NewReader(""), &output, &errors); err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{"https://github.com/hicancan/local-runtime-mcp", "GNU AGPL v3.0 only"} {
+		if !strings.Contains(output.String(), value) {
+			t.Fatalf("help is missing %q: %q", value, output.String())
+		}
 	}
 }
 

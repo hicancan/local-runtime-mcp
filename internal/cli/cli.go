@@ -197,6 +197,9 @@ Tunnel flags:
   --config PATH
   --tunnel-id ID                         Or CONTROL_PLANE_TUNNEL_ID
   --api-key-env NAME                     Defaults to CONTROL_PLANE_API_KEY
+
+Source: https://github.com/hicancan/local-runtime-mcp
+License: GNU AGPL v3.0 only
 `)
 }
 

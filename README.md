@@ -294,4 +294,4 @@ CI builds the TypeScript output on Windows, Linux, and macOS; compiles/lints Rus
 
 ## License
 
-[MIT](LICENSE)
+[GNU Affero General Public License v3.0 only](LICENSE). Modified versions offered to users over a network must make their corresponding source available under the same license.
