@@ -42,7 +42,7 @@ use windows_capture::settings::{
 };
 use windows_capture::window::Window as CaptureWindow;
 
-const VERSION: &str = "8.0.0";
+const VERSION: &str = "9.0.0";
 const MAX_STATES: usize = 64;
 const MAX_ELEMENTS: usize = 500;
 

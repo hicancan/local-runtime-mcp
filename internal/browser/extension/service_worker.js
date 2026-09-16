@@ -1,5 +1,5 @@
 import { packagedConfig } from './runtime_config.js';
-const VERSION = '8.0.0';
+const VERSION = '9.0.0';
 const attachedTabs = new Set();
 const childSessions = new Map();
 const pageStates = new Map();

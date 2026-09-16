@@ -1,3 +1,4 @@
+// Package cloudflare runs the cloudflared companion for a managed tunnel.
 package cloudflare
 
 import (

@@ -11,8 +11,8 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// Host owns the machine-local dependencies shared by every MCP transport.
-// Transports only determine how MCP messages reach this one runtime.
+// Host owns the machine-local dependencies shared by every connection mode.
+// Connections only determine how MCP messages reach this one runtime.
 type Host struct {
 	server     *mcp.Server
 	bridge     *browser.Bridge

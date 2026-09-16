@@ -18,7 +18,7 @@ func TestVersion(t *testing.T) {
 	if err := run(context.Background(), []string{"version"}, strings.NewReader(""), &output, &errors, executable); err != nil {
 		t.Fatal(err)
 	}
-	if output.String() != "lrmcp 8.0.0\n" {
+	if output.String() != "lrmcp 9.0.0\n" {
 		t.Fatalf("version output = %q", output.String())
 	}
 }
@@ -30,12 +30,54 @@ func TestHelpDescribesConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, value := range []string{
-		"connect openai", "serve http", "expose cloudflare", config.FileName,
+		"serve stdio", "serve http", "tunnel openai", "tunnel cloudflare", "setup browser", config.FileName,
 		"command line > LOCAL_RUNTIME_MCP_* environment > YAML > defaults",
 		"https://github.com/hicancan/local-runtime-mcp", "GNU AGPL v3.0 only",
 	} {
 		if !strings.Contains(output.String(), value) {
 			t.Fatalf("help is missing %q: %q", value, output.String())
+		}
+	}
+	for _, legacy := range []string{"connect openai", "expose cloudflare", "browser-setup", "lrmcp [flags]"} {
+		if strings.Contains(output.String(), legacy) {
+			t.Fatalf("help still contains removed command %q: %q", legacy, output.String())
+		}
+	}
+}
+
+func TestRemovedCommandsAreUnknown(t *testing.T) {
+	executable := filepath.Join(t.TempDir(), "lrmcp.exe")
+	for _, args := range [][]string{
+		nil,
+		{"connect", "openai"},
+		{"expose", "cloudflare"},
+		{"browser-setup"},
+		{"--version"},
+		{"-v"},
+		{"--help"},
+		{"-h"},
+	} {
+		var output, errors bytes.Buffer
+		err := run(context.Background(), args, strings.NewReader(""), &output, &errors, executable)
+		if err == nil {
+			t.Fatalf("removed command %q was accepted", args)
+		}
+	}
+}
+
+func TestCommandGroupsRejectUnknownMembers(t *testing.T) {
+	executable := filepath.Join(t.TempDir(), "lrmcp.exe")
+	for _, args := range [][]string{
+		{"serve"},
+		{"serve", "openai"},
+		{"tunnel"},
+		{"tunnel", "stdio"},
+		{"setup"},
+		{"setup", "computer"},
+	} {
+		var output, errors bytes.Buffer
+		if err := run(context.Background(), args, strings.NewReader(""), &output, &errors, executable); err == nil {
+			t.Fatalf("invalid command %q was accepted", args)
 		}
 	}
 }
@@ -45,7 +87,7 @@ func TestBrowserSetupUsesPortablePaths(t *testing.T) {
 	executable := filepath.Join(root, "lrmcp.exe")
 	directory := filepath.Join(root, "custom-extension")
 	var output, errors bytes.Buffer
-	args := []string{"browser-setup", "--directory", directory}
+	args := []string{"setup", "browser", "--directory", directory}
 	if err := run(context.Background(), args, strings.NewReader(""), &output, &errors, executable); err != nil {
 		t.Fatal(err)
 	}

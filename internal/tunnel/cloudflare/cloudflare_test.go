@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func TestArgumentsContainOnlyTokenFile(t *testing.T) {
+func TestManagedTunnelArgumentsContainOnlyTokenFile(t *testing.T) {
 	path := filepath.Join("private", "token")
 	want := []string{"tunnel", "--no-autoupdate", "--loglevel", "error", "run", "--token-file", path}
 	if got := Arguments(path); !reflect.DeepEqual(got, want) {

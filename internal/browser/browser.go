@@ -21,7 +21,7 @@ import (
 	"github.com/hicancan/local-runtime-mcp/internal/config"
 )
 
-const ExtensionVersion = "8.0.0"
+const ExtensionVersion = "9.0.0"
 
 type Bridge struct {
 	configured bool
@@ -271,7 +271,7 @@ func (b *Bridge) Act(ctx context.Context, action Action) (ActionResult, error) {
 
 func (b *Bridge) call(ctx context.Context, method string, params, output any) error {
 	if !b.configured {
-		return errors.New("browser is not configured; run lrmcp browser-setup")
+		return errors.New("browser is not configured; run lrmcp setup browser")
 	}
 	callContext, cancel := context.WithTimeout(ctx, 35*time.Second)
 	defer cancel()
@@ -334,7 +334,7 @@ func (b *Bridge) poll(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	if peer.ExtensionVersion != ExtensionVersion {
-		http.Error(writer, "browser extension version does not match lrmcp; run browser-setup and reload the extension", http.StatusUpgradeRequired)
+		http.Error(writer, "browser extension version does not match lrmcp; run lrmcp setup browser and reload the extension", http.StatusUpgradeRequired)
 		return
 	}
 	b.mu.Lock()

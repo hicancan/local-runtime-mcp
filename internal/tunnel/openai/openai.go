@@ -1,4 +1,5 @@
-package transport
+// Package openai connects an MCP server to OpenAI Secure MCP Tunnel.
+package openai
 
 import (
 	"context"
@@ -8,12 +9,12 @@ import (
 	tunnelclient "github.com/openai/tunnel-client"
 )
 
-type OpenAIConfig struct {
+type Config struct {
 	TunnelID string
 	APIKey   string
 }
 
-func ServeOpenAI(ctx context.Context, server *mcp.Server, cfg OpenAIConfig) error {
+func Run(ctx context.Context, server *mcp.Server, cfg Config) error {
 	if cfg.TunnelID == "" {
 		return errors.New("OpenAI tunnel ID is required")
 	}

@@ -11,14 +11,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/hicancan/local-runtime-mcp/internal/browser"
 	"github.com/hicancan/local-runtime-mcp/internal/config"
-	cloudflareexposure "github.com/hicancan/local-runtime-mcp/internal/exposure/cloudflare"
+	"github.com/hicancan/local-runtime-mcp/internal/connection"
 	"github.com/hicancan/local-runtime-mcp/internal/mcpserver"
-	"github.com/hicancan/local-runtime-mcp/internal/runtimehost"
-	"github.com/hicancan/local-runtime-mcp/internal/transport"
 )
 
 func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -35,60 +32,90 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return err
 	}
 	if len(args) == 0 {
-		return stdio(ctx, args, stdin, stdout, stderr, configPath)
+		return errors.New("command required; run lrmcp help")
 	}
 	switch args[0] {
-	case "connect":
-		return connect(ctx, args[1:], stderr, configPath)
 	case "serve":
-		return serve(ctx, args[1:], stderr, configPath)
-	case "expose":
-		return expose(ctx, args[1:], stderr, configPath)
-	case "browser-setup":
-		return browserSetup(args[1:], stdout, stderr, executable, configPath)
-	case "version", "--version", "-v":
+		return serve(ctx, args[1:], stdin, stdout, stderr, configPath)
+	case "tunnel":
+		return tunnel(ctx, args[1:], stderr, configPath)
+	case "setup":
+		return setup(args[1:], stdout, stderr, executable, configPath)
+	case "version":
 		_, err := fmt.Fprintln(stdout, "lrmcp", mcpserver.Version)
 		return err
-	case "help", "--help", "-h":
+	case "help":
 		usage(stdout)
 		return nil
-	}
-	if strings.HasPrefix(args[0], "-") {
-		return stdio(ctx, args, stdin, stdout, stderr, configPath)
 	}
 	return fmt.Errorf("unknown command %q; run lrmcp help", args[0])
 }
 
-func stdio(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, configPath string) error {
-	flags := flagSet("lrmcp", stderr)
+func serve(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, configPath string) error {
+	if len(args) == 0 {
+		return errors.New("serve requires the transport name stdio or http")
+	}
+	switch args[0] {
+	case "stdio":
+		flags := flagSet("lrmcp serve stdio", stderr)
+		browserFlags := addBrowserFlags(flags)
+		if err := flags.Parse(args[1:]); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 {
+			return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+		}
+		cfg, err := config.Resolve(configPath, browserFlags.overrides())
+		if err != nil {
+			return err
+		}
+		return connection.ServeStdio(ctx, cfg, stdin, stdout)
+	case "http":
+		return serveHTTP(ctx, args[1:], stderr, configPath)
+	default:
+		return fmt.Errorf("unknown serve transport %q; choose stdio or http", args[0])
+	}
+}
+
+func serveHTTP(ctx context.Context, args []string, stderr io.Writer, configPath string) error {
+	flags := flagSet("lrmcp serve http", stderr)
 	browserFlags := addBrowserFlags(flags)
+	httpFlags := addHTTPFlags(flags)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
 	}
-	cfg, err := config.Resolve(configPath, browserFlags.overrides())
+	overrides := browserFlags.overrides()
+	httpFlags.apply(&overrides)
+	cfg, err := config.Resolve(configPath, overrides)
 	if err != nil {
 		return err
 	}
-	host, err := runtimehost.Start(ctx, cfg)
-	if err != nil {
-		return err
-	}
-	defer host.Close(context.Background())
-	return normalizeCancellation(transport.ServeStdio(ctx, host.Server(), stdin, stdout))
+	return connection.ServeHTTP(ctx, cfg, stderr)
 }
 
-func connect(ctx context.Context, args []string, stderr io.Writer, configPath string) error {
-	if len(args) == 0 || args[0] != "openai" {
-		return errors.New("connect requires the provider name openai")
+func tunnel(ctx context.Context, args []string, stderr io.Writer, configPath string) error {
+	if len(args) == 0 {
+		return errors.New("tunnel requires the provider name openai or cloudflare")
 	}
-	flags := flagSet("connect openai", stderr)
+	switch args[0] {
+	case "openai":
+		return tunnelOpenAI(ctx, args[1:], stderr, configPath)
+	case "cloudflare":
+		return tunnelCloudflare(ctx, args[1:], stderr, configPath)
+	default:
+		return fmt.Errorf("unknown tunnel provider %q; choose openai or cloudflare", args[0])
+	}
+}
+
+func tunnelOpenAI(ctx context.Context, args []string, stderr io.Writer, configPath string) error {
+	flags := flagSet("lrmcp tunnel openai", stderr)
 	browserFlags := addBrowserFlags(flags)
 	tunnelID := flags.String("tunnel-id", "", "OpenAI tunnel ID")
 	apiKey := flags.String("api-key", "", "OpenAI tunnel API key")
-	if err := flags.Parse(args[1:]); err != nil {
+	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
@@ -101,52 +128,16 @@ func connect(ctx context.Context, args []string, stderr io.Writer, configPath st
 	if err != nil {
 		return err
 	}
-	if cfg.OpenAI.TunnelID == "" || cfg.OpenAI.APIKey == "" {
-		return errors.New("OpenAI tunnel_id and api_key are required in local-runtime-mcp.yaml, environment, or command-line flags")
-	}
-	host, err := runtimehost.Start(ctx, cfg)
-	if err != nil {
-		return err
-	}
-	defer host.Close(context.Background())
-	return normalizeCancellation(transport.ServeOpenAI(ctx, host.Server(), transport.OpenAIConfig{
-		TunnelID: cfg.OpenAI.TunnelID,
-		APIKey:   cfg.OpenAI.APIKey,
-	}))
+	return connection.TunnelOpenAI(ctx, cfg)
 }
 
-func serve(ctx context.Context, args []string, stderr io.Writer, configPath string) error {
-	if len(args) == 0 || args[0] != "http" {
-		return errors.New("serve requires the transport name http")
-	}
-	flags := flagSet("serve http", stderr)
-	browserFlags := addBrowserFlags(flags)
-	httpFlags := addHTTPFlags(flags)
-	if err := flags.Parse(args[1:]); err != nil {
-		return err
-	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
-	}
-	overrides := browserFlags.overrides()
-	httpFlags.apply(&overrides)
-	cfg, err := config.Resolve(configPath, overrides)
-	if err != nil {
-		return err
-	}
-	return runHTTP(ctx, cfg, stderr)
-}
-
-func expose(ctx context.Context, args []string, stderr io.Writer, configPath string) error {
-	if len(args) == 0 || args[0] != "cloudflare" {
-		return errors.New("expose requires the provider name cloudflare")
-	}
-	flags := flagSet("expose cloudflare", stderr)
+func tunnelCloudflare(ctx context.Context, args []string, stderr io.Writer, configPath string) error {
+	flags := flagSet("lrmcp tunnel cloudflare", stderr)
 	browserFlags := addBrowserFlags(flags)
 	httpFlags := addHTTPFlags(flags)
 	tunnelToken := flags.String("tunnel-token", "", "Cloudflare managed-tunnel token")
 	cloudflared := flags.String("cloudflared", "", "cloudflared binary path; defaults to the sibling companion or PATH")
-	if err := flags.Parse(args[1:]); err != nil {
+	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
@@ -160,70 +151,18 @@ func expose(ctx context.Context, args []string, stderr io.Writer, configPath str
 	if err != nil {
 		return err
 	}
-	if cfg.HTTP.PublicHost == "" || cfg.HTTP.BearerToken == "" || cfg.Cloudflare.TunnelToken == "" {
-		return errors.New("Cloudflare exposure requires http.public_host, http.bearer_token, and cloudflare.tunnel_token")
-	}
-	host, err := runtimehost.Start(ctx, cfg)
-	if err != nil {
-		return err
-	}
-	defer host.Close(context.Background())
-	httpServer, err := transport.NewHTTP(host.Server(), transport.HTTPConfig{
-		Listen: cfg.HTTP.Listen, BearerToken: cfg.HTTP.BearerToken, PublicHost: cfg.HTTP.PublicHost,
-	})
-	if err != nil {
-		return err
-	}
-
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	httpErrors := make(chan error, 1)
-	cloudflareErrors := make(chan error, 1)
-	go func() { httpErrors <- httpServer.Run(ctx) }()
-	go func() {
-		cloudflareErrors <- cloudflareexposure.Run(ctx, cloudflareexposure.Config{
-			Binary: cfg.Cloudflare.Binary,
-			Token:  cfg.Cloudflare.TunnelToken,
-			SensitiveEnvironmentNames: []string{
-				config.EnvBrowserToken, config.EnvOpenAIAPIKey,
-				config.EnvHTTPBearerToken, config.EnvCloudflareTunnelToken,
-			},
-			Stdout: stderr,
-			Stderr: stderr,
-		})
-	}()
-	fmt.Fprintf(stderr, "Local Runtime MCP exposing https://%s/mcp from %s\n", cfg.HTTP.PublicHost, httpServer.Address())
-	select {
-	case err := <-httpErrors:
-		return normalizeCancellation(err)
-	case err := <-cloudflareErrors:
-		return normalizeCancellation(err)
-	case <-ctx.Done():
-		return nil
-	}
+	return connection.TunnelCloudflare(ctx, cfg, stderr)
 }
 
-func runHTTP(ctx context.Context, cfg *config.Config, stderr io.Writer) error {
-	if cfg.HTTP.BearerToken == "" {
-		return errors.New("HTTP bearer_token is required in local-runtime-mcp.yaml, environment, or --token")
+func setup(args []string, stdout, stderr io.Writer, executable, configPath string) error {
+	if len(args) == 0 || args[0] != "browser" {
+		return errors.New("setup requires the component name browser")
 	}
-	host, err := runtimehost.Start(ctx, cfg)
-	if err != nil {
-		return err
-	}
-	defer host.Close(context.Background())
-	httpServer, err := transport.NewHTTP(host.Server(), transport.HTTPConfig{
-		Listen: cfg.HTTP.Listen, BearerToken: cfg.HTTP.BearerToken, PublicHost: cfg.HTTP.PublicHost,
-	})
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(stderr, "Local Runtime MCP serving Streamable HTTP on http://%s/mcp\n", httpServer.Address())
-	return normalizeCancellation(httpServer.Run(ctx))
+	return setupBrowser(args[1:], stdout, stderr, executable, configPath)
 }
 
-func browserSetup(args []string, stdout, stderr io.Writer, executable, configPath string) error {
-	flags := flagSet("browser-setup", stderr)
+func setupBrowser(args []string, stdout, stderr io.Writer, executable, configPath string) error {
+	flags := flagSet("lrmcp setup browser", stderr)
 	browserFlags := addBrowserFlags(flags)
 	defaultDirectory := filepath.Join(filepath.Dir(executable), "browser-extension")
 	directory := flags.String("directory", defaultDirectory, "extension output directory")
@@ -322,22 +261,15 @@ func writeJSON(writer io.Writer, value any) error {
 	return encoder.Encode(value)
 }
 
-func normalizeCancellation(err error) error {
-	if err == nil || errors.Is(err, context.Canceled) || strings.HasPrefix(err.Error(), "server is closing:") {
-		return nil
-	}
-	return err
-}
-
 func usage(writer io.Writer) {
 	fmt.Fprint(writer, `Local Runtime MCP (lrmcp)
 
 Usage:
-  lrmcp [flags]                         MCP over stdio
-  lrmcp connect openai [flags]          MCP over OpenAI Tunnel
+  lrmcp serve stdio [flags]             MCP over stdio
   lrmcp serve http [flags]              MCP over loopback Streamable HTTP
-  lrmcp expose cloudflare [flags]       Streamable HTTP through Cloudflare Tunnel
-  lrmcp browser-setup [flags]           Configure and extract the Chromium extension
+  lrmcp tunnel openai [flags]           MCP through OpenAI Secure MCP Tunnel
+  lrmcp tunnel cloudflare [flags]       Streamable HTTP through Cloudflare Tunnel
+  lrmcp setup browser [flags]           Configure and extract the Chromium extension
   lrmcp version
   lrmcp help
 
