@@ -1,12 +1,36 @@
 import { packagedConfig } from './runtime_config.js';
-const VERSION = '9.0.0';
+const VERSION = '9.0.1';
 const attachedTabs = new Set();
 const childSessions = new Map();
+const dialogWaiters = new Map();
 const pageStates = new Map();
 let generation = 0;
 let stateSequence = 0;
 async function sendCDP(source, method, params) {
     return chrome.debugger.sendCommand(source, method, params);
+}
+async function sendCDPAllowDialog(source, method, params) {
+    const waiters = dialogWaiters.get(source.tabId) || new Set();
+    dialogWaiters.set(source.tabId, waiters);
+    let signal;
+    const dialog = new Promise(resolve => {
+        signal = () => resolve({ dialog: true });
+        waiters.add(signal);
+    });
+    const command = sendCDP(source, method, params).then(value => ({ dialog: false, value }), error => ({ dialog: false, error }));
+    try {
+        const outcome = await Promise.race([command, dialog]);
+        if (outcome.dialog)
+            return undefined;
+        if ('error' in outcome)
+            throw outcome.error;
+        return outcome.value;
+    }
+    finally {
+        waiters.delete(signal);
+        if (waiters.size === 0)
+            dialogWaiters.delete(source.tabId);
+    }
 }
 chrome.runtime.onMessage.addListener((message) => {
     if (message?.type === 'settings-changed')
@@ -23,6 +47,10 @@ chrome.debugger.onEvent.addListener((source, method, rawParams) => {
     if (!source.tabId)
         return;
     const params = rawParams || {};
+    if (method === 'Page.javascriptDialogOpening') {
+        for (const signal of dialogWaiters.get(source.tabId) || [])
+            signal();
+    }
     if (method === 'Target.attachedToTarget' && params.sessionId) {
         let sessions = childSessions.get(source.tabId);
         if (!sessions)
@@ -288,7 +316,7 @@ async function action(params) {
             await clickAt(point, 'left', 1);
             if (params.kind === 'set_value')
                 await dispatchKey(tabId, 'Control+A');
-            await sendCDP(point.source, 'Input.insertText', { text: requireString(params.text, 'text') });
+            await sendCDPAllowDialog(point.source, 'Input.insertText', { text: requireString(params.text, 'text') });
             value = true;
             break;
         }
@@ -386,9 +414,11 @@ async function callOnTarget(tabId, ref, callback, args) {
     if (!objectId)
         throw new Error('target element did not produce a remote object');
     try {
-        const response = await sendCDP(target.source, 'Runtime.callFunctionOn', {
+        const response = await sendCDPAllowDialog(target.source, 'Runtime.callFunctionOn', {
             objectId, functionDeclaration: callback.toString(), arguments: args.map(value => ({ value })), returnByValue: true, userGesture: true
         });
+        if (!response)
+            return undefined;
         if (response.exceptionDetails)
             throw new Error(exceptionMessage(response));
         return response.result?.value;
@@ -426,9 +456,11 @@ async function callPage(tabId, callback, args, returnByValue = true) {
     // Function#toString preserves escapes in the static callback source; only
     // JSON-encoded data is appended. This avoids hand-built nested page scripts.
     const expression = `(${callback.toString()}).apply(globalThis, ${JSON.stringify(args)})`;
-    const response = await sendCDP({ tabId }, 'Runtime.evaluate', {
+    const response = await sendCDPAllowDialog({ tabId }, 'Runtime.evaluate', {
         expression, awaitPromise: true, returnByValue, userGesture: true
     });
+    if (!response)
+        return undefined;
     if (response.exceptionDetails)
         throw new Error(exceptionMessage(response));
     return returnByValue ? response.result?.value : response.result;
@@ -440,7 +472,7 @@ async function clickAt(point, button, count) {
 }
 async function mouse(source, type, x, y, button = 'none', buttons = 0, clickCount = 0, deltaX = 0, deltaY = 0) {
     await attach(source.tabId);
-    await sendCDP(source, 'Input.dispatchMouseEvent', { type, x, y, button, buttons, clickCount, deltaX, deltaY });
+    await sendCDPAllowDialog(source, 'Input.dispatchMouseEvent', { type, x, y, button, buttons, clickCount, deltaX, deltaY });
 }
 function buttonMask(button) {
     return button === 'right' ? 2 : button === 'middle' ? 4 : 1;
@@ -455,8 +487,8 @@ async function dispatchKey(tabId, combination) {
     const modifiers = parts.reduce((value, part) => value | (modifierValues[part.toLowerCase()] || 0), 0);
     const info = keyInfo(key);
     const payload = { key: info.key, code: info.code, windowsVirtualKeyCode: info.codeValue, nativeVirtualKeyCode: info.codeValue, modifiers };
-    await sendCDP({ tabId }, 'Input.dispatchKeyEvent', { ...payload, type: 'rawKeyDown' });
-    await sendCDP({ tabId }, 'Input.dispatchKeyEvent', { ...payload, type: 'keyUp' });
+    await sendCDPAllowDialog({ tabId }, 'Input.dispatchKeyEvent', { ...payload, type: 'rawKeyDown' });
+    await sendCDPAllowDialog({ tabId }, 'Input.dispatchKeyEvent', { ...payload, type: 'keyUp' });
 }
 function keyInfo(value) {
     const names = {
@@ -479,7 +511,9 @@ function keyInfo(value) {
 }
 async function evaluate(tabId, expression) {
     await attach(tabId);
-    const response = await sendCDP({ tabId }, 'Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, userGesture: true });
+    const response = await sendCDPAllowDialog({ tabId }, 'Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, userGesture: true });
+    if (!response)
+        return undefined;
     if (response.exceptionDetails)
         throw new Error(exceptionMessage(response));
     return response.result?.value;
@@ -499,6 +533,7 @@ async function attach(tabId) {
     }
     attachedTabs.add(tabId);
     childSessions.set(tabId, new Set());
+    await sendCDP({ tabId }, 'Page.enable');
     await sendCDP({ tabId }, 'Target.setAutoAttach', {
         autoAttach: true, waitForDebuggerOnStart: false, flatten: true,
         filter: [{ type: 'iframe', exclude: false }]

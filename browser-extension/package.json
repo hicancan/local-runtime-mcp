@@ -1,7 +1,7 @@
 {
   "name": "@local-runtime-mcp/browser-extension",
   "private": true,
-  "version": "9.0.0",
+  "version": "9.0.1",
   "license": "AGPL-3.0-only",
   "scripts": {
     "build": "tsc -p tsconfig.json"

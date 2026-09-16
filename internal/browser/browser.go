@@ -21,7 +21,7 @@ import (
 	"github.com/hicancan/local-runtime-mcp/internal/config"
 )
 
-const ExtensionVersion = "9.0.0"
+const ExtensionVersion = "9.0.1"
 
 type Bridge struct {
 	configured bool

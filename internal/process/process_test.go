@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -69,6 +70,36 @@ func TestPTYProcessLifecycle(t *testing.T) {
 	terminalOutput := result.Stdout + completed.Stdout
 	if err != nil || completed.Running || completed.ExitCode != 0 || !strings.Contains(terminalOutput, "first") || !strings.Contains(terminalOutput, "second") || completed.Stderr != "" {
 		t.Fatalf("completed PTY result = %+v, %v", completed, err)
+	}
+}
+
+func TestPTYResolvesBareProgramThroughPATH(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager := NewManager(ctx)
+	executable, err := filepath.Abs(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Dir(executable)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	result, err := manager.Run(context.Background(), Options{
+		Program: filepath.Base(executable), Args: []string{"-test.run=TestProcessHelper", "--", "delayed"},
+		Environment: map[string]string{"LOCAL_RUNTIME_MCP_PROCESS_HELPER": "1"}, IOMode: "pty", YieldTimeMS: 30,
+	})
+	if err != nil {
+		t.Fatalf("bare PTY executable did not resolve through PATH: %v", err)
+	}
+	output := result.Stdout
+	if result.Running {
+		completed, continueErr := manager.Continue(context.Background(), ContinueOptions{SessionID: result.SessionID, YieldTimeMS: 2000})
+		if continueErr != nil {
+			t.Fatal(continueErr)
+		}
+		result = completed
+		output += completed.Stdout
+	}
+	if result.Running || result.ExitCode != 0 || !strings.Contains(output, "first") || !strings.Contains(output, "second") {
+		t.Fatalf("bare PTY executable result = %+v output=%q", result, output)
 	}
 }
 

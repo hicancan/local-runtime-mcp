@@ -23,13 +23,33 @@ func TestWindowsDesktopSmoke(t *testing.T) {
 		t.Fatalf("window discovery failed: targets=%+v err=%v", targets, err)
 	}
 	var active string
+	var activeBounds Rectangle
 	for _, target := range targets.Windows {
 		if target.Active {
 			active = target.TargetID
+			activeBounds = target.Bounds
 			break
 		}
 	}
 	if active != "" {
+		activated, err := controller.Act(context.Background(), Action{Kind: "activate", TargetID: active})
+		if err != nil || !activated.Success {
+			t.Fatalf("activate current foreground window failed: result=%+v err=%v", activated, err)
+		}
+		afterActivation, err := controller.Targets(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var preserved bool
+		for _, target := range afterActivation.Windows {
+			if target.TargetID == active {
+				preserved = target.Active && target.Bounds == activeBounds
+				break
+			}
+		}
+		if !preserved {
+			t.Fatalf("activate changed the foreground target state: target=%s bounds=%+v after=%+v", active, activeBounds, afterActivation.Windows)
+		}
 		windowImage, windowState, err := controller.State(context.Background(), StateOptions{TargetID: active})
 		if err != nil || len(windowImage) < 8 || windowState.TargetID != active || windowState.StateID == "" {
 			t.Fatalf("foreground WGC/UIA state failed: bytes=%d state=%+v err=%v", len(windowImage), windowState, err)

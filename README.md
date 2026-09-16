@@ -161,7 +161,7 @@ flowchart LR
     CONTINUE --> LIFE[wait · terminate]
 ```
 
-`process_run` starts an executable directly with an argument array, working directory, environment overrides, initial stdin, timeout, output limits, and either pipe or PTY I/O. Short commands return their final result; longer commands return a session ID. `process_continue` reads incremental output, writes input, closes stdin, resizes a PTY, waits, or terminates the complete process tree.
+`process_run` starts an executable directly with an argument array, working directory, environment overrides, initial stdin, timeout, output limits, and either pipe or PTY I/O. Installed program names are resolved through `PATH` consistently in both modes. Short commands return their final result; longer commands return a session ID. `process_continue` reads incremental output, writes input, closes stdin, resizes a PTY, waits, or terminates the complete process tree.
 
 ### Filesystem
 

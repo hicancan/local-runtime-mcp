@@ -18,7 +18,7 @@ func TestVersion(t *testing.T) {
 	if err := run(context.Background(), []string{"version"}, strings.NewReader(""), &output, &errors, executable); err != nil {
 		t.Fatal(err)
 	}
-	if output.String() != "lrmcp 9.0.0\n" {
+	if output.String() != "lrmcp 9.0.1\n" {
 		t.Fatalf("version output = %q", output.String())
 	}
 }

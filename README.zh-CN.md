@@ -161,7 +161,7 @@ flowchart LR
     CONTINUE --> LIFE[等待 · 终止]
 ```
 
-`process_run` 使用可执行文件和参数数组直接启动程序，支持工作目录、环境变量覆盖、初始 stdin、超时、输出上限，以及 pipe 或 PTY I/O。短任务直接返回最终结果，持续任务返回 session ID。`process_continue` 用于读取增量输出、写入输入、关闭 stdin、调整 PTY、等待或终止完整进程树。
+`process_run` 使用可执行文件和参数数组直接启动程序，支持工作目录、环境变量覆盖、初始 stdin、超时、输出上限，以及 pipe 或 PTY I/O。pipe 与 PTY 会以一致方式通过 `PATH` 解析已安装的程序名。短任务直接返回最终结果，持续任务返回 session ID。`process_continue` 用于读取增量输出、写入输入、关闭 stdin、调整 PTY、等待或终止完整进程树。
 
 ### Filesystem
 

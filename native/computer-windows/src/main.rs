@@ -16,7 +16,8 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
 use windows::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    AttachThreadInput, GetCurrentThreadId, GetProcessTimes, OpenProcess,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, UIA_ButtonControlTypeId, UIA_CheckBoxControlTypeId,
@@ -29,8 +30,9 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId, IsWindow,
-    IsWindowVisible, SW_RESTORE, SetCursorPos, SetForegroundWindow, ShowWindow,
+    BringWindowToTop, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId, IsIconic,
+    IsWindow, IsWindowVisible, SW_RESTORE, SetCursorPos, SetForegroundWindow, ShowWindow,
+    SwitchToThisWindow,
 };
 use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame;
@@ -42,7 +44,7 @@ use windows_capture::settings::{
 };
 use windows_capture::window::Window as CaptureWindow;
 
-const VERSION: &str = "9.0.0";
+const VERSION: &str = "9.0.1";
 const MAX_STATES: usize = 64;
 const MAX_ELEMENTS: usize = 500;
 
@@ -780,13 +782,59 @@ fn activate(window: HWND) -> Result<(), String> {
         if !IsWindow(Some(window)).as_bool() || !IsWindowVisible(window).as_bool() {
             return Err("target window is no longer available".into());
         }
-        let _ = ShowWindow(window, SW_RESTORE);
+        if IsIconic(window).as_bool() {
+            let _ = ShowWindow(window, SW_RESTORE);
+        }
         let _ = BringWindowToTop(window);
-        if !SetForegroundWindow(window).as_bool() || GetForegroundWindow() != window {
-            return Err("window did not become foreground".into());
+        let mut requested = SetForegroundWindow(window).as_bool();
+        if wait_for_foreground(window, 10) {
+            return Ok(());
+        }
+
+        let foreground = GetForegroundWindow();
+        let current_thread = GetCurrentThreadId();
+        let foreground_thread = GetWindowThreadProcessId(foreground, None);
+        let target_thread = GetWindowThreadProcessId(window, None);
+        let attached_foreground = foreground_thread != 0
+            && foreground_thread != current_thread
+            && AttachThreadInput(current_thread, foreground_thread, true).as_bool();
+        let attached_target = target_thread != 0
+            && target_thread != current_thread
+            && target_thread != foreground_thread
+            && AttachThreadInput(current_thread, target_thread, true).as_bool();
+        let _ = BringWindowToTop(window);
+        requested = SetForegroundWindow(window).as_bool() || requested;
+        let _ = SetFocus(Some(window));
+        let activated_while_attached = wait_for_foreground(window, 15);
+        if attached_target {
+            let _ = AttachThreadInput(current_thread, target_thread, false);
+        }
+        if attached_foreground {
+            let _ = AttachThreadInput(current_thread, foreground_thread, false);
+        }
+        if activated_while_attached {
+            return Ok(());
+        }
+
+        SwitchToThisWindow(window, true);
+        if wait_for_foreground(window, 20) {
+            return Ok(());
+        }
+        if requested {
+            Err("window did not become foreground within 450 ms".into())
+        } else {
+            Err("Windows rejected the foreground activation request".into())
         }
     }
-    Ok(())
+}
+unsafe fn wait_for_foreground(window: HWND, attempts: usize) -> bool {
+    for _ in 0..attempts {
+        if unsafe { GetForegroundWindow() } == window {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
 }
 fn require_foreground(window: HWND) -> Result<(), String> {
     if unsafe { GetForegroundWindow() } != window {

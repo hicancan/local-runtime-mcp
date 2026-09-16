@@ -124,6 +124,10 @@ func (m *Manager) Run(callContext context.Context, options Options) (Result, err
 	if err != nil {
 		return Result{}, err
 	}
+	program, err := exec.LookPath(options.Program)
+	if err != nil {
+		return Result{}, fmt.Errorf("resolve program %q: %w", options.Program, err)
+	}
 
 	entry := &session{
 		id: newSessionID(), program: options.Program, args: append([]string(nil), options.Args...), directory: filepath.Clean(directory),
@@ -151,7 +155,7 @@ func (m *Manager) Run(callContext context.Context, options Options) (Result, err
 			_ = terminal.Close()
 			return Result{}, fmt.Errorf("resize pseudo-terminal: %w", err)
 		}
-		command := terminal.Command(options.Program, options.Args...)
+		command := terminal.Command(program, options.Args...)
 		command.Dir, command.Env = directory, mergeEnvironment(options.Environment)
 		preparePTY(command)
 		if err := command.Start(); err != nil {
@@ -168,7 +172,7 @@ func (m *Manager) Run(callContext context.Context, options Options) (Result, err
 		entry.stdin = ptyWriter{terminal}
 		go func() { _, _ = io.Copy(entry.stdout, terminal); close(entry.outputDone) }()
 	} else {
-		command := exec.Command(options.Program, options.Args...)
+		command := exec.Command(program, options.Args...)
 		command.Dir, command.Env = directory, mergeEnvironment(options.Environment)
 		command.Stdout, command.Stderr = entry.stdout, entry.stderr
 		if options.Stdin != "" || options.KeepStdinOpen {

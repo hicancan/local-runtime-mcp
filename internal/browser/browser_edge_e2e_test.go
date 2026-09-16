@@ -37,7 +37,7 @@ func TestEdgeExtensionEndToEnd(t *testing.T) {
 	childURL := strings.Replace(child.URL, "127.0.0.1", "child.local-runtime-mcp.invalid", 1)
 	page := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprintf(writer, `<!doctype html><title>LRMCP E2E</title><main><h1>ready</h1><button id="button" onclick="document.querySelector('h1').textContent='clicked'">Run</button><iframe src=%q></iframe></main>`, childURL)
+		fmt.Fprintf(writer, `<!doctype html><title>LRMCP E2E</title><main><h1>ready</h1><button id="button" onclick="document.querySelector('h1').textContent='clicked'">Run</button><button id="dialog" onclick="document.querySelector('h1').textContent=prompt('value','default')||'dismissed'">Dialog</button><iframe src=%q></iframe></main>`, childURL)
 	}))
 	defer page.Close()
 
@@ -177,6 +177,27 @@ func TestEdgeExtensionEndToEnd(t *testing.T) {
 	updated, err := bridge.Snapshot(callContext, tabID, 20, 1000)
 	if err != nil || !strings.Contains(updated.Text, "clicked") || updated.PageEpoch == snapshot.PageEpoch {
 		t.Fatalf("updated snapshot=%+v err=%v", updated, err)
+	}
+	var dialogRef string
+	for _, element := range updated.Elements {
+		if element.Name == "Dialog" {
+			dialogRef = element.Ref
+			break
+		}
+	}
+	if dialogRef == "" {
+		t.Fatalf("dialog button is missing after main-frame action: %+v", updated.Elements)
+	}
+	if _, err := bridge.Act(callContext, Action{Kind: "click", TabID: tabID, Ref: dialogRef}); err != nil {
+		t.Fatalf("dialog-opening click did not return: %v", err)
+	}
+	accept := true
+	if _, err := bridge.Act(callContext, Action{Kind: "handle_dialog", TabID: tabID, Accept: &accept, PromptText: "accepted"}); err != nil {
+		t.Fatalf("handle dialog failed: %v", err)
+	}
+	afterDialog, err := bridge.Snapshot(callContext, tabID, 20, 1000)
+	if err != nil || !strings.Contains(afterDialog.Text, "accepted") {
+		t.Fatalf("dialog result snapshot=%+v err=%v", afterDialog, err)
 	}
 	if _, err := bridge.Navigate(callContext, Navigation{TabID: tabID, Kind: "reload"}); err != nil {
 		t.Fatal(err)

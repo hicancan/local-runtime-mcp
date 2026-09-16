@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Local Runtime MCP Browser Bridge",
-  "version": "9.0.0",
+  "version": "9.0.1",
   "description": "Lets Local Runtime MCP control the current Chromium browser through an authenticated local bridge.",
   "homepage_url": "https://github.com/hicancan/local-runtime-mcp",
   "permissions": [
