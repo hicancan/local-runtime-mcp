@@ -3,6 +3,7 @@
 [![CI](https://github.com/hicancan/local-runtime-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/hicancan/local-runtime-mcp/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/hicancan/local-runtime-mcp)](https://github.com/hicancan/local-runtime-mcp/releases/latest)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
+[![M8ven Verified](https://m8ven.ai/badge/mcp/hicancan/local-runtime-mcp?variant=verified)](https://m8ven.ai/mcp/hicancan/local-runtime-mcp)
 
 **English** · [简体中文](README.zh-CN.md)
 
@@ -274,6 +275,8 @@ local-runtime-mcp/
 ├── config.example.yaml
 ├── README.md
 ├── README.zh-CN.md
+├── SECURITY.md
+├── PRIVACY.md
 ├── LICENSE
 ├── THIRD_PARTY_NOTICES.md
 └── cloudflared-LICENSE
@@ -390,6 +393,12 @@ go build ./cmd/lrmcp
 ```
 
 CI builds and tests Windows, Linux, and macOS. Windows CI also runs the Chromium extension end-to-end suite and Rust formatting and lint checks.
+
+## Security and privacy
+
+Local Runtime MCP operates with the permissions of the account that starts it. Authenticated clients can execute programs, access files, observe and control the Windows desktop, and interact with browser sessions, so access to the runtime should be treated as privileged machine access.
+
+See [SECURITY.md](SECURITY.md) for the security model, deployment guidance, and private vulnerability reporting. See [PRIVACY.md](PRIVACY.md) for capability data flows, local retention, and the boundaries of external MCP clients and tunnel providers.
 
 ## License
 

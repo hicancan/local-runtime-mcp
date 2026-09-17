@@ -13,8 +13,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/hicancan/local-runtime-mcp/internal/config"
+	"golang.org/x/sys/windows"
 )
 
 // TestEdgeExtensionEndToEnd is opt-in because it launches a real isolated Edge
@@ -69,9 +71,27 @@ func TestEdgeExtensionEndToEnd(t *testing.T) {
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
+	job, err := createEdgeJob(command.Process.Pid)
+	if err != nil {
 		_ = command.Process.Kill()
 		_, _ = command.Process.Wait()
+		t.Fatalf("contain Edge process tree: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = windows.TerminateJobObject(job, 1)
+		_ = windows.CloseHandle(job)
+		_ = command.Wait()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			err := os.RemoveAll(profile)
+			if err == nil || time.Now().After(deadline) {
+				if err != nil {
+					t.Errorf("remove isolated Edge profile: %v", err)
+				}
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
 	})
 
 	deadline := time.Now().Add(20 * time.Second)
@@ -202,6 +222,35 @@ func TestEdgeExtensionEndToEnd(t *testing.T) {
 	if _, err := bridge.Navigate(callContext, Navigation{TabID: tabID, Kind: "reload"}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func createEdgeJob(processID int) (windows.Handle, error) {
+	job, err := windows.CreateJobObject(nil, nil)
+	if err != nil {
+		return 0, err
+	}
+	information := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
+	information.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	if _, err := windows.SetInformationJobObject(
+		job,
+		windows.JobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&information)),
+		uint32(unsafe.Sizeof(information)),
+	); err != nil {
+		_ = windows.CloseHandle(job)
+		return 0, err
+	}
+	process, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(processID))
+	if err != nil {
+		_ = windows.CloseHandle(job)
+		return 0, err
+	}
+	defer windows.CloseHandle(process)
+	if err := windows.AssignProcessToJobObject(job, process); err != nil {
+		_ = windows.CloseHandle(job)
+		return 0, err
+	}
+	return job, nil
 }
 
 func findEdge() string {

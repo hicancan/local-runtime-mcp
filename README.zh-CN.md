@@ -3,6 +3,7 @@
 [![CI](https://github.com/hicancan/local-runtime-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/hicancan/local-runtime-mcp/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/hicancan/local-runtime-mcp)](https://github.com/hicancan/local-runtime-mcp/releases/latest)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
+[![M8ven Verified](https://m8ven.ai/badge/mcp/hicancan/local-runtime-mcp?variant=verified)](https://m8ven.ai/mcp/hicancan/local-runtime-mcp)
 
 [English](README.md) · **简体中文**
 
@@ -274,6 +275,8 @@ local-runtime-mcp/
 ├── config.example.yaml
 ├── README.md
 ├── README.zh-CN.md
+├── SECURITY.md
+├── PRIVACY.md
 ├── LICENSE
 ├── THIRD_PARTY_NOTICES.md
 └── cloudflared-LICENSE
@@ -390,6 +393,12 @@ go build ./cmd/lrmcp
 ```
 
 CI 覆盖 Windows、Linux 与 macOS。Windows CI 还会执行 Chromium 扩展端到端测试，以及 Rust 格式与静态检查。
+
+## 安全与隐私
+
+Local Runtime MCP 使用启动它的账户权限运行。经过身份验证的客户端可以执行程序、访问文件、观察和控制 Windows 桌面，并与浏览器会话交互，因此应将运行时访问视为对该机器账户的高权限访问。
+
+[SECURITY.md](SECURITY.md) 说明安全模型、部署建议和私密漏洞报告方式；[PRIVACY.md](PRIVACY.md) 说明各能力域的数据流、本地保留行为，以及外部 MCP 客户端和隧道服务商的边界。
 
 ## 开源协议
 

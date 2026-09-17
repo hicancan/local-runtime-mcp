@@ -1,6 +1,6 @@
 import { packagedConfig } from './runtime_config.js';
 
-const VERSION = '9.0.1';
+const VERSION = '9.0.2';
 const attachedTabs = new Set<number>();
 const childSessions = new Map<number, Set<string>>();
 const dialogWaiters = new Map<number, Set<() => void>>();

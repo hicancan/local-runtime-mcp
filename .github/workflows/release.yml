@@ -67,7 +67,7 @@ jobs:
           go build -trimpath -ldflags "-s -w" -o "dist/$name/${{ matrix.executable }}" ./cmd/lrmcp
           ./scripts/fetch-cloudflared.ps1 -OperatingSystem "${{ matrix.goos }}" -Architecture "${{ matrix.goarch }}" -DestinationDirectory "dist/$name" -TemporaryDirectory (Join-Path $env:RUNNER_TEMP 'cloudflared-download')
           Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/cloudflare/cloudflared/2026.9.1/LICENSE' -OutFile "dist/$name/cloudflared-LICENSE"
-          Copy-Item README.md,README.zh-CN.md,config.example.yaml,LICENSE,THIRD_PARTY_NOTICES.md "dist/$name/"
+          Copy-Item README.md,README.zh-CN.md,SECURITY.md,PRIVACY.md,config.example.yaml,LICENSE,THIRD_PARTY_NOTICES.md "dist/$name/"
           if ("${{ matrix.goos }}" -eq 'windows') {
             Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
           }
