@@ -339,6 +339,8 @@ cloudflare:
 
 隧道创建方法和支持的客户端见 [OpenAI Secure MCP Tunnel 指南](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)。
 
+当单次请求达到响应期限并关闭内存连接时，适配器会重建内嵌 MCP 会话，因此一个超时工具调用不会终止 `lrmcp` 进程，也不需要手动重启。
+
 ### Streamable HTTP
 
 在 `http` 段填写 HTTP Bearer token，然后运行：

@@ -339,6 +339,8 @@ Place the tunnel credentials in the `openai` section and run:
 
 See the [OpenAI Secure MCP Tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) for tunnel creation and supported clients.
 
+The adapter rebuilds its embedded MCP session when a request deadline closes the in-memory connection, so one expired tool call does not terminate the `lrmcp` process or require a manual restart.
+
 ### Streamable HTTP
 
 Place an HTTP Bearer token in the `http` section and run:
