@@ -141,6 +141,8 @@ Bare program names use the merged child `PATH` in both I/O modes; Windows also u
 
 Different sessions run concurrently. Within one session, input writes are serialized and each result drains stdout and stderr together. Waiting for output leaves termination available, including when stdin is blocked. Output and queued input are bounded; a single stdin payload is limited to 16 MiB.
 
+`duration_ms` is elapsed process time while the program runs and its fixed lifetime after exit. Collecting a completed session later leaves that duration unchanged.
+
 Cancellation before `process_run` returns a live session terminates and collects that process. Cancellation of `process_continue` stops that call's wait; use `terminate=true` to end the session. Execution timeout and Host shutdown terminate managed processes independently of the MCP request deadline.
 
 ### Filesystem · 6 tools
@@ -239,8 +241,10 @@ The blue target outline and AI position marker show the current interaction. Cli
 flowchart TB
     Tools[Browser tools] --> Registry[Instance registry + tab routing]
     Registry --> Bridge[Authenticated loopback bridge]
-    Bridge --> Edge[Edge profile extension]
-    Bridge --> Chrome[Chrome profile extension]
+    Bridge <-->|WebSocket · commands + keepalive| Edge[Edge profile extension]
+    Bridge <-->|WebSocket · commands + keepalive| Chrome[Chrome profile extension]
+    Edge -->|HTTP · results + authorization| Bridge
+    Chrome -->|HTTP · results + authorization| Bridge
     Chrome --> Intake[Command intake]
     Intake --> Queue[Bounded per-tab FIFO scheduler]
     Queue --> TabA[Tab A · CDP frames]
@@ -250,6 +254,8 @@ flowchart TB
 ```
 
 Install the same MV3 extension in each intended Chromium profile. Give each instance a readable label in extension options, such as `Edge · Work` or `Chrome · Research`. The extension keeps a stable UUID in that profile and connects to the shared bridge using its token. `chrome.debugger` sends CDP operations directly to tabs and frames.
+
+Each profile receives commands over one authenticated loopback WebSocket and exchanges keepalive messages every 20 seconds. A browser alarm restores interrupted connections. Results and desktop-operation authorization use authenticated HTTP on the same bridge. This connection remains active while browser tasks are idle, following Chromium's [extension service-worker WebSocket lifecycle](https://developer.chrome.com/docs/extensions/how-to/web-platform/websockets).
 
 | Tool | Target and operation |
 | --- | --- |
@@ -284,6 +290,8 @@ For two AI conversations, each can select a different browser instance and open 
 
 Request cancellation is distinct from process execution timeout and Host shutdown. A failed or expired call retains other resources. When a side effect may already have occurred, observe the target before retrying a non-idempotent action.
 
+The [two-conversation acceptance prompts](docs/concurrency-acceptance.zh-CN.md) exercise idle browser connectivity, independent process output, explicit profile routing, and desktop ownership through a configured ChatGPT connection.
+
 ## Installation
 
 Download a platform archive from [Releases](https://github.com/hicancan/local-runtime-mcp/releases/latest), verify its published SHA-256, and extract it into its own directory.
@@ -293,7 +301,7 @@ Download a platform archive from [Releases](https://github.com/hicancan/local-ru
 | Windows amd64 | Supported | Chromium extension | Native Windows engine |
 | Linux / macOS | Supported | Chromium extension in a desktop browser | Reports platform unavailability |
 
-Browser control requires a running Chromium profile with the extension loaded. Windows Computer requires Windows 10 version 2004 or newer, including Windows 11, an interactive desktop, and permissions appropriate for the target applications.
+Browser control requires Chromium 120 or newer and a running profile with the extension loaded. Windows Computer requires Windows 10 version 2004 or newer, including Windows 11, an interactive desktop, and permissions appropriate for the target applications.
 
 The Windows archive contains:
 
@@ -420,11 +428,11 @@ go vet ./...
 go build ./cmd/lrmcp
 ```
 
-Go tests cover resource lifetimes, response correlation, cancellation, competing file commits, process I/O, and browser identity routing. Extension scheduler tests cover ordering, fairness, cancellation, and queue limits. The opt-in Windows Chromium suite loads the real extension in disposable browser profiles:
+Go tests cover resource lifetimes, response correlation, cancellation, competing file commits, process I/O, and browser identity routing. Extension scheduler tests cover ordering, fairness, cancellation, and queue limits. The opt-in Windows Chromium suite loads the real extension in disposable browser profiles and includes an idle-only connection test:
 
 ```powershell
 $env:LOCAL_RUNTIME_MCP_BROWSER_E2E = '1'
-go test ./internal/browser -run TestEdgeExtensionEndToEnd -count=3 -v
+go test ./internal/browser -run 'TestEdgeExtension(IdleLifecycle|EndToEnd)' -count=3 -v
 ```
 
 CI exercises Windows, Linux, and macOS. Local protocol and browser tests validate those execution paths; live ChatGPT multi-conversation acceptance is performed separately against the configured client and tunnel.

@@ -20,9 +20,10 @@ import (
 	"time"
 
 	"github.com/hicancan/local-runtime-mcp/internal/config"
+	"golang.org/x/net/websocket"
 )
 
-const ExtensionVersion = "10.0.0"
+const ExtensionVersion = "10.0.1"
 
 // DesktopGate reserves the shared interactive desktop for a browser operation.
 // A successful reservation is released only once execution has acknowledged completion.
@@ -44,6 +45,8 @@ type Bridge struct {
 	prefix     string
 	closeOnce  sync.Once
 	closeErr   error
+	sockets    map[*websocket.Conn]struct{}
+	socketWG   sync.WaitGroup
 }
 
 type instance struct {
@@ -51,6 +54,7 @@ type instance struct {
 	lastSeen time.Time
 	commands chan command
 	controls chan command
+	socket   *websocket.Conn
 }
 
 type tabRoute struct{ browserID, bootID string }
@@ -198,7 +202,7 @@ type response struct {
 
 func Start(ctx context.Context, configuration config.Browser) (*Bridge, error) {
 	bridgeContext, cancel := context.WithCancel(ctx)
-	bridge := &Bridge{configured: configuration.Token != "", token: configuration.Token, pending: make(map[string]*pendingCall), instances: make(map[string]*instance), tabs: make(map[string]tabRoute), ctx: bridgeContext, cancel: cancel, prefix: rand.Text()}
+	bridge := &Bridge{configured: configuration.Token != "", token: configuration.Token, pending: make(map[string]*pendingCall), instances: make(map[string]*instance), tabs: make(map[string]tabRoute), sockets: make(map[*websocket.Conn]struct{}), ctx: bridgeContext, cancel: cancel, prefix: rand.Text()}
 	if !bridge.configured {
 		return bridge, nil
 	}
@@ -212,9 +216,7 @@ func Start(ctx context.Context, configuration config.Browser) (*Bridge, error) {
 	}
 	bridge.address = listener.Addr().String()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/hello", bridge.hello)
-	mux.HandleFunc("/v1/heartbeat", bridge.heartbeat)
-	mux.HandleFunc("/v1/poll", bridge.poll)
+	mux.Handle("/v1/connect", websocket.Server{Handshake: bridge.socketHandshake, Handler: bridge.connect})
 	mux.HandleFunc("/v1/result", bridge.receiveResult)
 	mux.HandleFunc("/v1/authorize", bridge.authorizeDesktop)
 	bridge.server = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
@@ -234,6 +236,10 @@ func (b *Bridge) Close(ctx context.Context) error {
 			b.cancel()
 		}
 		b.mu.Lock()
+		sockets := make([]*websocket.Conn, 0, len(b.sockets))
+		for socket := range b.sockets {
+			sockets = append(sockets, socket)
+		}
 		for id, pending := range b.pending {
 			if pending.stopGateWatch != nil {
 				pending.stopGateWatch()
@@ -245,6 +251,10 @@ func (b *Bridge) Close(ctx context.Context) error {
 			delete(b.pending, id)
 		}
 		b.mu.Unlock()
+		for _, socket := range sockets {
+			_ = socket.SetDeadline(time.Now())
+			_ = socket.Close()
+		}
 		if b.server == nil {
 			return
 		}
@@ -254,6 +264,7 @@ func (b *Bridge) Close(ctx context.Context) error {
 		if errors.Is(b.closeErr, context.DeadlineExceeded) {
 			b.closeErr = b.server.Close()
 		}
+		b.socketWG.Wait()
 	})
 	return b.closeErr
 }
@@ -263,7 +274,7 @@ func (b *Bridge) Status() Status {
 	defer b.mu.Unlock()
 	status := Status{Configured: b.configured, Address: b.address, Instances: make([]InstanceStatus, 0, len(b.instances))}
 	for id, instance := range b.instances {
-		connected := time.Since(instance.lastSeen) < 35*time.Second
+		connected := instance.socket != nil && time.Since(instance.lastSeen) < 35*time.Second
 		status.Connected = status.Connected || connected
 		status.Instances = append(status.Instances, InstanceStatus{BrowserID: id, Label: instance.peer.Label, Browser: instance.peer.Browser, ExtensionVersion: instance.peer.ExtensionVersion, Connected: connected, LastSeen: instance.lastSeen})
 	}
@@ -388,7 +399,7 @@ func (b *Bridge) route(tabID string) (string, error) {
 		return "", errors.New("tab_id is unknown or stale; call browser_tabs again")
 	}
 	instance := b.instances[route.browserID]
-	if instance == nil || instance.peer.BootID != route.bootID || time.Since(instance.lastSeen) >= 35*time.Second {
+	if instance == nil || instance.socket == nil || instance.peer.BootID != route.bootID || time.Since(instance.lastSeen) >= 35*time.Second {
 		return "", errors.New("browser instance is offline or restarted; call browser_tabs again")
 	}
 	return route.browserID, nil
@@ -428,7 +439,7 @@ func (b *Bridge) call(ctx context.Context, browserID, method string, params any,
 	defer cancel()
 	b.mu.Lock()
 	instance := b.instances[browserID]
-	if instance == nil || time.Since(instance.lastSeen) >= 35*time.Second {
+	if instance == nil || instance.socket == nil || time.Since(instance.lastSeen) >= 35*time.Second {
 		b.mu.Unlock()
 		return errors.New("browser_id is unknown or offline; call browser_status")
 	}
@@ -507,140 +518,6 @@ func (b *Bridge) cancelPendingLocked(id string, pending *pendingCall) {
 	}
 }
 
-func (b *Bridge) decodePeer(writer http.ResponseWriter, request *http.Request) (Peer, bool) {
-	if request.Method != http.MethodPost {
-		http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
-		return Peer{}, false
-	}
-	if !b.authorized(request) {
-		http.Error(writer, "unauthorized", http.StatusUnauthorized)
-		return Peer{}, false
-	}
-	var peer Peer
-	if err := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 4096)).Decode(&peer); err != nil {
-		http.Error(writer, "invalid peer metadata", http.StatusBadRequest)
-		return Peer{}, false
-	}
-	if peer.ExtensionVersion != ExtensionVersion {
-		http.Error(writer, "browser extension version does not match lrmcp; run lrmcp setup browser and reload the extension", http.StatusUpgradeRequired)
-		return Peer{}, false
-	}
-	if strings.TrimSpace(peer.InstanceID) == "" || strings.TrimSpace(peer.BootID) == "" {
-		http.Error(writer, "instance_id and boot_id are required", http.StatusBadRequest)
-		return Peer{}, false
-	}
-	return peer, true
-}
-
-func (b *Bridge) hello(writer http.ResponseWriter, request *http.Request) {
-	peer, ok := b.decodePeer(writer, request)
-	if !ok {
-		return
-	}
-	b.mu.Lock()
-	old := b.instances[peer.InstanceID]
-	if old == nil && len(b.instances) >= 32 {
-		b.mu.Unlock()
-		http.Error(writer, "browser instance capacity reached", http.StatusServiceUnavailable)
-		return
-	}
-	if old != nil && old.peer.BootID != peer.BootID {
-		for tabID, route := range b.tabs {
-			if route.browserID == peer.InstanceID {
-				delete(b.tabs, tabID)
-			}
-		}
-		for id, pending := range b.pending {
-			if pending.browserID == peer.InstanceID {
-				if pending.stopGateWatch != nil {
-					pending.stopGateWatch()
-				}
-				pending.cancel()
-				if pending.release != nil {
-					pending.release()
-				}
-				delete(b.pending, id)
-				pending.result <- response{Error: "browser extension restarted; operation outcome may be unknown"}
-			}
-		}
-	}
-	if old == nil || old.peer.BootID != peer.BootID {
-		old = &instance{commands: make(chan command, 64), controls: make(chan command, 256)}
-		b.instances[peer.InstanceID] = old
-	}
-	old.peer = peer
-	old.lastSeen = time.Now()
-	b.mu.Unlock()
-	writer.Header().Set("X-LRMCP-Bridge-ID", b.prefix)
-	writer.WriteHeader(http.StatusNoContent)
-}
-
-func (b *Bridge) livePeer(writer http.ResponseWriter, request *http.Request) (*instance, bool) {
-	peer, ok := b.decodePeer(writer, request)
-	if !ok {
-		return nil, false
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	instance := b.instances[peer.InstanceID]
-	if instance == nil || instance.peer.BootID != peer.BootID {
-		http.Error(writer, "extension generation changed; register again", http.StatusConflict)
-		return nil, false
-	}
-	instance.lastSeen = time.Now()
-	return instance, true
-}
-
-func (b *Bridge) heartbeat(writer http.ResponseWriter, request *http.Request) {
-	if _, ok := b.livePeer(writer, request); ok {
-		writer.WriteHeader(http.StatusNoContent)
-	}
-}
-
-func (b *Bridge) poll(writer http.ResponseWriter, request *http.Request) {
-	instance, ok := b.livePeer(writer, request)
-	if !ok {
-		return
-	}
-	timer := time.NewTimer(25 * time.Second)
-	defer timer.Stop()
-	for {
-		var item command
-		select {
-		case item = <-instance.controls:
-		default:
-			select {
-			case item = <-instance.controls:
-			case item = <-instance.commands:
-			case <-timer.C:
-				writer.WriteHeader(http.StatusNoContent)
-				return
-			case <-request.Context().Done():
-				return
-			case <-b.ctx.Done():
-				return
-			}
-		}
-		b.mu.Lock()
-		pending := b.pending[item.ID]
-		valid := pending != nil && pending.bootID == instance.peer.BootID && (item.Method == "cancel" || !pending.abandoned && pending.ctx.Err() == nil && time.Now().UnixMilli() < item.Deadline)
-		if valid && item.Method != "cancel" {
-			pending.dispatched = true
-		}
-		if !valid && pending != nil && !pending.dispatched {
-			pending.cancel()
-			delete(b.pending, item.ID)
-		}
-		b.mu.Unlock()
-		if !valid {
-			continue
-		}
-		writer.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(writer).Encode(item)
-		return
-	}
-}
-
 func (b *Bridge) receiveResult(writer http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodPost {
 		http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
@@ -663,11 +540,13 @@ func (b *Bridge) receiveResult(writer http.ResponseWriter, request *http.Request
 		http.Error(writer, "result does not belong to this instance generation", http.StatusConflict)
 		return
 	}
-	instance.lastSeen = time.Now()
 	if pending == nil {
 		b.mu.Unlock()
 		http.Error(writer, "unknown command", http.StatusNotFound)
 		return
+	}
+	if result.BootID == instance.peer.BootID && instance.socket != nil {
+		instance.lastSeen = time.Now()
 	}
 	delete(b.pending, result.ID)
 	if pending.stopGateWatch != nil {
@@ -722,7 +601,15 @@ func (b *Bridge) authorizeDesktop(writer http.ResponseWriter, request *http.Requ
 	if gate == nil {
 		b.mu.Lock()
 		pending.authorizing = false
+		abandoned := pending.abandoned
+		if abandoned && b.pending[identity.ID] == pending {
+			delete(b.pending, identity.ID)
+		}
 		b.mu.Unlock()
+		if abandoned {
+			http.Error(writer, "command canceled", http.StatusConflict)
+			return
+		}
 		writer.WriteHeader(204)
 		return
 	}
@@ -730,12 +617,18 @@ func (b *Bridge) authorizeDesktop(writer http.ResponseWriter, request *http.Requ
 	if err != nil {
 		b.mu.Lock()
 		pending.authorizing = false
+		if pending.abandoned && b.pending[identity.ID] == pending && pending.release == nil {
+			delete(b.pending, identity.ID)
+		}
 		b.mu.Unlock()
 		http.Error(writer, err.Error(), 409)
 		return
 	}
 	b.mu.Lock()
 	if b.pending[identity.ID] != pending || pending.abandoned {
+		if b.pending[identity.ID] == pending {
+			delete(b.pending, identity.ID)
+		}
 		b.mu.Unlock()
 		if release != nil {
 			release()
@@ -744,6 +637,10 @@ func (b *Bridge) authorizeDesktop(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 	if controlledContext != nil && controlledContext.Err() != nil {
+		pending.authorizing = false
+		if pending.abandoned && b.pending[identity.ID] == pending {
+			delete(b.pending, identity.ID)
+		}
 		b.mu.Unlock()
 		if release != nil {
 			release()

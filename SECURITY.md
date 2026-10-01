@@ -16,7 +16,7 @@ Every selected connection reaches one shared Runtime Host and the same 21-tool s
 | Streamable HTTP | Listens on loopback, requires a Bearer token of at least 32 characters, validates the accepted host, rejects nonempty browser Origin headers, and compares tokens in constant time. |
 | OpenAI Tunnel | Authenticates using the configured tunnel ID and API key. Official HTTP forwarding reaches a private loopback endpoint with a dynamically assigned port and a fresh in-memory private-hop credential. |
 | Cloudflare Tunnel | The official `cloudflared` companion reaches the configured loopback HTTP origin. The tunnel token authenticates `cloudflared`; the separate MCP Bearer token authenticates tool clients. The companion uses a temporary token file and a sanitized environment. |
-| Browser bridge | Listens on loopback, verifies its bridge token, checks the extension version, and routes commands and results to matching instance and connection-generation identities. Multiple configured profile instances may connect. |
+| Browser bridge | Listens on loopback, authenticates each WebSocket command connection and HTTP result/authorization request, checks the extension version, and routes commands and results to matching instance and connection-generation identities. Multiple configured profile instances may connect. |
 
 The project supports static Bearer authentication for HTTP and provider credentials for tunnel operation. Each credential has a distinct role and should be generated, protected, and rotated independently.
 

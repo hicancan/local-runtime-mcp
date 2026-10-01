@@ -28,45 +28,7 @@ func (a authorization) RoundTrip(req *http.Request) (*http.Response, error) {
 // Two independently connected clients operate one Host. Their first calls
 // naturally reuse JSON-RPC sequence numbers; resource identity is independent.
 func TestConcurrentClientsShareHostButNotResponseIdentity(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	host, err := Start(ctx, &config.Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		shutdown, stop := context.WithTimeout(context.Background(), 5*time.Second)
-		defer stop()
-		if err := host.Close(shutdown); err != nil {
-			t.Error(err)
-		}
-	})
-	const token = "0123456789abcdef0123456789abcdef"
-	httpServer, err := transport.NewHTTP(host.Server(), transport.HTTPConfig{Listen: "127.0.0.1:0", BearerToken: token})
-	if err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- httpServer.Run(ctx) }()
-	t.Cleanup(func() {
-		cancel()
-		if err := <-done; err != nil {
-			t.Error(err)
-		}
-	})
-	connect := func() *mcp.ClientSession {
-		client := mcp.NewClient(&mcp.Implementation{Name: "independent-test", Version: "1"}, nil)
-		session, err := client.Connect(ctx, &mcp.StreamableClientTransport{
-			Endpoint: "http://" + httpServer.Address() + "/mcp", DisableStandaloneSSE: true,
-			HTTPClient: &http.Client{Transport: authorization{http.DefaultTransport, token}},
-		}, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = session.Close() })
-		return session
-	}
-	a, b := connect(), connect()
+	ctx, a, b := sharedHTTPTestClients(t, http.DefaultTransport, http.DefaultTransport)
 	directory := t.TempDir()
 	errors := make(chan error, 2)
 	for index, session := range []*mcp.ClientSession{a, b} {
@@ -99,6 +61,49 @@ func TestConcurrentClientsShareHostButNotResponseIdentity(t *testing.T) {
 	if err != nil || len(tools.Tools) != 21 {
 		t.Fatalf("remaining client: count=%v err=%v", tools, err)
 	}
+}
+
+func sharedHTTPTestClients(t *testing.T, transportA, transportB http.RoundTripper) (context.Context, *mcp.ClientSession, *mcp.ClientSession) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+	host, err := Start(ctx, &config.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		shutdown, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		if err := host.Close(shutdown); err != nil {
+			t.Error(err)
+		}
+	})
+	const token = "0123456789abcdef0123456789abcdef"
+	httpServer, err := transport.NewHTTP(host.Server(), transport.HTTPConfig{Listen: "127.0.0.1:0", BearerToken: token})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- httpServer.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	})
+	connect := func(base http.RoundTripper) *mcp.ClientSession {
+		client := mcp.NewClient(&mcp.Implementation{Name: "independent-test", Version: "1"}, nil)
+		session, err := client.Connect(ctx, &mcp.StreamableClientTransport{
+			Endpoint: "http://" + httpServer.Address() + "/mcp", DisableStandaloneSSE: true,
+			HTTPClient: &http.Client{Transport: authorization{base, token}},
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = session.Close() })
+		return session
+	}
+	return ctx, connect(transportA), connect(transportB)
 }
 
 type toolFailure struct{ result *mcp.CallToolResult }

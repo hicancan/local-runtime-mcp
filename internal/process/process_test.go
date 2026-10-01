@@ -30,6 +30,106 @@ func TestManagedProcessLifecycle(t *testing.T) {
 	}
 }
 
+func TestProcessDurationStopsAtExit(t *testing.T) {
+	for _, mode := range []string{"pipe", "pty"} {
+		t.Run(mode, func(t *testing.T) {
+			manager := NewManager(context.Background())
+			t.Cleanup(func() { _ = manager.Close() })
+			started, err := manager.Run(context.Background(), Options{
+				Program: os.Args[0], Args: []string{"-test.run=TestProcessHelper", "--", "delayed"},
+				Environment: map[string]string{"LOCAL_RUNTIME_MCP_PROCESS_HELPER": "1"}, IOMode: mode, YieldTimeMS: 1,
+			})
+			if err != nil || !started.Running || started.SessionID == "" {
+				t.Fatalf("start = %+v, %v", started, err)
+			}
+			manager.mu.Lock()
+			entry := manager.sessions[started.SessionID]
+			manager.mu.Unlock()
+			select {
+			case <-entry.done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("process did not exit")
+			}
+			exited := entry.result(false)
+			if exited.Running || exited.ExitCode != 0 || exited.DurationMS < started.DurationMS {
+				t.Fatalf("exited = %+v; started = %+v", exited, started)
+			}
+			// Delay collection after the process has exited. The elapsed lifetime
+			// must not include how long the client waited before collecting it.
+			time.Sleep(60 * time.Millisecond)
+			collected, err := manager.Continue(context.Background(), ContinueOptions{SessionID: started.SessionID, YieldTimeMS: 1})
+			if err != nil || collected.Running || collected.ExitCode != 0 || collected.DurationMS != exited.DurationMS {
+				t.Fatalf("delayed collection changed duration: exited=%+v collected=%+v, %v", exited, collected, err)
+			}
+		})
+	}
+}
+
+func TestRunningProcessDurationAdvances(t *testing.T) {
+	entry := &session{
+		stdout: newStreamBuffer(100), stderr: newStreamBuffer(100),
+		started: time.Now(), done: make(chan struct{}), exitCode: -1,
+	}
+	first := entry.result(true)
+	time.Sleep(25 * time.Millisecond)
+	second := entry.result(true)
+	if !first.Running || !second.Running || second.DurationMS <= first.DurationMS {
+		t.Fatalf("running elapsed did not advance: first=%+v second=%+v", first, second)
+	}
+}
+
+type blockedCloseControl struct {
+	closing chan struct{}
+	resume  chan struct{}
+}
+
+func (*blockedCloseControl) Kill() error { return nil }
+
+func (c *blockedCloseControl) Close() error {
+	close(c.closing)
+	<-c.resume
+	return nil
+}
+
+func TestProcessDurationExcludesCleanup(t *testing.T) {
+	control := &blockedCloseControl{closing: make(chan struct{}), resume: make(chan struct{})}
+	entry := &session{
+		stdout: newStreamBuffer(100), stderr: newStreamBuffer(100),
+		started: time.Now().Add(-time.Second), done: make(chan struct{}), exitCode: -1,
+		waitProcess: func() error { return nil }, control: control,
+	}
+	go entry.wait()
+	t.Cleanup(func() {
+		close(control.resume)
+		select {
+		case <-entry.done:
+		case <-time.After(time.Second):
+			t.Error("cleanup did not finish")
+		}
+	})
+	select {
+	case <-control.closing:
+	case <-time.After(time.Second):
+		t.Fatal("process wait did not finish")
+	}
+	finished := entry.result(true)
+	time.Sleep(25 * time.Millisecond)
+	// Cleanup has not completed; concurrent calls must still return the fixed
+	// process lifetime, rather than adding time spent joining resources.
+	var calls sync.WaitGroup
+	for range 8 {
+		calls.Add(1)
+		go func() {
+			defer calls.Done()
+			result := entry.result(true)
+			if result.DurationMS != finished.DurationMS {
+				t.Errorf("cleanup changed duration: finished=%+v result=%+v", finished, result)
+			}
+		}()
+	}
+	calls.Wait()
+}
+
 func TestManagedProcessStdinAndOutputLimit(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

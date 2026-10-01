@@ -46,7 +46,7 @@ mod overlay;
 mod uia;
 use input::{check_cancel, mouse_button, move_to, press_key, send_mouse, type_text};
 
-const VERSION: &str = "10.0.0";
+const VERSION: &str = "10.0.1";
 const MAX_STATES: usize = 64;
 const MAX_ELEMENTS: usize = 500;
 

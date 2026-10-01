@@ -51,6 +51,12 @@ jobs:
         env:
           LOCAL_RUNTIME_MCP_BROWSER_E2E: '1'
         run: go test ./internal/browser -run TestEdgeExtensionEndToEnd -count=3 -v
+      - if: runner.os == 'Windows'
+        name: Verify idle extension lifetime and reconnect
+        shell: pwsh
+        env:
+          LOCAL_RUNTIME_MCP_BROWSER_E2E: '1'
+        run: go test ./internal/browser -run 'TestEdgeExtension(IdleLifecycle|ReconnectLifecycle)' -count=2 -timeout=12m -v
       - if: runner.os == 'Linux'
         run: go test -race ./...
       - run: go vet ./...

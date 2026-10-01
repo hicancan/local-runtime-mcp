@@ -72,6 +72,12 @@ jobs:
         env:
           LOCAL_RUNTIME_MCP_BROWSER_E2E: '1'
         run: go test ./internal/browser -run TestEdgeExtensionEndToEnd -count=3 -v
+      - if: runner.os == 'Windows'
+        name: Verify idle extension lifetime and reconnect
+        shell: pwsh
+        env:
+          LOCAL_RUNTIME_MCP_BROWSER_E2E: '1'
+        run: go test ./internal/browser -run 'TestEdgeExtension(IdleLifecycle|ReconnectLifecycle)' -count=2 -timeout=12m -v
       - name: Build
         shell: pwsh
         env:
@@ -92,6 +98,7 @@ jobs:
           Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/cloudflare/cloudflared/2026.9.1/LICENSE' -OutFile "dist/$name/cloudflared-LICENSE"
           Copy-Item README.md,README.zh-CN.md,SECURITY.md,PRIVACY.md,config.example.yaml,LICENSE,THIRD_PARTY_NOTICES.md "dist/$name/"
           Copy-Item -LiteralPath licenses -Destination "dist/$name/licenses" -Recurse
+          Copy-Item -LiteralPath docs -Destination "dist/$name/docs" -Recurse
           if ("${{ matrix.goos }}" -eq 'windows') {
             Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
           }

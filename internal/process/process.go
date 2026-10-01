@@ -108,6 +108,7 @@ type session struct {
 	done        chan struct{}
 
 	mu             sync.Mutex
+	finished       time.Time
 	exitCode       int
 	timedOut       bool
 	stdinDone      bool
@@ -165,7 +166,7 @@ func (m *Manager) Run(callContext context.Context, options Options) (Result, err
 
 	entry := &session{
 		id: newSessionID(), program: options.Program, args: append([]string(nil), options.Args...), directory: filepath.Clean(directory),
-		stdout: newStreamBuffer(outputLimit), stderr: newStreamBuffer(outputLimit), started: time.Now(), done: make(chan struct{}), exitCode: -1, inputGate: make(chan struct{}, 1),
+		stdout: newStreamBuffer(outputLimit), stderr: newStreamBuffer(outputLimit), done: make(chan struct{}), exitCode: -1, inputGate: make(chan struct{}, 1),
 	}
 	mode := options.IOMode
 	if mode == "" {
@@ -192,6 +193,7 @@ func (m *Manager) Run(callContext context.Context, options Options) (Result, err
 		command := terminal.Command(program, options.Args...)
 		command.Dir, command.Env = directory, environment
 		preparePTY(command)
+		entry.started = time.Now()
 		if err := command.Start(); err != nil {
 			_ = terminal.Close()
 			return Result{}, fmt.Errorf("start PTY process: %w", err)
@@ -217,6 +219,7 @@ func (m *Manager) Run(callContext context.Context, options Options) (Result, err
 				return Result{}, fmt.Errorf("create process stdin: %w", err)
 			}
 		}
+		entry.started = time.Now()
 		entry.control, err = startManaged(command)
 		if err != nil {
 			if entry.stdin != nil {
@@ -426,6 +429,9 @@ func (m *Manager) closeAll() {
 func (s *session) wait() {
 	err := s.waitProcess()
 	s.mu.Lock()
+	// Freeze the process lifetime before terminal/output cleanup and delayed
+	// client collection. While the process is alive, result reports elapsed time.
+	s.finished = time.Now()
 	if err == nil {
 		s.exitCode = 0
 	} else {
@@ -557,11 +563,15 @@ func (s *session) result(running bool) Result {
 	stderr, stderrTruncated := s.stderr.Drain()
 	s.mu.Lock()
 	exitCode, timedOut := s.exitCode, s.timedOut
+	finished := s.finished
+	if finished.IsZero() {
+		finished = time.Now()
+	}
 	s.mu.Unlock()
 	result := Result{
 		Running: running, Program: s.program, Args: append([]string(nil), s.args...), Directory: s.directory,
 		ExitCode: exitCode, Stdout: stdout, Stderr: stderr, StdoutTruncated: stdoutTruncated,
-		StderrTruncated: stderrTruncated, DurationMS: time.Since(s.started).Milliseconds(), TimedOut: timedOut, IOMode: s.ioMode,
+		StderrTruncated: stderrTruncated, DurationMS: finished.Sub(s.started).Milliseconds(), TimedOut: timedOut, IOMode: s.ioMode,
 	}
 	if running {
 		result.SessionID = s.id

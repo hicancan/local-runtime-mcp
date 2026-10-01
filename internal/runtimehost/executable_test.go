@@ -80,6 +80,34 @@ func TestExecutableStdio(t *testing.T) {
 	if version.Running || version.ExitCode != 0 || strings.TrimSpace(version.Stdout) != "lrmcp "+mcpserver.Version {
 		t.Fatalf("version process: %+v", version)
 	}
+	// Exercise duration through the actual installed binary without requiring
+	// a platform shell. Delay collection after the helper reports completion.
+	if err := os.WriteFile(filepath.Join(command.Dir, "release"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	requested := time.Now()
+	var runningHelper runtimeprocess.Result
+	call("process_run", map[string]any{
+		"program": os.Args[0], "args": []string{"-test.run=^TestRuntimeProcessHelper$", "--", "release", command.Dir},
+		"environment":   map[string]string{"LOCAL_RUNTIME_MCP_RUNTIME_PROCESS_HELPER": "1", "GORACE": "atexit_sleep_ms=0"},
+		"yield_time_ms": 1, "timeout_seconds": 10,
+	}, &runningHelper)
+	if !runningHelper.Running || runningHelper.SessionID == "" {
+		t.Fatalf("expected persistent helper process: %+v", runningHelper)
+	}
+	var helperTiming processHelperTiming
+	waitForProcessHelperFile(t, ctx, filepath.Join(command.Dir, "release.done"), &helperTiming)
+	time.Sleep(2 * time.Second)
+	var collectedHelper runtimeprocess.Result
+	call("process_continue", map[string]any{"session_id": runningHelper.SessionID, "yield_time_ms": 1000}, &collectedHelper)
+	upperBound := time.Unix(0, helperTiming.FinishedNS).Sub(requested).Milliseconds() + 1000
+	if collectedHelper.Running || collectedHelper.ExitCode != 0 || collectedHelper.DurationMS > upperBound {
+		t.Fatalf("executable duration includes collection delay: result=%+v upper_bound=%dms", collectedHelper, upperBound)
+	}
+	output := strings.ReplaceAll(runningHelper.Stdout+collectedHelper.Stdout, "\r\n", "\n")
+	if output != "release tick=1\nrelease tick=2\nrelease tick=3\n" || collectedHelper.Stderr != "" {
+		t.Fatalf("executable helper output: stdout=%q stderr=%q", output, collectedHelper.Stderr)
+	}
 	path := filepath.Join(command.Dir, "release.txt")
 	var written filesystem.TextWriteResult
 	call("filesystem_write_text", map[string]any{"path": path, "mode": "create", "content": "release smoke\n"}, &written)

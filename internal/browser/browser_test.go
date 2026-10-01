@@ -12,11 +12,23 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/net/websocket"
 )
 
 const testToken = "0123456789abcdef0123456789abcdef"
+
+type testConnectionKey struct {
+	bridge   *Bridge
+	id, boot string
+}
+
+var testConnections sync.Map
+
+const testOrigin = "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 func testBridge(t *testing.T) (*Bridge, context.Context) {
 	t.Helper()
@@ -40,27 +52,31 @@ func peer(id, boot string) Peer {
 }
 func register(t *testing.T, b *Bridge, p Peer) {
 	t.Helper()
-	r, err := postBridge(context.Background(), b, "hello", p)
+	r, err := websocket.Dial("ws://"+b.Status().Address+"/v1/connect", "", testOrigin)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Body.Close()
-	if r.StatusCode != 204 {
-		body, _ := io.ReadAll(r.Body)
-		t.Fatalf("hello %d: %s", r.StatusCode, body)
+	t.Cleanup(func() { _ = r.Close() })
+	if err := websocket.JSON.Send(r, connectionMessage{Type: "authenticate", Token: testToken, Peer: p}); err != nil {
+		t.Fatal(err)
 	}
+	var ready connectionMessage
+	if err := websocket.JSON.Receive(r, &ready); err != nil || ready.Type != "ready" {
+		t.Fatalf("authentication: %+v %v", ready, err)
+	}
+	testConnections.Store(testConnectionKey{b, p.InstanceID, p.BootID}, r)
+	t.Cleanup(func() { testConnections.Delete(testConnectionKey{b, p.InstanceID, p.BootID}) })
 }
 func pollCommand(t *testing.T, b *Bridge, p Peer) command {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	r, err := postBridge(ctx, b, "poll", p)
-	if err != nil {
-		t.Fatal(err)
+	value, ok := testConnections.Load(testConnectionKey{b, p.InstanceID, p.BootID})
+	if !ok {
+		t.Fatal("unregistered test connection")
 	}
-	defer r.Body.Close()
+	r := value.(*websocket.Conn)
+	_ = r.SetReadDeadline(time.Now().Add(time.Second))
 	var c command
-	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
+	if err := websocket.JSON.Receive(r, &c); err != nil {
 		t.Fatal(err)
 	}
 	return c
@@ -145,26 +161,28 @@ func TestBridgeRestartInvalidatesHandlesAndPending(t *testing.T) {
 		t.Fatal("old handle routable")
 	}
 }
-func TestBridgeQueuedCancellationNeverDispatches(t *testing.T) {
+func TestBridgeExpiredQueueEntriesNeverDispatch(t *testing.T) {
 	b, _ := testBridge(t)
 	a := peer("profile", "boot")
 	register(t, b, a)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	if _, err := b.Tabs(ctx, a.InstanceID); err == nil {
-		t.Fatal("not canceled")
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	b.mu.Lock()
+	b.pending["expired"] = &pendingCall{browserID: a.InstanceID, bootID: a.BootID, ctx: canceled, cancel: cancel}
+	current := b.instances[a.InstanceID]
+	b.mu.Unlock()
+	current.commands <- command{ID: "expired", BootID: a.BootID, Deadline: time.Now().Add(-time.Second).UnixMilli(), Method: "tabs.list"}
+	socketValue, _ := testConnections.Load(testConnectionKey{b, a.InstanceID, a.BootID})
+	socket := socketValue.(*websocket.Conn)
+	_ = socket.SetReadDeadline(time.Now().Add(40 * time.Millisecond))
+	var value command
+	if websocket.JSON.Receive(socket, &value) == nil {
+		t.Fatalf("expired command dispatched: %+v", value)
 	}
 	b.mu.Lock()
-	pending := len(b.pending)
-	b.mu.Unlock()
-	if pending != 0 {
-		t.Fatal("canceled request pending")
-	}
-	ctx2, stop := context.WithTimeout(context.Background(), 30*time.Millisecond)
-	defer stop()
-	if r, err := postBridge(ctx2, b, "poll", a); err == nil {
-		r.Body.Close()
-		t.Fatal("canceled command dispatched")
+	defer b.mu.Unlock()
+	if len(b.pending) != 0 {
+		t.Fatal("expired queue entry was not removed")
 	}
 }
 func TestDesktopReservationHeldUntilExecutionAcknowledgement(t *testing.T) {
@@ -212,33 +230,45 @@ func TestDesktopReservationHeldUntilExecutionAcknowledgement(t *testing.T) {
 }
 func TestBridgeRejectsMissingTokenAndOldExtension(t *testing.T) {
 	b, _ := testBridge(t)
-	r, err := http.Post("http://"+b.Status().Address+"/v1/hello", "application/json", strings.NewReader(`{}`))
-	if err != nil {
-		t.Fatal(err)
+	for _, test := range []struct {
+		name, token string
+		p           Peer
+		want        string
+	}{
+		{"missing", "", peer("missing", "boot"), "unauthorized"},
+		{"wrong", "incorrect credential", peer("wrong", "boot"), "unauthorized"},
+		{"old", testToken, Peer{InstanceID: "old", BootID: "boot", ExtensionVersion: "3.0.0"}, "version"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			socket, err := websocket.Dial("ws://"+b.Status().Address+"/v1/connect", "", testOrigin)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer socket.Close()
+			if err := websocket.JSON.Send(socket, connectionMessage{Type: "authenticate", Token: test.token, Peer: test.p}); err != nil {
+				t.Fatal(err)
+			}
+			var response connectionMessage
+			if err := websocket.JSON.Receive(socket, &response); err != nil || response.Type != "error" || !strings.Contains(response.Error, test.want) {
+				t.Fatalf("response=%+v error=%v", response, err)
+			}
+		})
 	}
-	r.Body.Close()
-	if r.StatusCode != 401 {
-		t.Fatal(r.StatusCode)
+	for _, origin := range []string{"https://example.com", "http://" + b.Status().Address, "chrome-extension://invalid"} {
+		if socket, err := websocket.Dial("ws://"+b.Status().Address+"/v1/connect", "", origin); err == nil {
+			socket.Close()
+			t.Fatalf("accepted origin %s", origin)
+		}
 	}
-	request, _ := http.NewRequest(http.MethodPost, "http://"+b.Status().Address+"/v1/hello", strings.NewReader(`{}`))
-	request.Header.Set("Authorization", testToken)
-	r, err = http.DefaultClient.Do(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r.Body.Close()
-	if r.StatusCode != 401 {
-		t.Fatal("accepted a token without Bearer prefix")
-	}
-	p := peer("old", "boot")
-	p.ExtensionVersion = "3.0.0"
-	r, err = postBridge(context.Background(), b, "hello", p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r.Body.Close()
-	if r.StatusCode != 426 {
-		t.Fatal(r.StatusCode)
+	for _, path := range []string{"hello", "poll", "heartbeat"} {
+		r, err := postBridge(context.Background(), b, path, peer("legacy", "boot"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Body.Close()
+		if r.StatusCode != 404 {
+			t.Fatalf("legacy route %s was retained: %d", path, r.StatusCode)
+		}
 	}
 }
 
@@ -328,7 +358,7 @@ func TestExtensionJavaScriptSyntax(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"service_worker.js", "scheduler.js", "options.js"} {
+	for _, name := range []string{"service_worker.js", "connection.js", "scheduler.js", "options.js"} {
 		if out, err := exec.Command(node, "--check", filepath.Join(dir, name)).CombinedOutput(); err != nil {
 			t.Fatalf("%s %v\n%s", name, err, out)
 		}

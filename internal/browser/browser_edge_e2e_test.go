@@ -20,6 +20,111 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// Observe the bridge only: tab queries, snapshots and DevTools would wake or
+// retain the MV3 worker and conceal a transport lifecycle regression.
+func TestEdgeExtensionIdleLifecycle(t *testing.T) {
+	if os.Getenv("LOCAL_RUNTIME_MCP_BROWSER_E2E") != "1" {
+		t.Skip("set LOCAL_RUNTIME_MCP_BROWSER_E2E=1 to launch isolated Edge")
+	}
+	edge := findEdge()
+	if edge == "" {
+		t.Skip("Microsoft Edge was not found")
+	}
+	bridge, _ := testBridge(t)
+	extension, err := InstallExtension(filepath.Join(t.TempDir(), "extension"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ConfigureExtension(extension, bridge.Status().Address, testToken); err != nil {
+		t.Fatal(err)
+	}
+	launchIsolatedEdge(t, edge, extension, "about:blank")
+	deadline := time.Now().Add(20 * time.Second)
+	for !bridge.Status().Connected && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	initial := bridge.Status()
+	if !initial.Connected || len(initial.Instances) != 1 {
+		t.Fatalf("isolated extension did not connect: %+v", initial)
+	}
+	id := initial.Instances[0].BrowserID
+	started := time.Now()
+	for time.Since(started) < 95*time.Second {
+		time.Sleep(time.Second)
+		status := bridge.Status()
+		if !status.Connected || len(status.Instances) != 1 || status.Instances[0].BrowserID != id {
+			t.Fatalf("idle bridge lost its profile after %s; initial=%+v current=%+v", time.Since(started), initial, status)
+		}
+	}
+	final := bridge.Status()
+	if !final.Instances[0].LastSeen.After(initial.Instances[0].LastSeen.Add(60 * time.Second)) {
+		t.Fatalf("idle profile did not exchange fresh keepalives: initial=%+v final=%+v", initial, final)
+	}
+	t.Logf("idle-only observation held profile online for %s: %+v", time.Since(started), final)
+}
+
+func TestEdgeExtensionReconnectLifecycle(t *testing.T) {
+	if os.Getenv("LOCAL_RUNTIME_MCP_BROWSER_E2E") != "1" {
+		t.Skip("set LOCAL_RUNTIME_MCP_BROWSER_E2E=1 to launch isolated Edge")
+	}
+	edge := findEdge()
+	if edge == "" {
+		t.Skip("Microsoft Edge was not found")
+	}
+	bridge, _ := testBridge(t)
+	address := bridge.Status().Address
+	extension, err := InstallExtension(filepath.Join(t.TempDir(), "extension"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ConfigureExtension(extension, address, testToken); err != nil {
+		t.Fatal(err)
+	}
+	launchIsolatedEdge(t, edge, extension, "https://example.invalid/")
+	waitConnected := func(b *Bridge) Status {
+		deadline := time.Now().Add(45 * time.Second)
+		for !b.Status().Connected && time.Now().Before(deadline) {
+			time.Sleep(100 * time.Millisecond)
+		}
+		status := b.Status()
+		if !status.Connected || len(status.Instances) != 1 {
+			t.Fatalf("profile did not reconnect: %+v", status)
+		}
+		return status
+	}
+	initial := waitConnected(bridge)
+	tabs, err := bridge.Tabs(context.Background(), initial.Instances[0].BrowserID)
+	if err != nil || len(tabs) == 0 {
+		t.Fatalf("initial tabs=%+v error=%v", tabs, err)
+	}
+	if err := bridge.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Leave the host absent beyond MV3's idle limit. Do not query any extension
+	// API or retain a debugger while the reconnect alarm must recover it.
+	time.Sleep(45 * time.Second)
+	restarted, err := Start(context.Background(), config.Browser{Listen: address, Token: testToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.Close(context.Background()) })
+	final := waitConnected(restarted)
+	if final.Instances[0].BrowserID != initial.Instances[0].BrowserID {
+		t.Fatal("stable profile identity changed after host restart")
+	}
+	if _, err := restarted.route(tabs[0].ID); err == nil {
+		t.Fatal("restarted host accepted an old route")
+	}
+	fresh, err := restarted.Tabs(context.Background(), final.Instances[0].BrowserID)
+	if err != nil || len(fresh) == 0 {
+		t.Fatalf("fresh tabs=%+v error=%v", fresh, err)
+	}
+	if fresh[0].ID == tabs[0].ID {
+		t.Fatal("reconnected extension reused an invalidated handle")
+	}
+	t.Logf("profile %s recovered after a 45-second host outage with new handles", final.Instances[0].BrowserID)
+}
+
 // TestEdgeExtensionEndToEnd is opt-in because it launches a real isolated Edge
 // profile. It exercises the packaged MV3 extension, CDP, page projection,
 // observation epochs, native screenshots, actions, and navigation as one path.

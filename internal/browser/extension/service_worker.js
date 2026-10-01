@@ -1,6 +1,7 @@
 import { packagedConfig } from './runtime_config.js';
 import { LaneScheduler } from './scheduler.js';
-const VERSION = '10.0.0';
+import { commandStream } from './connection.js';
+const VERSION = '10.0.1';
 const attachedTabs = new Set();
 const childSessions = new Map();
 const dialogWaiters = new Map();
@@ -15,7 +16,8 @@ const operationObservations = new Map();
 const executionSignals = new Map();
 const openingTabs = new Set();
 const scheduler = new LaneScheduler();
-let pollAbort = new AbortController();
+let connectionAbort = new AbortController();
+let running = false;
 let lastBridgeId = '';
 const resultOutbox = new Map();
 let outboxBytes = 0;
@@ -107,14 +109,14 @@ async function sendCDPAllowDialog(source, method, params) {
 }
 chrome.runtime.onMessage.addListener((message) => {
     if (message?.type === 'settings-changed') {
-        pollAbort.abort();
+        connectionAbort.abort();
         scheduler.cancelAll();
         bootId = crypto.randomUUID();
         tabHandles.clear();
         nativeTabs.clear();
         pageStates.clear();
-        pollAbort = new AbortController();
-        run(++generation);
+        connectionAbort = new AbortController();
+        void run(++generation);
     }
 });
 chrome.debugger.onDetach.addListener((source) => {
@@ -166,68 +168,57 @@ chrome.tabs.onUpdated.addListener((tabId, change) => {
     if (change.status === 'loading' || change.url)
         invalidateDocument(tabId);
 });
-run(++generation);
+// An alarm wakes an offline worker to reconnect after the host becomes
+// available. Healthy connections are kept alive by actual WebSocket traffic.
+chrome.alarms.onAlarm.addListener(alarm => {
+    if (alarm.name === 'bridge-reconnect' && !running)
+        void run(++generation);
+});
+void chrome.alarms.create('bridge-reconnect', { periodInMinutes: 0.5 });
+void run(++generation);
 async function run(currentGeneration) {
-    const currentBoot = bootId;
-    const abort = pollAbort;
-    while (currentGeneration === generation) {
-        const settings = await chrome.storage.local.get({
-            address: packagedConfig.address || '127.0.0.1:9315',
-            token: packagedConfig.token || '',
-            instanceId: '', label: ''
-        });
-        if (!settings.instanceId) {
-            settings.instanceId = crypto.randomUUID();
-            await chrome.storage.local.set({ instanceId: settings.instanceId });
-        }
-        if (!settings.token || settings.token.length < 32) {
-            await delay(2000);
-            continue;
-        }
-        const base = `http://${settings.address}/v1`;
-        const headers = { Authorization: `Bearer ${settings.token}`, 'Content-Type': 'application/json' };
-        const peer = { instance_id: settings.instanceId, boot_id: currentBoot, label: settings.label || 'Browser profile', browser: navigator.userAgent, extension_version: VERSION };
-        if (currentGeneration !== generation)
-            return;
-        const connection = new AbortController();
-        const stopConnection = () => connection.abort();
-        abort.signal.addEventListener('abort', stopConnection, { once: true });
-        try {
-            const hello = await fetch(`${base}/hello`, { method: 'POST', headers, body: JSON.stringify(peer), signal: connection.signal });
-            if (!hello.ok)
-                throw new Error(`registration returned HTTP ${hello.status}`);
-            const bridgeId = hello.headers.get('X-LRMCP-Bridge-ID') || '';
-            if (lastBridgeId && bridgeId !== lastBridgeId) {
-                scheduler.cancelAll();
-                pageStates.clear();
-                operationObservations.clear();
-                tabHandles.clear();
-                nativeTabs.clear();
+    const abort = connectionAbort;
+    running = true;
+    let failures = 0;
+    try {
+        while (currentGeneration === generation) {
+            const currentBoot = bootId;
+            const settings = await chrome.storage.local.get({
+                address: packagedConfig.address || '127.0.0.1:9315',
+                token: packagedConfig.token || '',
+                instanceId: '', label: ''
+            });
+            if (!settings.instanceId) {
+                settings.instanceId = crypto.randomUUID();
+                await chrome.storage.local.set({ instanceId: settings.instanceId });
             }
-            lastBridgeId = bridgeId;
-            void flushResults();
-            const heartbeat = setInterval(() => {
-                fetch(`${base}/heartbeat`, { method: 'POST', headers, body: JSON.stringify(peer), signal: connection.signal }).then(response => {
-                    if (response.status === 409)
-                        connection.abort();
-                }).catch(() => { });
-            }, 10000);
+            if (!settings.token || settings.token.length < 32) {
+                return;
+            }
+            const base = `http://${settings.address}/v1`;
+            const headers = { Authorization: `Bearer ${settings.token}`, 'Content-Type': 'application/json' };
+            const peer = { instance_id: settings.instanceId, boot_id: currentBoot, label: settings.label || 'Browser profile', browser: navigator.userAgent, extension_version: VERSION };
+            if (currentGeneration !== generation)
+                return;
             try {
-                while (currentGeneration === generation) {
-                    const response = await fetch(`${base}/poll`, { method: 'POST', headers, body: JSON.stringify(peer), signal: connection.signal });
+                await commandStream(settings.address, settings.token, peer, abort.signal, bridgeId => {
+                    failures = 0;
+                    if (lastBridgeId && bridgeId !== lastBridgeId) {
+                        scheduler.cancelAll();
+                        pageStates.clear();
+                        operationObservations.clear();
+                        tabHandles.clear();
+                        nativeTabs.clear();
+                    }
+                    lastBridgeId = bridgeId;
+                    void flushResults();
+                }, command => {
                     if (currentGeneration !== generation)
                         return;
-                    if (response.status === 204)
-                        continue;
-                    if (!response.ok)
-                        throw new Error(`bridge returned HTTP ${response.status}`);
-                    const command = await response.json();
-                    if (command.boot_id !== currentBoot)
-                        throw new Error('command generation is stale');
                     if (command.method === 'cancel') {
                         if (!scheduler.cancel(command.id))
                             deliverResult(base, headers, { id: command.id, ...peer, error: 'operation is no longer executing; canceled outcome may be unknown' });
-                        continue;
+                        return;
                     }
                     const params = command.params || {};
                     let native;
@@ -236,7 +227,7 @@ async function run(currentGeneration) {
                     }
                     catch (error) {
                         deliverResult(base, headers, { id: command.id, ...peer, error: error?.message || String(error) });
-                        continue;
+                        return;
                     }
                     const lane = native === undefined ? command.method : openingTabs.has(native) ? 'tabs.open' : `tab:${native}`;
                     // Intake continues while execution runs. Waiting lanes consume no active slot.
@@ -269,21 +260,34 @@ async function run(currentGeneration) {
                         }
                     }).then(result => ({ id: command.id, ...peer, result }), error => ({ id: command.id, ...peer, error: error?.message || String(error) }))
                         .then(payload => deliverResult(base, headers, payload)).catch(() => { });
-                }
+                });
+            }
+            catch (error) {
+                failures++;
+                // Connection diagnostics contain no credential, page content or result.
+                console.warn('Local Runtime MCP bridge disconnected:', error instanceof Error ? error.message : 'connection error');
             }
             finally {
-                clearInterval(heartbeat);
-                if (currentGeneration === generation)
+                if (currentGeneration === generation) {
                     scheduler.cancelAll();
+                    pageStates.clear();
+                    operationObservations.clear();
+                    tabHandles.clear();
+                    nativeTabs.clear();
+                }
             }
+            // One immediate retry repairs a transient loss. If the host remains absent,
+            // return and let the alarm wake an idle worker rather than calling storage
+            // or opening sockets forever in a one-second loop.
+            if (failures >= 2)
+                return;
+            if (currentGeneration === generation)
+                await delay(1000);
         }
-        catch {
-            await delay(1000);
-        }
-        finally {
-            connection.abort();
-            abort.signal.removeEventListener('abort', stopConnection);
-        }
+    }
+    finally {
+        if (currentGeneration === generation)
+            running = false;
     }
 }
 async function affectsVisiblePage(method, params, tabId) {

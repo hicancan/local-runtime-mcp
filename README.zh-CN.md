@@ -141,6 +141,8 @@ pipe 和 PTY 都使用合并后的子进程 `PATH` 查找程序，Windows 还使
 
 不同会话并行运行。同一会话的输入按序写入，一次结果同时消费 stdout 与 stderr。等待输出不会阻塞终止路径，stdin 写入堵塞时也能终止。输出和输入等待有容量上限，单次 stdin 最大为 16 MiB。
 
+`duration_ms` 在进程运行期间表示已运行时长，退出后固定为实际进程生命周期。稍后再采集完成结果时，这个时长保持不变。
+
 `process_run` 交付运行中会话之前被取消，会终止并回收该进程。取消 `process_continue` 只结束本次等待；结束会话使用 `terminate=true`。进程执行期限与 Host 退出独立于单次 MCP 请求期限。
 
 ### Filesystem · 6 个工具
@@ -239,8 +241,10 @@ Rust 引擎统一负责 Windows 捕获、窗口身份、DPI 坐标、UIA 引用�
 flowchart TB
     Tools[Browser 工具] --> Registry[实例注册表 + 标签页路由]
     Registry --> Bridge[带认证的 loopback Bridge]
-    Bridge --> Edge[Edge Profile 扩展]
-    Bridge --> Chrome[Chrome Profile 扩展]
+    Bridge <-->|WebSocket · 命令 + 心跳| Edge[Edge Profile 扩展]
+    Bridge <-->|WebSocket · 命令 + 心跳| Chrome[Chrome Profile 扩展]
+    Edge -->|HTTP · 结果 + 授权| Bridge
+    Chrome -->|HTTP · 结果 + 授权| Bridge
     Chrome --> Intake[命令接收]
     Intake --> Queue[有界标签页 FIFO 调度]
     Queue --> TabA[标签页 A · CDP Frame]
@@ -250,6 +254,8 @@ flowchart TB
 ```
 
 在每个用于 AI 操作的 Chromium Profile 中加载同一套 MV3 扩展，在扩展选项中填写容易识别的名称，例如 `Edge · 工作`、`Chrome · 研究`。扩展在该 Profile 中保存稳定 UUID，用 Bridge token 连接共享运行时。`chrome.debugger` 将 CDP 操作发送到明确的标签页和 Frame。
+
+每个 Profile 通过一条带认证的 loopback WebSocket 接收命令，每 20 秒交换一次心跳；浏览器 alarm 负责恢复中断的连接。结果回传和桌面操作授权通过同一 Bridge 的认证 HTTP 完成。浏览器任务空闲时连接仍保持活跃，遵循 Chromium 的[扩展 Worker WebSocket 生命周期](https://developer.chrome.com/docs/extensions/how-to/web-platform/websockets)。
 
 | 工具 | 目标与操作 |
 | --- | --- |
@@ -284,6 +290,8 @@ flowchart TB
 
 请求取消、进程执行期限和 Host 退出分别处理。一个失败或到期调用保留其他资源。动作可能已经产生副作用时，先观察目标，再决定是否重试非幂等操作。
 
+[双会话验收提示词](docs/concurrency-acceptance.zh-CN.md)可以通过已配置的 ChatGPT 连接验证空闲浏览器连接、独立进程输出、明确的 Profile 路由与桌面控制权。
+
 ## 安装
 
 从 [Releases](https://github.com/hicancan/local-runtime-mcp/releases/latest) 下载平台压缩包，校验公布的 SHA-256，解压到独立目录。
@@ -293,7 +301,7 @@ flowchart TB
 | Windows amd64 | 支持 | Chromium 扩展 | Windows 原生引擎 |
 | Linux / macOS | 支持 | 桌面浏览器中的 Chromium 扩展 | 返回平台不可用 |
 
-Browser 需要正在运行并加载扩展的 Chromium Profile。Windows Computer 需要 Windows 10 2004 或更新版本（包括 Windows 11）、交互桌面，以及适合目标应用的账户权限。
+Browser 需要 Chromium 120 或更新版本，以及正在运行并加载扩展的 Profile。Windows Computer 需要 Windows 10 2004 或更新版本（包括 Windows 11）、交互桌面，以及适合目标应用的账户权限。
 
 Windows 发布包包含：
 
@@ -420,11 +428,11 @@ go vet ./...
 go build ./cmd/lrmcp
 ```
 
-Go 测试覆盖资源生命周期、响应归属、取消、文件竞争提交、进程 I/O 和浏览器身份路由。扩展调度测试覆盖顺序、公平性、取消和队列上限。Windows 可选 Chromium 验收会在临时 Profile 中加载真实扩展：
+Go 测试覆盖资源生命周期、响应归属、取消、文件竞争提交、进程 I/O 和浏览器身份路由。扩展调度测试覆盖顺序、公平性、取消和队列上限。Windows 可选 Chromium 验收会在临时 Profile 中加载真实扩展，覆盖空闲连接与页面操作：
 
 ```powershell
 $env:LOCAL_RUNTIME_MCP_BROWSER_E2E = '1'
-go test ./internal/browser -run TestEdgeExtensionEndToEnd -count=3 -v
+go test ./internal/browser -run 'TestEdgeExtension(IdleLifecycle|EndToEnd)' -count=3 -v
 ```
 
 CI 覆盖 Windows、Linux 和 macOS。本地协议与浏览器测试验证对应执行链路；真实 ChatGPT 多会话验收针对已配置的客户端和 Tunnel 单独进行。

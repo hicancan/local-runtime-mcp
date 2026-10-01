@@ -23,7 +23,7 @@ Process-launched programs and browser pages may independently read, write, or tr
 - **OpenAI Tunnel:** OpenAI tunnel infrastructure, the official HTTP forwarding client, and a private loopback MCP endpoint created for this runtime invocation.
 - **Cloudflare Tunnel:** Cloudflare infrastructure and the official `cloudflared` companion forwarding authenticated MCP HTTP traffic to loopback.
 
-Browser extensions connect to the configured loopback bridge. The bridge routes each request to its selected profile instance and tab. Page results travel through the active MCP connection like other tool results.
+Browser extensions connect to the configured loopback bridge using an authenticated WebSocket for commands and periodic keepalive messages, and authenticated HTTP for results and desktop-operation authorization. The bridge routes each request to its selected profile instance and tab. Page results travel through the active MCP connection like other tool results.
 
 External MCP clients and tunnel providers may process request content and connection metadata under their own terms and privacy policies. Their histories, logs, retention, and account data are governed by those services and the operator's configuration.
 
