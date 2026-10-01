@@ -55,6 +55,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: '1.96.0'
+          components: rustfmt, clippy
       - if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/build-native.ps1
