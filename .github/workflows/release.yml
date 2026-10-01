@@ -48,13 +48,25 @@ jobs:
         run: npm ci
       - working-directory: browser-extension
         run: npm run build
+      - working-directory: browser-extension
+        run: npm test
       - run: git diff --exit-code -- internal/browser/extension
       - if: runner.os == 'Windows'
         uses: dtolnay/rust-toolchain@stable
       - if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/build-native.ps1
+      - if: runner.os == 'Windows'
+        run: cargo fmt --manifest-path native/computer-windows/Cargo.toml --check
+      - if: runner.os == 'Windows'
+        run: cargo clippy --manifest-path native/computer-windows/Cargo.toml --all-targets -- -D warnings
       - run: go test ./...
+      - run: go vet ./...
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          LOCAL_RUNTIME_MCP_BROWSER_E2E: '1'
+        run: go test ./internal/browser -run TestEdgeExtensionEndToEnd -count=3 -v
       - name: Build
         shell: pwsh
         env:
@@ -65,9 +77,16 @@ jobs:
           $name = "local-runtime-mcp_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}"
           New-Item -ItemType Directory -Path "dist/$name" -Force | Out-Null
           go build -trimpath -ldflags "-s -w" -o "dist/$name/${{ matrix.executable }}" ./cmd/lrmcp
+          if ($LASTEXITCODE -ne 0) { throw 'release executable build failed' }
+          if ((go env GOHOSTARCH) -eq "${{ matrix.goarch }}") {
+            $env:LOCAL_RUNTIME_MCP_EXECUTABLE = (Get-Item -LiteralPath "dist/$name/${{ matrix.executable }}").FullName
+            go test ./internal/runtimehost -run TestExecutableStdio -count=2 -v
+            if ($LASTEXITCODE -ne 0) { throw 'release executable MCP smoke test failed' }
+          }
           ./scripts/fetch-cloudflared.ps1 -OperatingSystem "${{ matrix.goos }}" -Architecture "${{ matrix.goarch }}" -DestinationDirectory "dist/$name" -TemporaryDirectory (Join-Path $env:RUNNER_TEMP 'cloudflared-download')
           Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/cloudflare/cloudflared/2026.9.1/LICENSE' -OutFile "dist/$name/cloudflared-LICENSE"
           Copy-Item README.md,README.zh-CN.md,SECURITY.md,PRIVACY.md,config.example.yaml,LICENSE,THIRD_PARTY_NOTICES.md "dist/$name/"
+          Copy-Item -LiteralPath licenses -Destination "dist/$name/licenses" -Recurse
           if ("${{ matrix.goos }}" -eq 'windows') {
             Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
           }
@@ -98,4 +117,12 @@ jobs:
           path: dist
       - env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" dist/*.zip --repo "${{ github.repository }}" --verify-tag --generate-notes --title "Local Runtime MCP ${{ github.ref_name }}"
+        shell: pwsh
+        run: |
+          $checksums = Get-ChildItem -LiteralPath dist -Filter '*.zip' | Sort-Object Name | ForEach-Object {
+            "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
+          }
+          $checksums | Set-Content -LiteralPath dist/SHA256SUMS -Encoding utf8NoBOM
+          $assets = @(Get-ChildItem -LiteralPath dist -File | ForEach-Object FullName)
+          gh release create "${{ github.ref_name }}" @assets --repo "${{ github.repository }}" --verify-tag --generate-notes --title "Local Runtime MCP ${{ github.ref_name }}"
+          if ($LASTEXITCODE -ne 0) { throw 'release publication failed' }

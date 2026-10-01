@@ -7,102 +7,65 @@
 
 [English](README.md) · **简体中文**
 
-Local Runtime MCP 为 AI 客户端提供运行 `lrmcp` 的机器上的直接、原生、多模态能力。一个便携运行时通过 20 个 MCP 工具覆盖进程、文件、图像、Windows 桌面和 Chromium。
+让 AI 客户端使用运行 `lrmcp` 的机器上的程序、文件、图像、浏览器配置文件和桌面。Local Runtime MCP 是一个便携的机器访问运行时，以 **21 个 MCP 工具覆盖五个能力域**。
 
-同一套能力服务器可以通过本地 stdio、loopback Streamable HTTP、OpenAI Secure MCP Tunnel 或托管 Cloudflare Tunnel 连接。Windows 发布目录可以放在固定磁盘或移动存储设备中，可执行文件、配置、浏览器集成和隧道配套程序会随目录一起迁移。
+本地客户端可以使用 stdio 或 Streamable HTTP；远端客户端可以通过 OpenAI Secure MCP Tunnel 或 Cloudflare Tunnel 接入。不同进程会话和浏览器标签页可以并发执行，共享文件和桌面输入则按照明确的资源规则协调。
 
-## 核心特点
-
-- **五个正交能力域**：process、filesystem、image、computer、browser。
-- **一套稳定 MCP 接口**：所有连接方式共享同样的 20 个工具与状态语义。
-- **原生多模态结果**：图像、浏览器截图和桌面截图直接返回 MCP 图像内容。
-- **状态感知交互**：浏览器引用、截图和桌面观察都有版本，操作明确使用产生目标的观察结果。
-- **便携运行**：`local-runtime-mcp.yaml` 固定放在可执行文件旁边，随整个运行目录移动。
-- **按职责选择实现语言**：Go 承载 MCP 与机器服务，Rust 实现 Windows Computer 引擎，TypeScript 实现 Chromium 扩展。
+- **原生多模态结果**：文件、网页和桌面观察直接返回文本与 MCP 图像内容。
+- **明确的浏览器目标**：连接多个 Chromium Profile，选择有名称的浏览器实例，通过不透明标签页句柄操作。
+- **可见的桌面控制**：获取控制权，观察窗口，根据观察操作，最后释放控制权；蓝色提示层和本地 Stop 入口让操作清晰可见。
+- **便携配置**：将 `local-runtime-mcp.yaml`、程序和浏览器集成保存在同一目录，支持固定磁盘与移动存储。
+- **按平台职责实现**：Go 承载运行时和 MCP 适配器，Rust 实现 Windows 捕获、UI Automation 和输入，TypeScript 实现 Chromium 集成。
 
 ## 整体架构
 
-Local Runtime MCP 将两个独立问题分别建模：
-
-1. **MCP 客户端怎样到达这个运行时？**——连接平面。
-2. **运行时可以在当前机器上做什么？**——能力平面。
-
-每条命令只选择一种连接方式，然后启动同一个 Runtime Host，发布同一个 MCP Server。
+连接层负责请求怎样到达，能力层负责机器上执行什么。一个 Runtime Host 管理当前运行实例中所有客户端共享的资源。
 
 ```mermaid
 flowchart TB
-    subgraph Clients[客户端]
-		OP[操作者]
-        LOCAL[本地 MCP 客户端]
-        REMOTE[远程 AI 客户端]
-    end
-
-    subgraph Commands[命令入口]
-        CLI[lrmcp]
-        SERVE[serve]
-        TUNNEL[tunnel]
-        SETUP[setup]
-    end
-
-    subgraph Connection[连接平面]
-        STDIO[stdio 传输]
-        HTTP[Streamable HTTP 传输]
-        OAI[OpenAI Tunnel 适配器]
-        CF[Cloudflare Tunnel 适配器]
-        OAIE[OpenAI 边缘服务]
-        CFE[Cloudflare 边缘服务]
-        CFD[cloudflared 配套程序]
-        MEMORY[内存 MCP 传输]
-    end
-
-    subgraph Runtime[运行时平面]
-        CFG[类型化配置]
-        HOST[Runtime Host]
-        MCP[MCP Server · 20 个工具]
-    end
-
-    subgraph Capabilities[能力平面]
-        P[Process]
-        F[Filesystem]
-        I[Image]
-        C[Computer]
-        B[Browser]
-    end
-
-    OP --> CLI
-    CLI --> SERVE
-    CLI --> TUNNEL
-    CLI --> SETUP
-
-    SERVE --> STDIO
-    SERVE --> HTTP
-    TUNNEL --> OAI
-    TUNNEL --> CF
-    OAI --> MEMORY
-    CF --> CFD
-    CFD --> HTTP
-	REMOTE --> OAIE
-	OAIE --> OAI
-	REMOTE --> CFE
-	CFE --> CFD
-	LOCAL --> STDIO
-	LOCAL --> HTTP
-
-    STDIO --> HOST
-    HTTP --> HOST
-    MEMORY --> HOST
-    CFG --> HOST
-    HOST --> MCP
-    MCP --> P
-    MCP --> F
-    MCP --> I
-    MCP --> C
-    MCP --> B
+    Operator[操作者] --> CLI[CLI + 配置]
+    CLI --> Host[Runtime Host]
+    Local[本地 MCP 客户端] --> Stdio[MCP stdio]
+    Local --> HTTP[MCP Streamable HTTP]
+    Remote[远端 AI 客户端] --> OpenAI[OpenAI Tunnel 适配器]
+    Remote --> Cloudflare[Cloudflare 适配器 + cloudflared]
+    OpenAI --> HTTP
+    Cloudflare --> HTTP
+    Stdio --> MCP[MCP 适配器 · 21 个工具]
+    HTTP --> MCP
+    MCP --> Process[Process]
+    MCP --> Files[Filesystem]
+    MCP --> Image[Image]
+    MCP --> Computer[Computer]
+    MCP --> Browser[Browser]
+    Process --> Machine[本机进程 + 文件]
+    Files --> Machine
+    Image --> Machine
+    Computer --> Native[Rust Windows 引擎]
+    Native --> Desktop[当前交互桌面]
+    Browser --> Bridge[带认证的 loopback Bridge]
+    Bridge --> Profiles[多个 Profile 的扩展]
+    Profiles --> CDP[CDP 标签页 + Frame]
+    Host -. 生命周期 .-> MCP
+    Host -. 管理 .-> Process
+    Host -. 管理 .-> Files
+    Host -. 管理 .-> Computer
+    Host -. 管理 .-> Bridge
 ```
 
-### 命令入口
+实线表示请求链路，虚线表示资源生命周期归属。文本和图像是 MCP 内容类型，由选定的传输方式一起承载。
 
-命令层级与架构语义一一对应：
+| 层 | 职责 |
+| --- | --- |
+| CLI 与配置 | 选择连接模式，一次性解析配置。 |
+| 连接适配器 | 通过 stdio、HTTP 或 Tunnel Provider 递送请求。 |
+| MCP 适配器 | 发布工具 schema、验证参数、编码结果。 |
+| 能力服务 | 定义资源身份、观察、操作与并发规则。 |
+| 平台后端 | 执行操作系统调用、Windows 原生交互和 Chromium CDP 命令。 |
+
+Host 创建 Process Manager、Filesystem Service、Browser Bridge 和 Computer Controller。退出时停止接收工作，取消待执行请求，清理受管进程与注入输入，关闭连接及配套程序。单次请求失败后，Host 和其他资源继续运行。
+
+### 命令与传输
 
 ```text
 lrmcp
@@ -118,153 +81,219 @@ lrmcp
 └── help
 ```
 
-| 命令 | MCP 链路 | 身份凭据 | 典型场景 |
-| --- | --- | --- | --- |
-| `lrmcp serve stdio` | 标准 MCP stdio | 进程环境与主机访问权限 | 本地 MCP 宿主和开发工具 |
-| `lrmcp serve http` | loopback 上的标准 MCP Streamable HTTP | 静态 Bearer token | 本地集成和反向代理源站 |
-| `lrmcp tunnel openai` | 内嵌 OpenAI Tunnel 适配器与内存 MCP 传输 | OpenAI tunnel ID 与 API key | ChatGPT 和受支持的 OpenAI 客户端 |
-| `lrmcp tunnel cloudflare` | `cloudflared` 配套程序连接 loopback Streamable HTTP | Cloudflare tunnel token 与 MCP Bearer token | 由当前机器提供服务的稳定公网域名 |
-| `lrmcp setup browser` | 释放并配置 Chromium 扩展 | 自动生成的 loopback Bridge token | 初始化 Browser 能力 |
+每次运行选择一种连接模式。七条命令路径分别负责连接启动、浏览器准备和程序信息。
 
-`serve` 选择标准 MCP 传输，`tunnel` 选择公网可达服务。OpenAI 直接使用其可嵌入的 tunnel client；Cloudflare 使用官方维护的 `cloudflared` 配套程序，并转发到 HTTP 传输。两种适配器采用各自原生的集成方式，同时共享一致的命令结构。
+| 命令 | 链路与凭据 |
+| --- | --- |
+| `lrmcp serve stdio` | 标准 MCP 进程管道，由父进程提供访问权限。 |
+| `lrmcp serve http` | loopback Streamable HTTP，使用配置的 Bearer token。 |
+| `lrmcp tunnel openai` | 官方 HTTP forwarding 连接私有 loopback MCP 端点，配置 Tunnel ID 与 API key。 |
+| `lrmcp tunnel cloudflare` | 官方 `cloudflared` 连接 loopback HTTP，配置 Cloudflare Tunnel token 与 MCP Bearer token。 |
+| `lrmcp setup browser` | 生成 Bridge 凭据，释放和配置扩展。 |
+| `lrmcp version` | 输出可执行文件版本。 |
+| `lrmcp help` | 显示命令与参数。 |
 
-### Runtime Host
+OpenAI 适配器使用动态分配的本机端口和运行时生成、保存在内存中的私有链路凭据。官方转发客户端通过标准 HTTP 连接共享 MCP Server。Cloudflare 使用配置中的 loopback 源站及官方维护的配套程序。两种 Provider 共享能力实现。
 
-Runtime Host 统一持有 Browser Bridge、Computer Controller、进程会话和 MCP Server。连接适配器负责消息到达与进程生命周期。关闭 `lrmcp` 时，选中的连接和机器运行时会一同退出。
-
-### 配置流
-
-所有入口使用同一条优先级规则，最终得到一个类型化配置对象：
+### 配置
 
 ```mermaid
 flowchart LR
-    D[内置默认值] --> Y[local-runtime-mcp.yaml]
-    Y --> E[LOCAL_RUNTIME_MCP_* 环境变量]
-    E --> A[命令行参数]
-    A --> R[最终配置]
-    R --> H[连接适配器 + Runtime Host]
+    Defaults[默认值] --> YAML[程序同目录 YAML]
+    YAML --> Environment[环境变量覆盖]
+    Environment --> Flags[命令行覆盖]
+    Flags --> Config[最终配置]
+    Config --> Connection[连接适配器]
+    Config --> Host[Runtime Host]
 ```
 
-配置路径始终为 `<lrmcp 所在目录>/local-runtime-mcp.yaml`。复制整个运行目录后，连接设置和浏览器身份也会随之迁移。
+优先级为 **命令行 > 环境变量 > YAML > 默认值**。配置固定读取 `<lrmcp 所在目录>/local-runtime-mcp.yaml`。浏览器实例身份保存在各 Profile 的扩展存储中；进程、标签页和桌面观察句柄由当前资源生命周期管理。
 
-## 能力域
+## 五个能力域
 
-### Process
+| 领域 | 工具数量 |
+| --- | ---: |
+| Process | 2 |
+| Filesystem | 6 |
+| Image | 1 |
+| Computer | 4 |
+| Browser | 8 |
+| **总计** | **21** |
+
+### Process · 2 个工具
 
 ```mermaid
-flowchart LR
-    RUN[process_run] --> START[直接启动程序]
-    START --> COMPLETE[完成结果]
-    START --> SESSION[运行中会话]
-    SESSION --> CONTINUE[process_continue]
-    CONTINUE --> STREAM[增量输出]
-    CONTINUE --> INPUT[stdin · PTY 尺寸]
-    CONTINUE --> LIFE[等待 · 终止]
+flowchart TB
+    Run[process_run] --> Resolve[使用子进程 PATH 解析程序]
+    Resolve --> Launch[直接启动 · pipe 或 PTY]
+    Launch --> Final[完成结果]
+    Launch --> Sessions[独立进程会话]
+    Sessions --> Continue[process_continue · session_id]
+    Continue --> Input[按序 stdin + PTY 尺寸]
+    Continue --> Output[协调输出消费 + 等待]
+    Continue --> Stop[独立终止路径]
 ```
 
-`process_run` 使用可执行文件和参数数组直接启动程序，支持工作目录、环境变量覆盖、初始 stdin、超时、输出上限，以及 pipe 或 PTY I/O。pipe 与 PTY 会以一致方式通过 `PATH` 解析已安装的程序名。短任务直接返回最终结果，持续任务返回 session ID。`process_continue` 用于读取增量输出、写入输入、关闭 stdin、调整 PTY、等待或终止完整进程树。
+- `process_run` 接收程序名、参数数组、工作目录、环境变量覆盖、初始 stdin、执行期限、输出上限和 pipe/PTY I/O 模式。
+- `process_continue` 读取增量输出、写入 stdin、关闭 pipe 输入、调整 PTY 尺寸、等待或终止受管会话。
 
-### Filesystem
+pipe 和 PTY 都使用合并后的子进程 `PATH` 查找程序，Windows 还使用 `PATHEXT`。显式相对程序路径以请求的工作目录为基准。需要 shell 语法时，明确启动所需 shell 并传入参数。
+
+不同会话并行运行。同一会话的输入按序写入，一次结果同时消费 stdout 与 stderr。等待输出不会阻塞终止路径，stdin 写入堵塞时也能终止。输出和输入等待有容量上限，单次 stdin 最大为 16 MiB。
+
+`process_run` 交付运行中会话之前被取消，会终止并回收该进程。取消 `process_continue` 只结束本次等待；结束会话使用 `terminate=true`。进程执行期限与 Host 退出独立于单次 MCP 请求期限。
+
+### Filesystem · 6 个工具
 
 ```mermaid
-flowchart LR
-    PATH[机器直接路径] --> DISCOVER[list · stat]
-    PATH --> OBSERVE[read · search]
-    PATH --> WRITE[原子完整写入]
-    PATH --> PATCH[带版本补丁]
-    OBSERVE --> HASH[可选 SHA-256]
-    HASH --> WRITE
-    HASH --> PATCH
+flowchart TB
+    Read[列举 · stat · 读取 · 搜索] --> Files[本机文件系统]
+    Write[创建 · 替换 · 补丁] --> Path[解析提交路径身份]
+    Path --> Lock[按路径协调提交]
+    Lock --> Version[读取并校验预期 SHA-256]
+    Version --> Build[生成完整新内容]
+    Build --> Commit[原子发布]
+    Commit --> Files
 ```
-
-Filesystem 工具接受绝对路径，也接受相对于运行时工作目录的路径。读取、搜索和目录遍历都有明确的结果上限。完整写入采用原子提交。补丁将预期 SHA-256 与唯一上下文 hunk 组合，为 Agent 编辑提供乐观并发控制，同时保留直接机器路径模型。
 
 | 工具 | 操作 |
 | --- | --- |
-| `filesystem_list` | 有界目录遍历 |
-| `filesystem_stat` | 元数据与可选 SHA-256 |
-| `filesystem_read_text` | 有界 UTF-8 行范围读取 |
-| `filesystem_search_text` | 字面文本或 Go 正则搜索 |
-| `filesystem_write_text` | 原子创建或完整替换 |
-| `filesystem_patch_text` | 原子、版本校验的上下文补丁 |
+| `filesystem_list` | 有界目录遍历。 |
+| `filesystem_stat` | 元数据与可选 SHA-256。 |
+| `filesystem_read_text` | 按行范围读取 UTF-8，设置行数与字节上限。 |
+| `filesystem_search_text` | 字面文本或 Go 正则搜索。 |
+| `filesystem_write_text` | 明确选择 `mode=create` 或 `mode=replace`。 |
+| `filesystem_patch_text` | 带版本校验、唯一上下文锚点的补丁。 |
 
-### Image
+`create` 在目标不存在时发布完整文件；`replace` 要求文件已存在，并提供 `expected_sha256`。Patch 同样要求预期 hash，所有 hunk 都基于同一个不可变原始版本定位。
 
-```mermaid
-flowchart LR
-    FILE[PNG · JPEG · GIF · WebP] --> VALIDATE[解码与校验]
-    VALIDATE --> CROP[可选裁剪]
-    CROP --> SCALE[可选等比例缩放]
-    SCALE --> RESULT[MCP 图像内容 + 元数据]
-```
+文本读取返回完整行。第一条目标行超过字节预算时返回有界错误；已经读取完整行后遇到超限则报告截断和下一行号。跳过的行使用固定内存扫描，需要 SHA-256 时通过流式读取计算整个文件的 hash。
 
-`image_read` 将机器路径转换为原生 MCP 图像内容。它会校验编码大小与像素数量，支持裁剪和等比例缩放，并随图像返回媒体类型、尺寸和源文件元数据。
+Filesystem Service 从版本校验到提交全程持有对应路径的锁。不同路径与读操作可并行。修改拒绝最终路径上的符号链接，并规范化已有父目录的别名以协调提交。
 
-### Computer
+这些锁协调本 Host 发出的文件调用。外部编辑器和被启动的程序按各自规则访问文件系统。并发编码任务可以使用不同 Git worktree，分开索引和构建输出。
+
+### Image · 1 个工具
 
 ```mermaid
 flowchart LR
-    TOOLS[computer_targets · computer_state · computer_action] --> CONTRACT[Go 契约层]
-    CONTRACT --> IPC[帧式 Worker 协议]
-    IPC --> RUST[内嵌 Rust 引擎]
-    RUST --> WGC[Windows Graphics Capture]
-    RUST --> UIA[UI Automation]
-    RUST --> INPUT[Windows 原生输入]
-    WGC --> DESKTOP[交互桌面]
-    UIA --> DESKTOP
-    INPUT --> DESKTOP
+    Read[image_read] --> Open[只打开一次源文件]
+    Open --> Bytes[限制实际读取字节]
+    Bytes --> Header[校验格式 + 像素 + 尺寸]
+    Header --> Original[原始编码图像]
+    Header --> Transform[有内存预算的裁剪 + 缩放]
+    Transform --> Encode[有字节预算的 PNG 编码]
+    Original --> Result[MCP 图像 + 元数据]
+    Encode --> Result
 ```
 
-Windows Computer 域将像素、语义 UI 元素和原生输入组成完整的观察—操作闭环：
+`image_read` 支持 PNG、JPEG、GIF 和 WebP，返回原生 MCP 图像内容及实际源文件字节数和尺寸。可选裁剪与等比例缩放输出 PNG。编码输入、像素、尺寸、解码变换内存和输出编码都有上限，等待执行容量时可以取消。
 
-- `computer_targets` 列出经过验证的顶层窗口身份。
-- `computer_state` 捕获桌面或活动目标，返回 state ID 和数量受限的 UI Automation 引用。
-- `computer_action` 激活目标，或执行 `move`、`click`、`double_click`、`drag`、`type_text`、`set_value`、`press_key`、`scroll`。
+Image 是无状态读取。Browser 与 Computer 截图各自保留对应的观察身份和坐标语义。
 
-窗口激活和物理输入会推进状态纪元，后续操作从新的 `computer_state` 继续，使坐标和语义引用始终属于生成它们的观察结果。Rust Worker 负责捕获、UI Automation、DPI 与坐标转换、前台校验和输入路由；Go 负责公开 MCP 契约和 Worker 生命周期。
-
-### Browser
+### Computer · 4 个工具
 
 ```mermaid
-flowchart LR
-    TOOLS[browser 工具] --> BRIDGE[带认证的 loopback Bridge]
-    BRIDGE --> EXT[Chromium MV3 扩展]
-    EXT --> CDP[chrome.debugger · CDP]
-    CDP --> TAB[标签页 + Frame]
-    TAB --> SNAP[可访问性快照]
-    TAB --> SHOT[视口 + 整页截图]
-    TAB --> ACT[DOM + 输入 + 导航]
+flowchart TB
+    Control[computer_control · acquire/status/release] --> Coordinator[Go 桌面协调器]
+    Targets[computer_targets] --> Coordinator
+    State[computer_state] --> Coordinator
+    Action[computer_action · control_id] --> Coordinator
+    Coordinator --> Worker[Rust 原生引擎]
+    Worker --> Identity[窗口身份 + 观察纪元]
+    Worker --> Capture[Windows Graphics Capture]
+    Worker --> UIA[UI Automation Pattern + 引用]
+    Worker --> Input[物理输入 + 释放清理]
+    Worker --> Overlay[蓝色轮廓 + AI 操作标记 + Stop]
+    Overlay -. 撤销控制 .-> Coordinator
 ```
 
-Browser 域控制由操作者选择的 Chromium 配置文件。扩展连接带认证的本机 Bridge，通过 `chrome.debugger` 使用 Chrome DevTools Protocol，并延续该配置文件中的登录会话、标签页、下载和浏览器权限。
+Windows 当前交互桌面共享一个前台、鼠标和键盘输入流。`computer_control` 将这个输入资源分配给一个工作流：
 
-| 工具 | 操作 |
+```text
+computer_control(kind="acquire", label="更新文档") → control_id
+computer_targets() → target_id
+computer_action(kind="activate", control_id=..., target_id=...)
+computer_state(control_id=..., target_id=...) → 可行动的 state_id
+computer_action(kind="click", control_id=..., state_id=..., element_ref=...)
+computer_state(control_id=..., target_id=...) → 新的 state_id
+computer_control(kind="release", control_id=...)
+```
+
+- `computer_control` 获取控制权、查询占用状态或使用匹配 token 释放。状态显示任务名称与占用情况，控制 token 由获取者保管。
+- `computer_targets` 列出经过验证的顶层窗口。
+- `computer_state` 返回像素和有界 UI Automation 信息。不传控制 token 时是 `actionable=false` 的只读观察，state ID 为空，元素只提供描述；有效 token 将可行动引用与 state ID 绑定到当前控制代次和前台目标。
+- `computer_action` 支持 `activate`、`move`、`click`、`double_click`、`drag`、`type_text`、`set_value`、`press_key`、`scroll`。全部动作需要 `control_id`；基于观察的动作需要准确匹配的可行动 `state_id`。
+
+控制权默认五分钟空闲到期，受控操作自动刷新期限。释放、到期、本地 Stop 与退出会取消待执行工作，清理注入输入，失效旧的可行动观察。其他工作流尝试获取时收到 desktop busy。
+
+已提交操作或输入清理仍在完成时，控制状态保持 `stopping`。已经提交的原生或 UIA 操作在取消后可能结果不确定，应先检查目标再决定是否重复执行。
+
+Rust 引擎统一负责 Windows 捕获、窗口身份、DPI 坐标、UIA 引用、输入路由与提示层。语义 `set_value` 使用目标支持的 UI Automation ValuePattern。`uia_status` 返回可用、截断或提供程序错误。像素与 UIA 反映持续变化的界面，每次动作之后都应重新观察，包括已经产生部分副作用的失败。
+
+蓝色目标轮廓和 AI 位置标记显示当前交互。点击本地 Stop 条可以撤销控制。提示层从反馈截图中排除。物理动作使用系统输入流，真正独立的桌面任务可以使用不同交互机器或环境。
+
+### Browser · 8 个工具
+
+```mermaid
+flowchart TB
+    Tools[Browser 工具] --> Registry[实例注册表 + 标签页路由]
+    Registry --> Bridge[带认证的 loopback Bridge]
+    Bridge --> Edge[Edge Profile 扩展]
+    Bridge --> Chrome[Chrome Profile 扩展]
+    Chrome --> Intake[命令接收]
+    Intake --> Queue[有界标签页 FIFO 调度]
+    Queue --> TabA[标签页 A · CDP Frame]
+    Queue --> TabB[标签页 B · CDP Frame]
+    TabA --> Observation[文档纪元 + 快照 + 截图坐标]
+    TabB --> Observation
+```
+
+在每个用于 AI 操作的 Chromium Profile 中加载同一套 MV3 扩展，在扩展选项中填写容易识别的名称，例如 `Edge · 工作`、`Chrome · 研究`。扩展在该 Profile 中保存稳定 UUID，用 Bridge token 连接共享运行时。`chrome.debugger` 将 CDP 操作发送到明确的标签页和 Frame。
+
+| 工具 | 目标与操作 |
 | --- | --- |
-| `browser_status` | Bridge 与扩展连接状态 |
-| `browser_tabs` | 列出浏览器标签页 |
-| `browser_open` | 打开标签页 |
-| `browser_close` | 关闭标签页 |
-| `browser_navigate` | URL、后退、前进或刷新 |
-| `browser_snapshot` | 跨 Frame 的有界可见文本和带版本元素引用 |
-| `browser_screenshot` | 视口、整页或裁剪 PNG 截图 |
-| `browser_action` | 点击、双击、悬停、拖动、输入、设置值、按键、滚动、选择、勾选、上传文件、处理对话框或执行 JavaScript |
+| `browser_status` | 列出有名称的实例及连接状态。 |
+| `browser_tabs` | 指定 `browser_id`，发现标签页。 |
+| `browser_open` | 指定 `browser_id`，创建标签页，默认 `active=false`。 |
+| `browser_close` | 关闭不透明 `tab_id`。 |
+| `browser_navigate` | 对 `tab_id` 导航、后退、前进或刷新。 |
+| `browser_snapshot` | 跨 Frame 的有界可访问性文本和带版本元素引用。 |
+| `browser_screenshot` | 对 `tab_id` 获取视口、整页或裁剪 PNG。 |
+| `browser_action` | 使用引用或截图坐标操作，并支持表单、文件、对话框和 JavaScript。 |
 
-Snapshot 生成带版本的元素引用，视口截图生成带版本的坐标空间。Action 明确引用其中一次观察，使页面变化之后不会继续复用陈旧目标。
+从状态结果复制 `browser_id`，从发现或创建结果复制不透明标签页 `id`，在后续调用中作为 `tab_id` 使用。句柄内部包含实例和生命周期身份。目标不存在或离线时返回错误，保持所选 Profile 的边界。扩展 Worker 重启或连接代次变化后，重新发现标签页、获取观察。
 
-## 工具总表
+动作包括 `click`、`double_click`、`hover`、`drag`、`type_text`、`set_value`、`press_key`、`scroll`、`select`、`check`、`upload_files`、`handle_dialog`、`evaluate`。视口坐标需要匹配的截图 ID；元素引用属于观察时的文档和 Frame 代次。导航、Frame 变化、重连与副作用会失效对应观察。
 
-| 领域 | 工具 | 数量 |
-| --- | --- | ---: |
-| Process | `process_run`、`process_continue` | 2 |
-| Filesystem | `filesystem_list`、`filesystem_stat`、`filesystem_read_text`、`filesystem_search_text`、`filesystem_write_text`、`filesystem_patch_text` | 6 |
-| Image | `image_read` | 1 |
-| Computer | `computer_targets`、`computer_state`、`computer_action` | 3 |
-| Browser | `browser_status`、`browser_tabs`、`browser_open`、`browser_close`、`browser_navigate`、`browser_snapshot`、`browser_screenshot`、`browser_action` | 8 |
-| **总计** |  | **20** |
+不同实例与标签页可并行，同一个标签页按序执行。等待容量与执行槽有界，被取消的排队命令会丢弃。不同 Profile 保留各自浏览器数据，同一 Profile 的标签页共享其会话、cookie 和账户。
+
+改变当前可见桌面的 Browser 操作会与 Computer 控制权协调。后台标签页工作继续并行；可见操作遇到已占用桌面时，携带匹配的 `control_id`，或等待控制权释放。
+
+## 并发工作流
+
+| 资源 | 协调规则 |
+| --- | --- |
+| Process | 会话独立；每个会话按序输入、协调消费输出。 |
+| Filesystem | 读取与不同路径并行；同路径按版本校验后提交。 |
+| Image | 在执行容量和内存预算内独立读取。 |
+| Browser | 明确实例和标签页路由；不同标签页并行，单标签页 FIFO。 |
+| Computer | 一个桌面输入控制者；只读观察仍可用。 |
+
+两个 AI 会话可以各自选择一个浏览器实例，打开自己的后台标签页，也可以同时运行独立进程；其中一个工作流使用桌面输入。如果选择同一个标签页、文件、仓库或云端账户，它们就共享对应资源。
+
+请求取消、进程执行期限和 Host 退出分别处理。一个失败或到期调用保留其他资源。动作可能已经产生副作用时，先观察目标，再决定是否重试非幂等操作。
 
 ## 安装
 
-从 [Releases](https://github.com/hicancan/local-runtime-mcp/releases/latest) 下载对应平台的压缩包，解压到一个独立目录。
+从 [Releases](https://github.com/hicancan/local-runtime-mcp/releases/latest) 下载平台压缩包，校验公布的 SHA-256，解压到独立目录。
+
+| 平台 | Process、Filesystem、Image | Browser | Computer |
+| --- | --- | --- | --- |
+| Windows amd64 | 支持 | Chromium 扩展 | Windows 原生引擎 |
+| Linux / macOS | 支持 | 桌面浏览器中的 Chromium 扩展 | 返回平台不可用 |
+
+Browser 需要正在运行并加载扩展的 Chromium Profile。Windows Computer 需要 Windows 10 2004 或更新版本（包括 Windows 11）、交互桌面，以及适合目标应用的账户权限。
 
 Windows 发布包包含：
 
@@ -279,44 +308,41 @@ local-runtime-mcp/
 ├── PRIVACY.md
 ├── LICENSE
 ├── THIRD_PARTY_NOTICES.md
+├── licenses/
 └── cloudflared-LICENSE
 ```
 
-将 `config.example.yaml` 复制为 `local-runtime-mcp.yaml`，填写所选连接方式使用的配置段：
+将 `config.example.yaml` 复制为 `local-runtime-mcp.yaml`，填写当前连接方式所需配置：
 
 ```yaml
 browser:
   listen: 127.0.0.1:9315
-  token: "替换为至少-32-个字符的随机令牌"
+  token: "replace-with-a-random-token-of-at-least-32-characters"
 
 openai:
-  tunnel_id: "替换为-OpenAI-Tunnel-ID"
-  api_key: "替换为-OpenAI-Tunnel-API-Key"
+  tunnel_id: "replace-with-your-openai-tunnel-id"
+  api_key: "replace-with-your-openai-tunnel-api-key"
 
 http:
   listen: 127.0.0.1:9316
   public_host: mcp.example.com
-  bearer_token: "替换为至少-32-个字符的随机令牌"
+  bearer_token: "replace-with-a-random-token-of-at-least-32-characters"
 
 cloudflare:
-  tunnel_token: "替换为-Cloudflare-托管隧道令牌"
+  tunnel_token: "replace-with-your-cloudflare-managed-tunnel-token"
 ```
 
-配置文件包含连接凭据，应按照其他含凭据的应用目录一样保存和管理整个运行目录。
+按照含凭据应用目录的要求保护整个运行目录。移动运行目录时，浏览器安装、实例身份和账户数据仍属于原机器上的 Profile。
 
-### 初始化浏览器
-
-运行：
+### 浏览器准备
 
 ```powershell
 ./lrmcp.exe setup browser
 ```
 
-该命令会按需生成浏览器 token，写入同目录的 YAML，并将扩展释放到可执行文件旁边的 `browser-extension`。打开 `edge://extensions` 或 `chrome://extensions`，启用开发人员模式，选择“加载解压缩的扩展”，再选择该目录。
+命令将 Bridge 凭据保存在同目录 YAML，并把扩展释放到可执行文件旁边的 `browser-extension`。在每个目标 Profile 中打开 `edge://extensions` 或 `chrome://extensions`，启用开发人员模式，选择“加载解压缩的扩展”，再选择该目录。打开扩展选项设置独立名称，确认 Bridge 地址与 token。启动 `lrmcp` 后通过 `browser_status` 查看连接中的实例。
 
 ### 本地 stdio
-
-典型 MCP 客户端配置如下：
 
 ```json
 {
@@ -331,39 +357,35 @@ cloudflare:
 
 ### OpenAI Tunnel
 
-在 `openai` 段填写隧道凭据，然后运行：
+填写 `openai` 段后运行：
 
 ```powershell
 ./lrmcp.exe tunnel openai
 ```
 
-隧道创建方法和支持的客户端见 [OpenAI Secure MCP Tunnel 指南](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)。
-
-当单次请求达到响应期限并关闭内存连接时，适配器会重建内嵌 MCP 会话，因此一个超时工具调用不会终止 `lrmcp` 进程，也不需要手动重启。
+Provider 设置和受支持的客户端见 [OpenAI Secure MCP Tunnel 指南](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)。私有 HTTP 源站自动创建，端口与私有链路凭据只在本次运行中保留。
 
 ### Streamable HTTP
 
-在 `http` 段填写 HTTP Bearer token，然后运行：
+填写 `http.bearer_token` 后运行：
 
 ```powershell
 ./lrmcp.exe serve http
 ```
 
-默认 MCP 端点为 `http://127.0.0.1:9316/mcp`。监听器固定在 loopback，适合作为本机反向代理的源站。
+默认端点为 `http://127.0.0.1:9316/mcp`。loopback 监听器使用配置的 Bearer token，也可以作为反向代理源站。
 
 ### Cloudflare Tunnel
 
-创建远程管理的 Cloudflare Tunnel，将域名路由到 `http://127.0.0.1:9316`，填写 `http.public_host`、`http.bearer_token` 与 `cloudflare.tunnel_token`，然后运行：
+创建远程管理的 Cloudflare Tunnel，将域名路由到 `http://127.0.0.1:9316`，填写 `http.public_host`、`http.bearer_token` 和 `cloudflare.tunnel_token` 后运行：
 
 ```powershell
 ./lrmcp.exe tunnel cloudflare
 ```
 
-发布包包含固定版本的 `cloudflared` 配套程序。公网端点为 `https://<public_host>/mcp`，使用配置中的 HTTP Bearer token 认证。
+发布包附带固定版本的 `cloudflared`。远端 MCP 客户端使用 `https://<public_host>/mcp` 与 MCP Bearer token。Cloudflare token 验证隧道程序，MCP token 验证工具客户端。
 
-## 环境变量与命令行覆盖
-
-便携 YAML 适合日常运行，自动化场景可以覆盖单项配置：
+### 环境变量覆盖
 
 | 环境变量 | YAML 字段 |
 | --- | --- |
@@ -377,31 +399,39 @@ cloudflare:
 | `LOCAL_RUNTIME_MCP_CLOUDFLARE_TUNNEL_TOKEN` | `cloudflare.tunnel_token` |
 | `LOCAL_RUNTIME_MCP_CLOUDFLARED` | `cloudflare.binary` |
 
-运行 `lrmcp help` 可以查看对应的命令行参数。
+运行 `lrmcp help` 查看对应命令行参数。
 
 ## 构建与测试
 
-构建环境需要 Go 1.27、Node.js 24；Windows Computer 引擎还需要稳定版 Rust MSVC 工具链。
+需要 Go 1.27、Node.js 24。Windows Computer 引擎使用稳定版 Rust MSVC 工具链，原生构建前加载 Visual Studio 构建环境。
 
 ```powershell
 Push-Location browser-extension
 npm ci
 npm run build
+npm test
 Pop-Location
 ./scripts/build-native.ps1
+cargo fmt --manifest-path native/computer-windows/Cargo.toml --check
+cargo clippy --manifest-path native/computer-windows/Cargo.toml --all-targets -- -D warnings
 go test ./...
 go vet ./...
 go build ./cmd/lrmcp
 ```
 
-CI 覆盖 Windows、Linux 与 macOS。Windows CI 还会执行 Chromium 扩展端到端测试，以及 Rust 格式与静态检查。
+Go 测试覆盖资源生命周期、响应归属、取消、文件竞争提交、进程 I/O 和浏览器身份路由。扩展调度测试覆盖顺序、公平性、取消和队列上限。Windows 可选 Chromium 验收会在临时 Profile 中加载真实扩展：
 
-## 安全与隐私
+```powershell
+$env:LOCAL_RUNTIME_MCP_BROWSER_E2E = '1'
+go test ./internal/browser -run TestEdgeExtensionEndToEnd -count=3 -v
+```
 
-Local Runtime MCP 使用启动它的账户权限运行。经过身份验证的客户端可以执行程序、访问文件、观察和控制 Windows 桌面，并与浏览器会话交互，因此应将运行时访问视为对该机器账户的高权限访问。
+CI 覆盖 Windows、Linux 和 macOS。本地协议与浏览器测试验证对应执行链路；真实 ChatGPT 多会话验收针对已配置的客户端和 Tunnel 单独进行。
 
-[SECURITY.md](SECURITY.md) 说明安全模型、部署建议和私密漏洞报告方式；[PRIVACY.md](PRIVACY.md) 说明各能力域的数据流、本地保留行为，以及外部 MCP 客户端和隧道服务商的边界。
+## 安全、隐私与协议
 
-## 开源协议
+通过认证的客户端使用运行 `lrmcp` 的账户权限。资源句柄在共享机器内部协调目标与工作流。需要工作负载分离时，使用专用操作系统账户与浏览器 Profile。
 
-Local Runtime MCP 使用 [GNU AGPL v3.0 only](LICENSE)。发布包同时包含独立授权的 `cloudflared` 配套程序，归属与协议详情见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+[SECURITY.md](SECURITY.md) 说明部署与私密漏洞报告；[PRIVACY.md](PRIVACY.md) 说明本地保留和外部 Provider 数据流。
+
+项目使用 [GNU AGPL v3.0 only](LICENSE)。`cloudflared` 配套程序使用独立协议，依赖归属见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

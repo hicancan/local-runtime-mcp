@@ -50,12 +50,15 @@ func TestToolCatalogAndIdentity(t *testing.T) {
 		"browser_navigate": {false, false, false, true}, "browser_snapshot": {true, false, true, true},
 		"browser_screenshot": {true, false, true, true}, "browser_action": {false, true, false, true},
 		"computer_targets": {true, false, true, false}, "computer_state": {true, false, true, false},
-		"computer_action": {false, true, false, false},
+		"computer_action":  {false, true, false, false},
+		"computer_control": {false, false, false, false},
 	}
 	type propertySchema struct {
 		Enum []string `json:"enum"`
+		Type any      `json:"type"`
 	}
 	schemas := make(map[string]map[string]propertySchema, len(expected))
+	required := make(map[string][]string, len(expected))
 	if len(listed.Tools) != len(expected) {
 		t.Fatalf("tool count = %d, want %d", len(listed.Tools), len(expected))
 	}
@@ -80,15 +83,41 @@ func TestToolCatalogAndIdentity(t *testing.T) {
 		}
 		var schema struct {
 			Properties map[string]propertySchema `json:"properties"`
+			Required   []string                  `json:"required"`
 		}
 		if err := json.Unmarshal(data, &schema); err != nil {
 			t.Fatalf("decode input schema for %q: %v", registered.Name, err)
 		}
 		schemas[registered.Name] = schema.Properties
+		required[registered.Name] = schema.Required
 	}
 	assertEnum(t, schemas["browser_navigate"]["kind"].Enum, []string{"url", "back", "forward", "reload"})
 	assertEnum(t, schemas["browser_action"]["kind"].Enum, []string{"click", "double_click", "hover", "drag", "type_text", "set_value", "press_key", "scroll", "select", "check", "upload_files", "handle_dialog", "evaluate"})
 	assertEnum(t, schemas["computer_action"]["kind"].Enum, []string{"activate", "move", "click", "double_click", "drag", "type_text", "set_value", "press_key", "scroll"})
+	assertEnum(t, schemas["computer_control"]["kind"].Enum, []string{"acquire", "status", "release"})
+	assertEnum(t, schemas["filesystem_write_text"]["mode"].Enum, []string{"create", "replace"})
+	for name, fields := range map[string][]string{
+		"browser_tabs": {"browser_id"}, "browser_open": {"browser_id", "url"},
+		"browser_close": {"tab_id"}, "browser_navigate": {"tab_id", "kind"},
+		"browser_snapshot": {"tab_id"}, "browser_screenshot": {"tab_id"}, "browser_action": {"tab_id", "kind"},
+		"computer_control": {"kind"}, "computer_action": {"control_id", "kind"},
+		"filesystem_write_text": {"mode", "path", "content"},
+	} {
+		for _, field := range fields {
+			if kind, ok := schemas[name][field].Type.(string); !ok || kind != "string" {
+				t.Fatalf("%s.%s must be a string", name, field)
+			}
+			found := false
+			for _, value := range required[name] {
+				if value == field {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("%s.%s must be required", name, field)
+			}
+		}
+	}
 	if _, ok := schemas["filesystem_write_text"]["create_parents"]; !ok {
 		t.Fatal("filesystem_write_text is missing explicit create_parents")
 	}
@@ -96,8 +125,9 @@ func TestToolCatalogAndIdentity(t *testing.T) {
 		t.Fatal("computer_action is missing UI Automation element_ref")
 	}
 	for toolName, forbidden := range map[string][]string{
-		"computer_state": {"include_accessibility"},
-		"browser_action": {"selector"},
+		"computer_state":        {"include_accessibility"},
+		"browser_action":        {"selector"},
+		"filesystem_write_text": {"create_only"},
 	} {
 		for _, name := range forbidden {
 			if _, ok := schemas[toolName][name]; ok {
@@ -118,7 +148,7 @@ func TestFilesystemImageAndProcessTools(t *testing.T) {
 	root := t.TempDir()
 	session := connect(t)
 	note := filepath.Join(root, "docs", "note.txt")
-	write := callOK(t, session, "filesystem_write_text", map[string]any{"path": note, "content": "hello from MCP\n", "create_only": true, "create_parents": true})
+	write := callOK(t, session, "filesystem_write_text", map[string]any{"path": note, "content": "hello from MCP\n", "mode": "create", "create_parents": true})
 	var written filesystem.TextWriteResult
 	decodeStructured(t, write, &written)
 	if !written.Created || written.Path != note {
@@ -182,14 +212,17 @@ func connect(t *testing.T) *mcp.ClientSession {
 		t.Fatal(err)
 	}
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
-	go func() { _ = New(ctx, bridge, nil).Run(ctx, serverTransport) }()
+	processes := runtimeprocess.NewManager(ctx)
+	go func() {
+		_ = New(Dependencies{Process: processes, Filesystem: filesystem.New(), Browser: bridge}).Run(ctx, serverTransport)
+	}()
 	client := mcp.NewClient(&mcp.Implementation{Name: "lrmcp-test", Version: Version}, nil)
 	session, err := client.Connect(ctx, clientTransport, nil)
 	if err != nil {
 		cancel()
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = session.Close(); cancel() })
+	t.Cleanup(func() { _ = session.Close(); cancel(); _ = bridge.Close(context.Background()); _ = processes.Close() })
 	return session
 }
 

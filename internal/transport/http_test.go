@@ -92,6 +92,44 @@ func TestHTTPTransportRejectsUnsafeConfiguration(t *testing.T) {
 	}
 }
 
+func TestProviderOriginRequiresPrivateHopCredential(t *testing.T) {
+	server := mcp.NewServer(&mcp.Implementation{Name: "private-test", Version: "1"}, nil)
+	instance, err := NewHTTP(server, HTTPConfig{Listen: "127.0.0.1:0", BearerToken: testBearerToken, InternalToken: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- instance.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	})
+	endpoint := "http://" + instance.Address() + "/mcp"
+	denied := request(t, endpoint, testBearerToken, "", "https://chatgpt.com")
+	denied.Body.Close()
+	if denied.StatusCode != http.StatusUnauthorized {
+		t.Fatal("public bearer credential accepted on private provider hop")
+	}
+	body := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`)
+	req, _ := http.NewRequest(http.MethodPost, endpoint, body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Authorization", "Bearer forwarded-caller-auth")
+	req.Header.Set("Origin", "https://chatgpt.com")
+	req.Header.Set(InternalTokenHeader, testBearerToken)
+	accepted, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted.Body.Close()
+	if accepted.StatusCode != http.StatusOK {
+		t.Fatalf("private hop rejected forwarded metadata: %d", accepted.StatusCode)
+	}
+}
+
 func request(t *testing.T, endpoint, token, host, origin string) *http.Response {
 	t.Helper()
 	body := bytes.NewBufferString(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`)

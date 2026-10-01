@@ -1,51 +1,56 @@
 # Privacy
 
-Effective date: September 17, 2026
+Effective date: October 1, 2026
 
-Local Runtime MCP is self-hosted software. The project does not operate a hosted runtime, analytics service, telemetry endpoint, or storage service that receives data from `lrmcp`. Data is processed on the machine running the software and is returned to the MCP client only when a client invokes a capability.
+Local Runtime MCP is self-hosted software. Capability data is processed on the machine running `lrmcp` and returned through the selected MCP connection. The project operates no runtime hosting, analytics, telemetry collection, or storage service that receives tool data.
 
-## Data processed by each capability
+## Capability data
 
-| Capability | Data it may process | Result returned to the MCP client |
+| Domain | Data processed | Results sent to the MCP client |
 | --- | --- | --- |
-| Process | Program paths, arguments, working directories, environment overrides, stdin, stdout, and stderr | Process status and bounded output |
-| Filesystem | Direct paths, directory entries, file metadata, text content, hashes, searches, and requested writes or patches | Requested metadata, text, search results, and mutation results |
-| Image | Supported local PNG, JPEG, GIF, and WebP files | Image metadata and native image content, optionally cropped or resized |
-| Computer | Window metadata, Windows Graphics Capture frames, UI Automation elements, coordinates, and requested input actions | Desktop or window screenshots, semantic UI state, and action results |
-| Browser | Tab titles and URLs, accessibility content, page screenshots, evaluated script results, selected upload paths, and requested browser actions | Browser state, page content, screenshots, and action results |
+| Process | Program paths, arguments, directories, environment overrides, stdin, stdout, and stderr | Session identity, status, and bounded output |
+| Filesystem | Paths, directory entries, metadata, text, hashes, searches, and requested mutations | Requested text and metadata, search results, and commit results |
+| Image | Local PNG, JPEG, GIF, and WebP data | Native image content and metadata, optionally cropped or resized |
+| Computer | Window identity and titles, WGC frames, UIA elements, task labels, input coordinates, and control/observation identities | Control occupancy, pixels, UI state, and action results |
+| Browser | Extension instance IDs and labels, tab titles and URLs, page text, accessibility references, screenshots, upload paths, script results, and requested actions | Named instances, tab identities, observations, images, and action results |
 
-The Process domain can run programs that independently read data, write data, or communicate over a network. Those programs' behavior is governed by their own code and configuration.
+Process-launched programs and browser pages may independently read, write, or transmit data according to their own code, permissions, and settings. Separate browser profiles can still access the same remote account or shared document.
 
-## Where data travels
+## Connection data flows
 
-Every invocation uses one selected MCP connection:
+- **stdio:** local pipes between the MCP client and the runtime.
+- **Streamable HTTP:** the authenticated loopback MCP endpoint, optionally reached through an operator-configured reverse proxy.
+- **OpenAI Tunnel:** OpenAI tunnel infrastructure, the official HTTP forwarding client, and a private loopback MCP endpoint created for this runtime invocation.
+- **Cloudflare Tunnel:** Cloudflare infrastructure and the official `cloudflared` companion forwarding authenticated MCP HTTP traffic to loopback.
 
-- **stdio** carries requests and results through local process pipes.
-- **Streamable HTTP** carries requests and results through an authenticated loopback HTTP endpoint.
-- **OpenAI Tunnel** carries MCP traffic through OpenAI's tunnel infrastructure.
-- **Cloudflare Tunnel** carries authenticated Streamable HTTP traffic through Cloudflare's tunnel infrastructure to the loopback origin.
+Browser extensions connect to the configured loopback bridge. The bridge routes each request to its selected profile instance and tab. Page results travel through the active MCP connection like other tool results.
 
-The Chromium extension communicates only with the configured loopback browser bridge. Browser observations and actions then travel back through the active MCP connection like other tool results.
-
-When a tunnel or external MCP client is used, the corresponding provider may process connection metadata and MCP traffic under its own terms and privacy policy. Local Runtime MCP does not control provider-side logging, retention, or account data.
+External MCP clients and tunnel providers may process request content and connection metadata under their own terms and privacy policies. Their histories, logs, retention, and account data are governed by those services and the operator's configuration.
 
 ## Local storage and retention
 
-The runtime stores only the state needed to operate:
+| Location | State and lifetime |
+| --- | --- |
+| `local-runtime-mcp.yaml` beside the executable | Persistent connection settings and browser, HTTP, OpenAI, or Cloudflare credentials selected by the operator. |
+| Unpacked extension directory | Packaged loopback bridge address and token written by browser setup. |
+| Each profile's extension storage | Bridge settings, readable profile label, and stable extension instance UUID. The operator can remove them by resetting or uninstalling that profile's extension. |
+| Process memory | Bounded output and active session state; completed, uncollected sessions expire after ten minutes. Host shutdown cleans up owned processes. |
+| Bridge and extension memory | Bounded pending commands, connection generations, tab handles, page epochs, retained references, and screenshot identities. Extension restart invalidates prior observation handles. |
+| Computer memory | Control token, task label, expiry, actionable state IDs, UIA references, and current operation state. Release, idle expiry, local Stop, and shutdown clear actionable control state. |
+| Runtime-only OpenAI state | Private loopback port and freshly generated private-hop credential held in memory, discarded with that invocation. |
+| Temporary helper directories | Extracted Windows native worker and the Cloudflare token file, removed on normal component shutdown. |
+| Machine files and browser data | Requested file changes, downloaded content, browser history, and program-produced artifacts persist according to their owning application and operator settings. |
 
-- `local-runtime-mcp.yaml`, beside the executable, persists the configuration selected by the operator and may contain browser, HTTP, OpenAI, and Cloudflare credentials.
-- `lrmcp setup browser` writes the browser bridge address and token into the unpacked extension directory. The extension can also store its address, token, and generated instance identifier in the Chromium profile's local extension storage.
-- Active process sessions retain bounded stdout and stderr in memory. Completed, uncollected sessions expire after ten minutes; shutdown terminates owned sessions.
-- Browser commands, retained element references, screenshot identifiers, and Computer state identifiers are held in memory and bounded by the runtime or extension. Native screenshot and image bytes are returned to the requesting MCP client.
-- The Windows Computer worker and Cloudflare token file use temporary directories that are removed when their owning runtime component stops normally.
-- Files created or changed through Filesystem or Process are intentional machine-side effects and remain until the operator, client, or invoked program removes them.
+The desktop overlay displays the current task label and AI interaction marker locally. Its Stop control revokes desktop input ownership. The overlay is excluded from feedback capture; captured application pixels may still contain sensitive information visible to the host account.
 
-The runtime does not create an activity history, upload telemetry, or maintain a project-operated copy of tool requests and results. Terminal output from `lrmcp`, provider logs, operating-system logs, browser history, MCP client history, and data created by invoked programs are outside this runtime's retention behavior.
+The core runtime retains operational state rather than a persistent tool-activity history. Terminal diagnostics, provider logs, OS logs, browser history, MCP client conversation history, and invoked program data have their own retention policies. Unexpected crashes or forced termination can leave temporary files for the operator to remove.
 
 ## Operator choices
 
-Operators determine which client connects, which transport is active, which browser profile loads the extension, which account runs the process, what paths and programs are exposed, and which third-party tunnel providers are used. Use a dedicated operating-system account and browser profile when stronger separation from personal data is desired.
+Choose which client and provider connect, which OS account runs the runtime, and which browser profiles load the extension. Protect the portable runtime directory and its configuration when moving it between machines. Browser profile identity and stored sessions remain with the browser profile on the machine where it is installed.
 
-## Questions and changes
+Use dedicated accounts and profiles when workload separation is appropriate. Explicit browser IDs, tab handles, and desktop control tokens help route work inside the shared runtime; authenticated clients continue to share the host account's authority.
 
-Privacy-relevant changes are documented in this file and released through the project's public Git history. Questions can be sent to [mail@hicancan.top](mailto:mail@hicancan.top). Security vulnerabilities should follow [SECURITY.md](SECURITY.md).
+## Questions and updates
+
+Privacy-relevant changes are recorded in this policy and the public Git history. Send questions to [mail@hicancan.top](mailto:mail@hicancan.top). Follow [SECURITY.md](SECURITY.md) for vulnerabilities.

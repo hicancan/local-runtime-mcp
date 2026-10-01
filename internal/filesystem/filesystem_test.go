@@ -1,6 +1,7 @@
 package filesystem
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,12 +9,14 @@ import (
 )
 
 func TestTextLifecycleAndCompareAndSwap(t *testing.T) {
+	service := New()
+	ctx := context.Background()
 	root := t.TempDir()
 	path := filepath.Join(root, "nested", "note.txt")
-	if _, err := WriteText(path, "one\n", WriteTextOptions{CreateOnly: true}); err == nil {
+	if _, err := service.WriteText(ctx, path, "one\n", WriteTextOptions{Mode: "create"}); err == nil {
 		t.Fatal("write unexpectedly created missing parents")
 	}
-	written, err := WriteText(path, "one\ntwo\nthree\n", WriteTextOptions{CreateOnly: true, CreateParents: true})
+	written, err := service.WriteText(ctx, path, "one\ntwo\nthree\n", WriteTextOptions{Mode: "create", CreateParents: true})
 	if err != nil || !written.Created || len(written.SHA256) != 64 {
 		t.Fatalf("initial write = %+v, %v", written, err)
 	}
@@ -21,21 +24,21 @@ func TestTextLifecycleAndCompareAndSwap(t *testing.T) {
 	if err != nil || read.Content != "two\n" || read.StartLine != 2 || read.EndLine != 2 || read.NextLine != 3 || !read.Truncated || read.SHA256 != written.SHA256 {
 		t.Fatalf("range read = %+v, %v", read, err)
 	}
-	if _, err := WriteText(path, "bad", WriteTextOptions{ExpectedSHA256: strings.Repeat("0", 64)}); err == nil {
+	if _, err := service.WriteText(ctx, path, "bad", WriteTextOptions{Mode: "replace", ExpectedSHA256: strings.Repeat("0", 64)}); err == nil {
 		t.Fatal("write with a stale hash succeeded")
 	}
 	unchanged, _ := os.ReadFile(path)
 	if string(unchanged) != "one\ntwo\nthree\n" {
 		t.Fatalf("stale write changed file: %q", unchanged)
 	}
-	edited, err := PatchText(path, PatchTextOptions{
+	edited, err := service.PatchText(ctx, path, PatchTextOptions{
 		ExpectedSHA256: written.SHA256,
 		Hunks:          []TextPatchHunk{{Old: "one", New: "ONE", After: "\n"}, {Before: "one\n", Old: "two", New: "TWO", After: "\nthree"}},
 	})
 	if err != nil || edited.Hunks != 2 {
 		t.Fatalf("batch edit = %+v, %v", edited, err)
 	}
-	if _, err := PatchText(path, PatchTextOptions{ExpectedSHA256: edited.SHA256, Hunks: []TextPatchHunk{{Old: "ONE", New: "changed", After: "\n"}, {Old: "missing", New: "x", After: "\n"}}}); err == nil {
+	if _, err := service.PatchText(ctx, path, PatchTextOptions{ExpectedSHA256: edited.SHA256, Hunks: []TextPatchHunk{{Old: "ONE", New: "changed", After: "\n"}, {Old: "missing", New: "x", After: "\n"}}}); err == nil {
 		t.Fatal("partially invalid batch edit succeeded")
 	}
 	unchanged, _ = os.ReadFile(path)
@@ -45,6 +48,8 @@ func TestTextLifecycleAndCompareAndSwap(t *testing.T) {
 }
 
 func TestMutationsRejectFinalSymlink(t *testing.T) {
+	service := New()
+	ctx := context.Background()
 	root := t.TempDir()
 	target := filepath.Join(root, "target.txt")
 	link := filepath.Join(root, "link.txt")
@@ -54,11 +59,11 @@ func TestMutationsRejectFinalSymlink(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Skipf("symbolic links unavailable: %v", err)
 	}
-	if _, err := WriteText(link, "changed", WriteTextOptions{}); err == nil {
+	if _, err := service.WriteText(ctx, link, "changed", WriteTextOptions{Mode: "replace", ExpectedSHA256: hashBytes([]byte("original"))}); err == nil {
 		t.Fatal("write followed a final symbolic link")
 	}
 	hash, _ := hashFile(target)
-	if _, err := PatchText(link, PatchTextOptions{ExpectedSHA256: hash, Hunks: []TextPatchHunk{{Old: "original", New: "changed"}}}); err == nil {
+	if _, err := service.PatchText(ctx, link, PatchTextOptions{ExpectedSHA256: hash, Hunks: []TextPatchHunk{{Old: "original", New: "changed"}}}); err == nil {
 		t.Fatal("edit followed a final symbolic link")
 	}
 	data, err := os.ReadFile(target)
@@ -68,12 +73,14 @@ func TestMutationsRejectFinalSymlink(t *testing.T) {
 }
 
 func TestPatchUsesOneImmutableBaseAndRejectsAmbiguity(t *testing.T) {
+	service := New()
+	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "patch.txt")
 	data := "alpha\nbeta\ngamma\n"
 	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	result, err := PatchText(path, PatchTextOptions{ExpectedSHA256: hashBytes([]byte(data)), Hunks: []TextPatchHunk{
+	result, err := service.PatchText(ctx, path, PatchTextOptions{ExpectedSHA256: hashBytes([]byte(data)), Hunks: []TextPatchHunk{
 		{Before: "alpha\n", Old: "beta", New: "BETA", After: "\ngamma"},
 		{Before: "gamma", Old: "", New: "!", After: "\n"},
 	}})
@@ -84,10 +91,10 @@ func TestPatchUsesOneImmutableBaseAndRejectsAmbiguity(t *testing.T) {
 	if string(got) != "alpha\nBETA\ngamma!\n" {
 		t.Fatalf("patched content = %q", got)
 	}
-	if _, err := PatchText(path, PatchTextOptions{ExpectedSHA256: result.SHA256, Hunks: []TextPatchHunk{{Old: "a", New: "x"}}}); err == nil {
+	if _, err := service.PatchText(ctx, path, PatchTextOptions{ExpectedSHA256: result.SHA256, Hunks: []TextPatchHunk{{Old: "a", New: "x"}}}); err == nil {
 		t.Fatal("ambiguous patch succeeded")
 	}
-	if _, err := PatchText(path, PatchTextOptions{Hunks: []TextPatchHunk{{Old: "alpha", New: "x"}}}); err == nil {
+	if _, err := service.PatchText(ctx, path, PatchTextOptions{Hunks: []TextPatchHunk{{Old: "alpha", New: "x"}}}); err == nil {
 		t.Fatal("patch without expected_sha256 succeeded")
 	}
 }

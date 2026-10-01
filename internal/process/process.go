@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -26,6 +27,8 @@ const (
 	defaultYieldMS        = 10_000
 	defaultContinueMS     = 1_000
 	completedRetention    = 10 * time.Minute
+	maxSessions           = 128
+	maxInputWaiters       = 32
 )
 
 var environmentName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -77,9 +80,15 @@ type processControl interface {
 }
 
 type Manager struct {
-	ctx      context.Context
-	mu       sync.Mutex
-	sessions map[string]*session
+	ctx           context.Context
+	cancel        context.CancelFunc
+	mu            sync.Mutex
+	sessions      map[string]*session
+	closed        bool
+	startingCount int
+	starting      sync.WaitGroup
+	workers       sync.WaitGroup
+	closeOnce     sync.Once
 }
 
 type session struct {
@@ -98,10 +107,17 @@ type session struct {
 	started     time.Time
 	done        chan struct{}
 
-	mu        sync.Mutex
-	exitCode  int
-	timedOut  bool
-	stdinDone bool
+	mu             sync.Mutex
+	exitCode       int
+	timedOut       bool
+	stdinDone      bool
+	inputGate      chan struct{}
+	inputWaiters   int
+	resultMu       sync.Mutex
+	controlMu      sync.Mutex
+	inputWorkers   sync.WaitGroup
+	terminalMu     sync.Mutex
+	terminalClosed bool
 }
 
 type ptyWriter struct{ pty.Pty }
@@ -111,27 +127,45 @@ func (p ptyWriter) Close() error {
 }
 
 func NewManager(ctx context.Context) *Manager {
-	manager := &Manager{ctx: ctx, sessions: make(map[string]*session)}
+	managedContext, cancel := context.WithCancel(ctx)
+	manager := &Manager{ctx: managedContext, cancel: cancel, sessions: make(map[string]*session)}
 	go func() {
-		<-ctx.Done()
-		manager.closeAll()
+		<-managedContext.Done()
+		_ = manager.Close()
 	}()
 	return manager
 }
 
 func (m *Manager) Run(callContext context.Context, options Options) (Result, error) {
+	if err := callContext.Err(); err != nil {
+		return Result{}, err
+	}
+	m.mu.Lock()
+	if m.closed || m.ctx.Err() != nil {
+		m.mu.Unlock()
+		return Result{}, errors.New("process manager is closed")
+	}
+	if len(m.sessions)+m.startingCount >= maxSessions {
+		m.mu.Unlock()
+		return Result{}, errors.New("process session capacity is full")
+	}
+	m.starting.Add(1)
+	m.startingCount++
+	m.mu.Unlock()
+	defer func() { m.mu.Lock(); m.startingCount--; m.mu.Unlock(); m.starting.Done() }()
 	directory, timeout, outputLimit, yield, err := validateOptions(options)
 	if err != nil {
 		return Result{}, err
 	}
-	program, err := exec.LookPath(options.Program)
+	environment := mergeEnvironment(options.Environment)
+	program, err := resolveProgram(options.Program, directory, environment)
 	if err != nil {
 		return Result{}, fmt.Errorf("resolve program %q: %w", options.Program, err)
 	}
 
 	entry := &session{
 		id: newSessionID(), program: options.Program, args: append([]string(nil), options.Args...), directory: filepath.Clean(directory),
-		stdout: newStreamBuffer(outputLimit), stderr: newStreamBuffer(outputLimit), started: time.Now(), done: make(chan struct{}), exitCode: -1,
+		stdout: newStreamBuffer(outputLimit), stderr: newStreamBuffer(outputLimit), started: time.Now(), done: make(chan struct{}), exitCode: -1, inputGate: make(chan struct{}, 1),
 	}
 	mode := options.IOMode
 	if mode == "" {
@@ -156,7 +190,7 @@ func (m *Manager) Run(callContext context.Context, options Options) (Result, err
 			return Result{}, fmt.Errorf("resize pseudo-terminal: %w", err)
 		}
 		command := terminal.Command(program, options.Args...)
-		command.Dir, command.Env = directory, mergeEnvironment(options.Environment)
+		command.Dir, command.Env = directory, environment
 		preparePTY(command)
 		if err := command.Start(); err != nil {
 			_ = terminal.Close()
@@ -167,13 +201,15 @@ func (m *Manager) Run(callContext context.Context, options Options) (Result, err
 		if err != nil {
 			_ = command.Process.Kill()
 			_ = terminal.Close()
+			_ = command.Wait()
 			return Result{}, fmt.Errorf("manage PTY process: %w", err)
 		}
 		entry.stdin = ptyWriter{terminal}
 		go func() { _, _ = io.Copy(entry.stdout, terminal); close(entry.outputDone) }()
 	} else {
 		command := exec.Command(program, options.Args...)
-		command.Dir, command.Env = directory, mergeEnvironment(options.Environment)
+		command.Dir, command.Env = directory, environment
+		command.WaitDelay = 2 * time.Second
 		command.Stdout, command.Stderr = entry.stdout, entry.stderr
 		if options.Stdin != "" || options.KeepStdinOpen {
 			entry.stdin, err = command.StdinPipe()
@@ -183,6 +219,12 @@ func (m *Manager) Run(callContext context.Context, options Options) (Result, err
 		}
 		entry.control, err = startManaged(command)
 		if err != nil {
+			if entry.stdin != nil {
+				_ = entry.stdin.Close()
+			}
+			if command.Process != nil {
+				_ = command.Wait()
+			}
 			return Result{}, fmt.Errorf("start process: %w", err)
 		}
 		entry.waitProcess = command.Wait
@@ -190,8 +232,10 @@ func (m *Manager) Run(callContext context.Context, options Options) (Result, err
 
 	m.mu.Lock()
 	m.sessions[entry.id] = entry
+	m.workers.Add(3)
 	m.mu.Unlock()
 	go func() {
+		defer m.workers.Done()
 		entry.wait()
 		timer := time.NewTimer(completedRetention)
 		defer timer.Stop()
@@ -202,13 +246,29 @@ func (m *Manager) Run(callContext context.Context, options Options) (Result, err
 			m.remove(entry.id)
 		}
 	}()
-	go entry.watch(m.ctx, time.Duration(timeout)*time.Second)
+	go func() { defer m.workers.Done(); entry.watch(m.ctx, time.Duration(timeout)*time.Second) }()
+	// Cancellation must also reach a blocked initial stdin write.
+	initialDone := make(chan struct{})
+	go func() {
+		defer m.workers.Done()
+		select {
+		case <-callContext.Done():
+			entry.terminate(false)
+		case <-m.ctx.Done():
+			entry.terminate(false)
+		case <-initialDone:
+		}
+	}()
+	defer close(initialDone)
 
 	if entry.stdin != nil && options.Stdin != "" {
-		if _, err := io.WriteString(entry.stdin, options.Stdin); err != nil {
+		if err := entry.writeStdin(callContext, options.Stdin); err != nil {
 			entry.terminate(false)
 			<-entry.done
 			m.remove(entry.id)
+			if callContext.Err() != nil {
+				return Result{}, callContext.Err()
+			}
 			return Result{}, fmt.Errorf("write process stdin: %w", err)
 		}
 	}
@@ -221,18 +281,47 @@ func (m *Manager) Run(callContext context.Context, options Options) (Result, err
 	select {
 	case <-entry.done:
 		m.remove(entry.id)
+		if err := callContext.Err(); err != nil {
+			return Result{}, err
+		}
+		if err := m.ctx.Err(); err != nil {
+			return Result{}, err
+		}
 		return entry.result(false), nil
 	case <-timer.C:
+		if err := callContext.Err(); err != nil {
+			entry.terminate(false)
+			<-entry.done
+			m.remove(entry.id)
+			return Result{}, err
+		}
+		if err := m.ctx.Err(); err != nil {
+			entry.terminate(false)
+			<-entry.done
+			m.remove(entry.id)
+			return Result{}, err
+		}
 		return entry.result(true), nil
 	case <-callContext.Done():
 		entry.terminate(false)
 		<-entry.done
 		m.remove(entry.id)
 		return Result{}, callContext.Err()
+	case <-m.ctx.Done():
+		entry.terminate(false)
+		<-entry.done
+		m.remove(entry.id)
+		return Result{}, m.ctx.Err()
 	}
 }
 
 func (m *Manager) Continue(callContext context.Context, options ContinueOptions) (Result, error) {
+	if err := callContext.Err(); err != nil {
+		return Result{}, err
+	}
+	if err := m.ctx.Err(); err != nil {
+		return Result{}, err
+	}
 	if strings.TrimSpace(options.SessionID) == "" {
 		return Result{}, errors.New("session_id cannot be empty")
 	}
@@ -249,17 +338,12 @@ func (m *Manager) Continue(callContext context.Context, options ContinueOptions)
 	if entry == nil {
 		return Result{}, errors.New("process session was not found or has already been collected")
 	}
+	if options.Terminate && (options.Stdin != "" || options.CloseStdin || options.Columns != 0 || options.Rows != 0) {
+		return Result{}, errors.New("terminate cannot be combined with input or resize")
+	}
 	if options.Stdin != "" {
-		entry.mu.Lock()
-		stdin, closed := entry.stdin, entry.stdinDone
-		if stdin == nil || closed {
-			entry.mu.Unlock()
-			return Result{}, errors.New("process stdin is not open; start it with keep_stdin_open")
-		}
-		_, writeErr := io.WriteString(stdin, options.Stdin)
-		entry.mu.Unlock()
-		if writeErr != nil {
-			return Result{}, fmt.Errorf("write process stdin: %w", writeErr)
+		if err := entry.writeStdin(callContext, options.Stdin); err != nil {
+			return Result{}, err
 		}
 	}
 	if options.CloseStdin {
@@ -274,7 +358,14 @@ func (m *Manager) Continue(callContext context.Context, options ContinueOptions)
 		if options.Columns < 1 || options.Columns > 1000 || options.Rows < 1 || options.Rows > 1000 {
 			return Result{}, errors.New("columns and rows must both be between 1 and 1000")
 		}
-		if err := entry.terminal.Resize(options.Columns, options.Rows); err != nil {
+		entry.terminalMu.Lock()
+		if entry.terminalClosed {
+			entry.terminalMu.Unlock()
+			return Result{}, errors.New("PTY session has exited")
+		}
+		err := entry.terminal.Resize(options.Columns, options.Rows)
+		entry.terminalMu.Unlock()
+		if err != nil {
 			return Result{}, fmt.Errorf("resize pseudo-terminal: %w", err)
 		}
 	}
@@ -292,6 +383,8 @@ func (m *Manager) Continue(callContext context.Context, options ContinueOptions)
 		return entry.result(true), nil
 	case <-callContext.Done():
 		return Result{}, callContext.Err()
+	case <-m.ctx.Done():
+		return Result{}, m.ctx.Err()
 	}
 }
 
@@ -299,6 +392,20 @@ func (m *Manager) remove(id string) {
 	m.mu.Lock()
 	delete(m.sessions, id)
 	m.mu.Unlock()
+}
+
+// Close stops admission, terminates process trees, and joins process/output workers.
+func (m *Manager) Close() error {
+	m.closeOnce.Do(func() {
+		m.mu.Lock()
+		m.closed = true
+		m.cancel()
+		m.mu.Unlock()
+		m.starting.Wait()
+		m.closeAll()
+		m.workers.Wait()
+	})
+	return nil
 }
 
 func (m *Manager) closeAll() {
@@ -310,6 +417,9 @@ func (m *Manager) closeAll() {
 	m.mu.Unlock()
 	for _, entry := range sessions {
 		entry.terminate(false)
+	}
+	for _, entry := range sessions {
+		<-entry.done
 	}
 }
 
@@ -325,11 +435,21 @@ func (s *session) wait() {
 		}
 	}
 	s.mu.Unlock()
+	s.controlMu.Lock()
 	_ = s.control.Close()
+	s.control = nil
+	s.controlMu.Unlock()
+	_ = s.closeStdin()
 	if s.terminal != nil {
-		_ = s.terminal.Close()
-		<-s.outputDone
+		s.terminalMu.Lock()
+		s.terminalClosed = true
+		finishTerminal(s.terminal, s.outputDone)
+		s.terminalMu.Unlock()
+		s.mu.Lock()
+		s.stdinDone = true
+		s.mu.Unlock()
 	}
+	s.inputWorkers.Wait()
 	close(s.done)
 }
 
@@ -351,20 +471,88 @@ func (s *session) terminate(timedOut bool) {
 		s.timedOut = true
 	}
 	s.mu.Unlock()
-	_ = s.control.Kill()
+	// Do not wait for input serialization: closing the handle unblocks a writer.
+	_ = s.closeStdin()
+	s.controlMu.Lock()
+	if s.control != nil {
+		_ = s.control.Kill()
+	}
+	s.controlMu.Unlock()
 }
 
 func (s *session) closeStdin() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.stdin == nil || s.stdinDone {
+		s.mu.Unlock()
 		return nil
 	}
+	if s.terminal != nil {
+		s.mu.Unlock()
+		return errors.New("PTY input cannot be half-closed; terminate the session instead")
+	}
 	s.stdinDone = true
-	return s.stdin.Close()
+	stdin := s.stdin
+	s.mu.Unlock()
+	return stdin.Close()
+}
+
+func (s *session) writeStdin(ctx context.Context, text string) error {
+	if len(text) > maxOutputBytes {
+		return errors.New("stdin exceeds the 16 MiB limit")
+	}
+	s.mu.Lock()
+	if s.inputWaiters >= maxInputWaiters {
+		s.mu.Unlock()
+		return errors.New("process input queue is full")
+	}
+	s.inputWaiters++
+	s.mu.Unlock()
+	defer func() { s.mu.Lock(); s.inputWaiters--; s.mu.Unlock() }()
+	select {
+	case s.inputGate <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.done:
+		return errors.New("process has exited")
+	}
+	if err := ctx.Err(); err != nil {
+		<-s.inputGate
+		return err
+	}
+	s.mu.Lock()
+	stdin, closed := s.stdin, s.stdinDone
+	if stdin == nil || closed {
+		s.mu.Unlock()
+		<-s.inputGate
+		return errors.New("process stdin is not open; start it with keep_stdin_open")
+	}
+	s.inputWorkers.Add(1)
+	s.mu.Unlock()
+	finished := make(chan error, 1)
+	go func() {
+		defer s.inputWorkers.Done()
+		_, err := io.WriteString(stdin, text)
+		<-s.inputGate
+		finished <- err
+	}()
+	select {
+	case err := <-finished:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.done:
+		return errors.New("process has exited")
+	}
 }
 
 func (s *session) result(running bool) Result {
+	s.resultMu.Lock()
+	defer s.resultMu.Unlock()
+	select {
+	case <-s.done:
+		running = false
+	default:
+	}
 	stdout, stdoutTruncated := s.stdout.Drain()
 	stderr, stderrTruncated := s.stderr.Drain()
 	s.mu.Lock()
@@ -384,6 +572,9 @@ func (s *session) result(running bool) Result {
 func validateOptions(options Options) (string, int, int, int, error) {
 	if strings.TrimSpace(options.Program) == "" {
 		return "", 0, 0, 0, errors.New("program cannot be empty")
+	}
+	if len(options.Stdin) > maxOutputBytes {
+		return "", 0, 0, 0, errors.New("stdin exceeds the 16 MiB limit")
 	}
 	directory := options.Directory
 	if directory == "" {
@@ -453,11 +644,11 @@ func mergeEnvironment(overrides map[string]string) []string {
 	values := make(map[string]string)
 	for _, entry := range os.Environ() {
 		if index := strings.IndexByte(entry, '='); index >= 0 {
-			values[strings.ToUpper(entry[:index])] = entry
+			values[environmentKey(entry[:index])] = entry
 		}
 	}
 	for name, value := range overrides {
-		values[strings.ToUpper(name)] = name + "=" + value
+		values[environmentKey(name)] = name + "=" + value
 	}
 	result := make([]string, 0, len(values))
 	for _, entry := range values {
@@ -465,6 +656,67 @@ func mergeEnvironment(overrides map[string]string) []string {
 	}
 	sort.Strings(result)
 	return result
+}
+
+func environmentKey(name string) string {
+	if runtime.GOOS == "windows" {
+		return strings.ToUpper(name)
+	}
+	return name
+}
+
+func environmentValue(environment []string, name string) string {
+	for _, entry := range environment {
+		if index := strings.IndexByte(entry, '='); index >= 0 && environmentKey(entry[:index]) == environmentKey(name) {
+			return entry[index+1:]
+		}
+	}
+	return ""
+}
+
+func resolveProgram(program, directory string, environment []string) (string, error) {
+	if strings.ContainsAny(program, `/\\`) || filepath.IsAbs(program) {
+		if !filepath.IsAbs(program) {
+			program = filepath.Join(directory, program)
+		}
+		return findExecutable(program, environment)
+	}
+	for _, component := range filepath.SplitList(environmentValue(environment, "PATH")) {
+		component = strings.Trim(component, `"`)
+		if component == "" {
+			component = directory
+		}
+		if !filepath.IsAbs(component) {
+			component = filepath.Join(directory, component)
+		}
+		if resolved, err := findExecutable(filepath.Join(component, program), environment); err == nil {
+			return resolved, nil
+		}
+	}
+	return "", exec.ErrNotFound
+}
+
+func findExecutable(path string, environment []string) (string, error) {
+	candidates := []string{path}
+	if runtime.GOOS == "windows" && filepath.Ext(path) == "" {
+		extensions := environmentValue(environment, "PATHEXT")
+		if extensions == "" {
+			extensions = ".COM;.EXE;.BAT;.CMD"
+		}
+		candidates = nil
+		for _, extension := range strings.Split(extensions, ";") {
+			if extension != "" {
+				candidates = append(candidates, path+extension)
+			}
+		}
+	}
+	for _, candidate := range candidates {
+		info, err := os.Stat(candidate)
+		if err == nil && info.Mode().IsRegular() && (runtime.GOOS == "windows" || info.Mode()&0o111 != 0) {
+			return filepath.Abs(candidate)
+		}
+	}
+	return "", exec.ErrNotFound
 }
 
 func newSessionID() string {

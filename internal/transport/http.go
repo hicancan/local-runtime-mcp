@@ -15,10 +15,15 @@ import (
 
 const DefaultHTTPListen = "127.0.0.1:9316"
 
+// InternalTokenHeader authenticates the provider-to-host loopback hop separately
+// from the MCP client's forwarded Authorization header.
+const InternalTokenHeader = "X-Local-Runtime-MCP-Internal-Token"
+
 type HTTPConfig struct {
-	Listen      string
-	BearerToken string
-	PublicHost  string
+	Listen        string
+	BearerToken   string
+	PublicHost    string
+	InternalToken bool
 }
 
 type HTTPServer struct {
@@ -50,6 +55,7 @@ func NewHTTP(server *mcp.Server, cfg HTTPConfig) (*HTTPServer, error) {
 		JSONResponse:                 true,
 		DisableLocalhostProtection:   true,
 		PropagateRequestCancellation: true,
+		MaxRequestBodyBytes:          32 << 20,
 	})
 	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/mcp" {
@@ -60,13 +66,18 @@ func NewHTTP(server *mcp.Server, cfg HTTPConfig) (*HTTPServer, error) {
 			http.Error(writer, "forbidden host", http.StatusForbidden)
 			return
 		}
-		if request.Header.Get("Origin") != "" {
+		if !cfg.InternalToken && request.Header.Get("Origin") != "" {
 			http.Error(writer, "browser-origin requests are not allowed", http.StatusForbidden)
 			return
 		}
-		provided := strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
-		if len(provided) != len(cfg.BearerToken) || subtle.ConstantTimeCompare([]byte(provided), []byte(cfg.BearerToken)) != 1 {
-			writer.Header().Set("WWW-Authenticate", `Bearer realm="local-runtime-mcp"`)
+		provided, bearer := strings.CutPrefix(request.Header.Get("Authorization"), "Bearer ")
+		if cfg.InternalToken {
+			provided, bearer = request.Header.Get(InternalTokenHeader), true
+		}
+		if !bearer || len(provided) != len(cfg.BearerToken) || subtle.ConstantTimeCompare([]byte(provided), []byte(cfg.BearerToken)) != 1 {
+			if !cfg.InternalToken {
+				writer.Header().Set("WWW-Authenticate", `Bearer realm="local-runtime-mcp"`)
+			}
 			http.Error(writer, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -96,7 +107,12 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	case <-ctx.Done():
 		// This server is stateless: terminal shutdown should take the machine
 		// offline immediately instead of waiting on a client's open HTTP body.
-		return s.server.Close()
+		err := s.server.Close()
+		serveErr := <-errorsChannel
+		if errors.Is(serveErr, http.ErrServerClosed) {
+			serveErr = nil
+		}
+		return errors.Join(err, serveErr)
 	}
 }
 

@@ -1,15 +1,17 @@
 import { packagedConfig } from './runtime_config.js';
+import { LaneScheduler } from './scheduler.js';
 
-const VERSION = '9.0.3';
+const VERSION = '10.0.0';
 const attachedTabs = new Set<number>();
 const childSessions = new Map<number, Set<string>>();
 const dialogWaiters = new Map<number, Set<() => void>>();
+const openDialogs = new Set<number>();
 type Dynamic = Record<string, any>;
 type DebugSource = chrome.debugger.Debuggee & { tabId: number; sessionId?: string };
 type TargetReference = { source: DebugSource; backendNodeId: number };
 type PageState = {
   epoch: string;
-  screenshot: { id: string; width: number; height: number } | null;
+  screenshot: { id: string; width: number; height: number; pageX: number; pageY: number } | null;
   snapshots: Map<string, Map<string, TargetReference>>;
   snapshotOrder: string[];
 };
@@ -18,9 +20,68 @@ type Point = { x: number; y: number; source: DebugSource };
 const pageStates = new Map<number, PageState>();
 let generation = 0;
 let stateSequence = 0;
+let bootId = crypto.randomUUID();
+const tabHandles = new Map<number, string>();
+const nativeTabs = new Map<string, number>();
+const operationObservations = new Map<number, PageState>();
+const executionSignals = new Map<number, AbortSignal>();
+const openingTabs = new Set<number>();
+const scheduler = new LaneScheduler();
+let pollAbort = new AbortController();
+let lastBridgeId = '';
+type Delivery = { base: string; headers: Record<string, string>; payload: Dynamic; bytes: number; attempts: number; active: boolean; readyAt: number };
+const resultOutbox = new Map<string, Delivery>();
+let outboxBytes = 0;
+let resultDeliveries = 0;
+let retryDeliveries = 0;
+
+function deliverResult(base: string, headers: Record<string,string>, payload: Dynamic) {
+  let bytes = JSON.stringify(payload).length;
+  if (outboxBytes + bytes > 64 * 1024 * 1024) {
+    payload = { id: payload.id, instance_id: payload.instance_id, boot_id: payload.boot_id,
+      error: 'operation finished, but response buffering capacity was exceeded; do not replay side effects automatically' };
+    bytes = JSON.stringify(payload).length;
+  }
+  const key = `${base}:${payload.boot_id}:${payload.id}`;
+  if (!resultOutbox.has(key)) {
+    if (resultOutbox.size >= 256) {
+      // Bound responses retained across provider reconfiguration/restarts. A
+      // canceled command with no live execution can acknowledge cancellation again.
+      const oldest = [...resultOutbox].find(([,entry]) => !entry.active);
+      if (oldest) { resultOutbox.delete(oldest[0]); outboxBytes -= oldest[1].bytes; }
+      else return;
+    }
+    resultOutbox.set(key, { base, headers, payload, bytes, attempts: 0, active: false, readyAt: 0 }); outboxBytes += bytes;
+  }
+  flushResults();
+}
+
+function flushResults() {
+  const ready = [...resultOutbox].filter(([,entry]) => !entry.active && entry.readyAt <= Date.now()).sort((a,b)=>a[1].readyAt-b[1].readyAt);
+  const fresh = ready.filter(([,entry])=>entry.attempts===0), retries = ready.filter(([,entry])=>entry.attempts>0);
+  while (resultDeliveries < 4 && (fresh.length || retries.length)) {
+    // Reserve progress for one retry as well as fresh acknowledgements. A busy
+    // new connection must not indefinitely starve an older desktop reservation.
+    const next = retryDeliveries===0 && retries.length ? retries.shift()! : fresh.shift() || retries.shift()!;
+    const [key,entry] = next;
+    const retry = entry.attempts>0;
+    if (retry) retryDeliveries++;
+    entry.active = true; entry.attempts++; resultDeliveries++;
+    fetch(`${entry.base}/result`, { method: 'POST', headers: entry.headers, body: JSON.stringify(entry.payload), signal: AbortSignal.timeout(5000) })
+      .then(result => {
+        if (result.ok || [404,409,401].includes(result.status)) { resultOutbox.delete(key); outboxBytes -= entry.bytes; }
+      }).catch(() => {}) // Retry acknowledgement only; never re-execute a command.
+      .finally(() => { entry.active = false; entry.readyAt = Date.now()+2000; resultDeliveries--; if(retry)retryDeliveries--; flushResults(); });
+  }
+}
+setInterval(() => void flushResults(), 2000);
 
 async function sendCDP(source: DebugSource, method: string, params?: Record<string, unknown>): Promise<any> {
-  return chrome.debugger.sendCommand(source, method, params);
+  const signal = executionSignals.get(source.tabId);
+  signal?.throwIfAborted();
+  const command = chrome.debugger.sendCommand(source, method, params);
+  if (!signal) return command;
+  return withAbort(command, signal, source.tabId);
 }
 
 async function sendCDPAllowDialog(source: DebugSource, method: string, params?: Record<string, unknown>): Promise<any> {
@@ -35,6 +96,7 @@ async function sendCDPAllowDialog(source: DebugSource, method: string, params?: 
     value => ({ dialog: false as const, value }),
     error => ({ dialog: false as const, error })
   );
+  if (openDialogs.has(source.tabId)) signal();
   try {
     const outcome = await Promise.race([command, dialog]);
     if (outcome.dialog) return undefined;
@@ -47,7 +109,11 @@ async function sendCDPAllowDialog(source: DebugSource, method: string, params?: 
 }
 
 chrome.runtime.onMessage.addListener((message) => {
-  if (message?.type === 'settings-changed') run(++generation);
+  if (message?.type === 'settings-changed') {
+    pollAbort.abort(); scheduler.cancelAll();
+    bootId = crypto.randomUUID(); tabHandles.clear(); nativeTabs.clear(); pageStates.clear();
+    pollAbort = new AbortController(); run(++generation);
+  }
 });
 chrome.debugger.onDetach.addListener((source) => {
 	if (!source.tabId) return;
@@ -59,7 +125,10 @@ chrome.debugger.onEvent.addListener((source, method, rawParams) => {
 	if (!source.tabId) return;
   const params: any = rawParams || {};
   if (method === 'Page.javascriptDialogOpening') {
+    openDialogs.add(source.tabId);
     for (const signal of dialogWaiters.get(source.tabId) || []) signal();
+  } else if (method === 'Page.javascriptDialogClosed') {
+    openDialogs.delete(source.tabId);
   }
   if (method === 'Target.attachedToTarget' && params.sessionId) {
     let sessions = childSessions.get(source.tabId);
@@ -71,24 +140,31 @@ chrome.debugger.onEvent.addListener((source, method, rawParams) => {
     }).catch(() => {});
   } else if (method === 'Target.detachedFromTarget' && params.sessionId) {
     childSessions.get(source.tabId)?.delete(params.sessionId);
+    invalidateDocument(source.tabId);
+  } else if (method === 'Page.frameNavigated' || method === 'Page.frameDetached') {
+    invalidateDocument(source.tabId);
   }
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
   attachedTabs.delete(tabId);
-  invalidatePage(tabId);
+  invalidateDocument(tabId);
+  const handle = tabHandles.get(tabId); if (handle) nativeTabs.delete(handle);
+  tabHandles.delete(tabId);
 });
 chrome.tabs.onUpdated.addListener((tabId, change) => {
-  if (change.status === 'loading' || change.url) invalidatePage(tabId);
+  if (change.status === 'loading' || change.url) invalidateDocument(tabId);
 });
 
 run(++generation);
 
 async function run(currentGeneration: number) {
+  const currentBoot = bootId;
+  const abort = pollAbort;
   while (currentGeneration === generation) {
     const settings = await chrome.storage.local.get({
       address: packagedConfig.address || '127.0.0.1:9315',
       token: packagedConfig.token || '',
-      instanceId: ''
+      instanceId: '', label: ''
     });
     if (!settings.instanceId) {
       settings.instanceId = crypto.randomUUID();
@@ -100,41 +176,117 @@ async function run(currentGeneration: number) {
     }
     const base = `http://${settings.address}/v1`;
     const headers = { Authorization: `Bearer ${settings.token}`, 'Content-Type': 'application/json' };
+    const peer = { instance_id: settings.instanceId, boot_id: currentBoot, label: settings.label || 'Browser profile', browser: navigator.userAgent, extension_version: VERSION };
+    if (currentGeneration !== generation) return;
+    const connection = new AbortController();
+    const stopConnection = () => connection.abort();
+    abort.signal.addEventListener('abort', stopConnection, { once: true });
     try {
-      const response = await fetch(`${base}/poll`, {
-        method: 'POST', headers,
-        body: JSON.stringify({ instance_id: settings.instanceId, browser: navigator.userAgent, extension_version: VERSION })
-      });
-      if (response.status === 204) continue;
-      if (!response.ok) throw new Error(`bridge returned HTTP ${response.status}`);
-      const command = await response.json();
-      let payload;
-      try {
-        payload = { id: command.id, instance_id: settings.instanceId, result: await execute(command.method, command.params || {}) };
-      } catch (error: any) {
-        payload = { id: command.id, instance_id: settings.instanceId, error: error?.message || String(error) };
+      const hello = await fetch(`${base}/hello`, { method: 'POST', headers, body: JSON.stringify(peer), signal: connection.signal });
+      if (!hello.ok) throw new Error(`registration returned HTTP ${hello.status}`);
+      const bridgeId = hello.headers.get('X-LRMCP-Bridge-ID') || '';
+      if (lastBridgeId && bridgeId !== lastBridgeId) {
+        scheduler.cancelAll(); pageStates.clear(); operationObservations.clear(); tabHandles.clear(); nativeTabs.clear();
       }
-      const sent = await fetch(`${base}/result`, { method: 'POST', headers, body: JSON.stringify(payload) });
-      if (!sent.ok && sent.status !== 404) throw new Error(`result returned HTTP ${sent.status}`);
+      lastBridgeId = bridgeId;
+      void flushResults();
+      const heartbeat = setInterval(() => {
+        fetch(`${base}/heartbeat`, { method: 'POST', headers, body: JSON.stringify(peer), signal: connection.signal }).then(response => {
+          if (response.status === 409) connection.abort();
+        }).catch(() => {});
+      }, 10000);
+      try {
+        while (currentGeneration === generation) {
+          const response = await fetch(`${base}/poll`, { method: 'POST', headers, body: JSON.stringify(peer), signal: connection.signal });
+          if (currentGeneration !== generation) return;
+          if (response.status === 204) continue;
+          if (!response.ok) throw new Error(`bridge returned HTTP ${response.status}`);
+          const command = await response.json();
+          if (command.boot_id !== currentBoot) throw new Error('command generation is stale');
+          if (command.method === 'cancel') {
+            if (!scheduler.cancel(command.id)) deliverResult(base,headers,{ id:command.id,...peer,error:'operation is no longer executing; canceled outcome may be unknown' });
+            continue;
+          }
+          const params = command.params || {};
+          let native: number | undefined;
+          try { native = params.tab_id ? requireTabID(params) : undefined; }
+          catch (error: any) {
+            deliverResult(base, headers, { id: command.id, ...peer, error: error?.message || String(error) });
+            continue;
+          }
+          const lane = native === undefined ? command.method : openingTabs.has(native) ? 'tabs.open' : `tab:${native}`;
+          // Intake continues while execution runs. Waiting lanes consume no active slot.
+          scheduler.submit(command.id, lane, command.deadline, async signal => {
+            if (native !== undefined) executionSignals.set(native, signal);
+            const canceled = () => {
+              if (native !== undefined) {
+                invalidatePage(native);
+                chrome.debugger.detach({ tabId: native }).catch(() => {});
+              }
+            };
+            signal.addEventListener('abort', canceled, { once: true });
+            try {
+              signal.throwIfAborted();
+              if (await affectsVisiblePage(command.method, params, native)) {
+                const authorized = await fetch(`${base}/authorize`, { method: 'POST', headers, body: JSON.stringify({ id: command.id, instance_id: settings.instanceId, boot_id: currentBoot }), signal });
+                if (!authorized.ok) throw new Error(await authorized.text());
+              }
+              signal.throwIfAborted();
+              return await execute(command.method, params, signal);
+            } finally {
+              signal.removeEventListener('abort', canceled);
+              if (native !== undefined) { executionSignals.delete(native); operationObservations.delete(native); }
+            }
+          }).then(result => ({ id: command.id, ...peer, result }), error => ({ id: command.id, ...peer, error: error?.message || String(error) }))
+            .then(payload => deliverResult(base, headers, payload)).catch(() => {});
+        }
+      } finally {
+        clearInterval(heartbeat); if (currentGeneration === generation) scheduler.cancelAll();
+      }
     } catch {
       await delay(1000);
+    } finally {
+      connection.abort(); abort.signal.removeEventListener('abort', stopConnection);
     }
   }
 }
 
-async function execute(method: string, params: Dynamic) {
+async function affectsVisiblePage(method: string, params: Dynamic, tabId?: number) {
+  if (method === 'tabs.open') return params.active === true;
+  if (!['tabs.close', 'page.navigate', 'page.action'].includes(method) || tabId === undefined) return false;
+  if (method === 'page.action' && params.kind === 'evaluate') return true; // arbitrary JS is not target-scoped
+  const tab = await chrome.tabs.get(tabId);
+  const window = await chrome.windows.get(tab.windowId);
+  return !!tab.active && !!window.focused;
+}
+
+function withAbort<T>(operation: Promise<T>, signal: AbortSignal, tabId: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    // Await detach acknowledgement before reporting canceled execution. A caller
+    // timeout alone is not proof that an already-submitted CDP action stopped.
+    const abort = () => chrome.debugger.detach({ tabId }).catch(() => {}).finally(() => reject(signal.reason || new Error('browser operation canceled; outcome may be unknown')));
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+    operation.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+  });
+}
+
+async function execute(method: string, params: Dynamic, signal: AbortSignal) {
+  signal.throwIfAborted();
   switch (method) {
     case 'tabs.list':
       return (await chrome.tabs.query({})).filter(isControllableTab).map(tabView);
     case 'tabs.open': {
-      const tab = await chrome.tabs.create({ url: params.url || 'about:blank', active: params.active !== false });
+      const tab = await chrome.tabs.create({ url: params.url || 'about:blank', active: params.active === true });
 	  if (!tab.id) throw new Error('browser did not assign a tab ID');
-      await waitForLoad(tab.id);
-      return tabView(await chrome.tabs.get(tab.id));
+      openingTabs.add(tab.id);
+      executionSignals.set(tab.id, signal);
+      try { await waitForLoad(tab.id); signal.throwIfAborted(); return tabView(await chrome.tabs.get(tab.id)); }
+      finally { executionSignals.delete(tab.id); openingTabs.delete(tab.id); }
     }
     case 'tabs.close':
       invalidatePage(requireTabID(params));
-      await chrome.tabs.remove(params.tab_id);
+      await chrome.tabs.remove(requireTabID(params));
       return {};
     case 'page.navigate': {
       const id = requireTabID(params);
@@ -171,11 +323,11 @@ async function execute(method: string, params: Dynamic) {
 
 async function snapshot(tabId: number, maxElements: unknown, maxText: unknown) {
   const tab = await chrome.tabs.get(tabId);
-  const state = pageState(tabId);
-  const snapshotId = `${state.epoch}:q${(++stateSequence).toString(36)}`;
 	await attach(tabId);
 	// Auto-attach events for already existing OOPIF targets are asynchronous.
 	await delay(50);
+  const state = pageState(tabId);
+  const snapshotId = `${state.epoch}:q${(++stateSequence).toString(36)}`;
 	const limit = numberLiteral(maxElements, 1, 5000), textLimit = numberLiteral(maxText, 1, 500000);
   const sources = [{ tabId }, ...Array.from(childSessions.get(tabId) || []).map(sessionId => ({ tabId, sessionId }))];
   const elements: any[] = [], texts: string[] = [], refs = new Map<string, TargetReference>();
@@ -206,6 +358,7 @@ async function snapshot(tabId: number, maxElements: unknown, maxText: unknown) {
       });
     }
   }
+  if (pageStates.get(tabId) !== state) throw new Error('page changed during observation; request another snapshot');
   state.snapshots.set(snapshotId, refs);
   state.snapshotOrder.push(snapshotId);
   while (state.snapshotOrder.length > 8) {
@@ -214,7 +367,7 @@ async function snapshot(tabId: number, maxElements: unknown, maxText: unknown) {
   }
   const joinedText = texts.join('\n');
   return {
-    tab_id: tabId, page_epoch: state.epoch, snapshot_id: snapshotId, title: tab.title || '', url: tab.url || '',
+    tab_id: tabHandle(tabId), page_epoch: state.epoch, snapshot_id: snapshotId, title: tab.title || '', url: tab.url || '',
     text: joinedText.slice(0, textLimit), text_truncated: joinedText.length > textLimit,
     elements, elements_truncated: elementsTruncated
   };
@@ -227,8 +380,8 @@ const interactiveAXRoles = new Set([
 
 async function screenshot(tabId: number, params: Dynamic) {
   const tab = await chrome.tabs.get(tabId);
-  const state = pageState(tabId);
   await attach(tabId);
+  const state = pageState(tabId);
   const metrics = await sendCDP({ tabId }, 'Page.getLayoutMetrics');
   const viewport = metrics.cssVisualViewport || metrics.visualViewport;
   const content = metrics.cssContentSize || metrics.contentSize;
@@ -249,16 +402,17 @@ async function screenshot(tabId: number, params: Dynamic) {
 	const options: Record<string, any> = { format: 'png', fromSurface: true, captureBeyondViewport };
   if (clip) options.clip = clip;
   const capture = await sendCDP({ tabId }, 'Page.captureScreenshot', options);
+  if (pageStates.get(tabId) !== state) throw new Error('page changed during capture; request another screenshot');
   if (capture.data.length > 60 * 1024 * 1024) throw new Error('encoded screenshot exceeds the 60 MiB bridge limit');
   let screenshotId = '';
   if (!params.full_page && !clip) {
     screenshotId = `${state.epoch}:p${(++stateSequence).toString(36)}`;
-    state.screenshot = { id: screenshotId, width, height };
+    state.screenshot = { id: screenshotId, width, height, pageX: viewport.pageX, pageY: viewport.pageY };
   }
   return {
     data_base64: capture.data,
     info: {
-      tab_id: tabId, page_epoch: state.epoch, screenshot_id: screenshotId, title: tab.title || '', url: tab.url || '',
+      tab_id: tabHandle(tabId), page_epoch: state.epoch, screenshot_id: screenshotId, title: tab.title || '', url: tab.url || '',
       x, y, width, height, full_page: !!params.full_page, mime_type: 'image/png'
     }
   };
@@ -267,6 +421,11 @@ async function screenshot(tabId: number, params: Dynamic) {
 async function action(params: Dynamic) {
   const tabId = requireTabID(params);
   validateActionState(tabId, params);
+  const observation = pageStates.get(tabId);
+  if (observation) operationObservations.set(tabId, observation);
+  // Once execution can produce any side effect, old observations are unusable,
+  // including when a later operation fails after only part of the action.
+  invalidatePage(tabId);
   let value;
   switch (params.kind) {
     case 'click':
@@ -289,17 +448,20 @@ async function action(params: Dynamic) {
       const buttons = buttonMask(button);
       if (!Number.isFinite(end.x) || !Number.isFinite(end.y)) throw new Error('drag requires to_x and to_y');
       if (params.screenshot_id) {
-        const viewport = pageStates.get(tabId)?.screenshot;
+        const viewport = operationObservations.get(tabId)?.screenshot;
         if (!viewport || end.x < 0 || end.y < 0 || end.x >= viewport.width || end.y >= viewport.height) {
           throw new Error('drag destination is outside the referenced viewport screenshot');
         }
       }
-	  await mouse(start.source, 'mouseMoved', start.x, start.y, 'none', 0, 0);
-	  await mouse(start.source, 'mousePressed', start.x, start.y, button, buttons, 1);
-      for (let step = 1; step <= 12; step++) {
-		await mouse(start.source, 'mouseMoved', start.x + (end.x - start.x) * step / 12, start.y + (end.y - start.y) * step / 12, button, buttons, 0);
+      await mouse(start.source, 'mouseMoved', start.x, start.y, 'none', 0, 0);
+      try {
+        await mouse(start.source, 'mousePressed', start.x, start.y, button, buttons, 1);
+        for (let step = 1; step <= 12; step++) {
+          await mouse(start.source, 'mouseMoved', start.x + (end.x - start.x) * step / 12, start.y + (end.y - start.y) * step / 12, button, buttons, 0);
+        }
+      } finally {
+        await sendCDPAllowDialog(start.source, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: end.x, y: end.y, button, buttons: 0, clickCount: 1 }).catch(() => {});
       }
-	  await mouse(start.source, 'mouseReleased', end.x, end.y, button, 0, 1);
       value = true;
       break;
     }
@@ -359,17 +521,20 @@ async function action(params: Dynamic) {
       throw new Error(`unsupported browser action ${params.kind}`);
   }
   invalidatePage(tabId);
-  return { tab_id: tabId, kind: params.kind, success: true, value };
+  return { tab_id: tabHandle(tabId), kind: params.kind, success: true, value };
 }
 
 async function targetPoint(tabId: number, params: Dynamic): Promise<Point> {
   if (params.screenshot_id) {
-    const state = pageStates.get(tabId)?.screenshot;
+    const state = operationObservations.get(tabId)?.screenshot;
     if (!state || state.id !== params.screenshot_id) throw new Error('screenshot_id is stale; capture the viewport again');
     const x = Number(params.x), y = Number(params.y);
     if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x >= state.width || y >= state.height) {
       throw new Error('coordinates are outside the referenced viewport screenshot');
     }
+    const metrics = await sendCDP({ tabId }, 'Page.getLayoutMetrics');
+    const viewport = metrics.cssVisualViewport || metrics.visualViewport;
+    if (viewport.clientWidth !== state.width || viewport.clientHeight !== state.height || viewport.pageX !== state.pageX || viewport.pageY !== state.pageY) throw new Error('viewport changed since screenshot; capture again');
     return { x, y, source: { tabId } };
   }
   const target = targetRef(tabId, params.ref);
@@ -387,7 +552,7 @@ function pageCenter() {
 function targetRef(tabId: number, ref: string): TargetReference {
   if (!ref) throw new Error('element ref is required');
   const marker = ref.lastIndexOf(':e'), snapshotId = marker > 0 ? ref.slice(0, marker) : '';
-  const target = pageStates.get(tabId)?.snapshots?.get(snapshotId)?.get(ref);
+  const target = (operationObservations.get(tabId) || pageStates.get(tabId))?.snapshots?.get(snapshotId)?.get(ref);
   if (!target) throw new Error('element ref was not found or is stale');
   return target;
 }
@@ -422,6 +587,11 @@ function invalidatePage(tabId: number) {
   pageStates.delete(tabId);
 }
 
+function invalidateDocument(tabId: number) {
+  operationObservations.delete(tabId);
+  invalidatePage(tabId);
+}
+
 function validateActionState(tabId: number, params: Dynamic) {
   if (!params.ref && !params.screenshot_id) return;
   const state = pageStates.get(tabId);
@@ -449,8 +619,8 @@ async function callPage(tabId: number, callback: Function, args: any[], returnBy
 
 async function clickAt(point: Point, button: string, count: number) {
   await mouse(point.source, 'mouseMoved', point.x, point.y, 'none', 0, 0);
-  await mouse(point.source, 'mousePressed', point.x, point.y, button, buttonMask(button), count);
-  await mouse(point.source, 'mouseReleased', point.x, point.y, button, 0, count);
+  try { await mouse(point.source, 'mousePressed', point.x, point.y, button, buttonMask(button), count); }
+  finally { await sendCDPAllowDialog(point.source, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: point.x, y: point.y, button, buttons: 0, clickCount: count }).catch(() => {}); }
 }
 
 async function mouse(source: DebugSource, type: string, x: number, y: number, button = 'none', buttons = 0, clickCount = 0, deltaX = 0, deltaY = 0) {
@@ -471,8 +641,8 @@ async function dispatchKey(tabId: number, combination: string) {
   const modifiers = parts.reduce((value, part) => value | (modifierValues[part.toLowerCase()] || 0), 0);
   const info = keyInfo(key);
   const payload = { key: info.key, code: info.code, windowsVirtualKeyCode: info.codeValue, nativeVirtualKeyCode: info.codeValue, modifiers };
-  await sendCDPAllowDialog({ tabId }, 'Input.dispatchKeyEvent', { ...payload, type: 'rawKeyDown' });
-  await sendCDPAllowDialog({ tabId }, 'Input.dispatchKeyEvent', { ...payload, type: 'keyUp' });
+  try { await sendCDPAllowDialog({ tabId }, 'Input.dispatchKeyEvent', { ...payload, type: 'rawKeyDown' }); }
+  finally { await sendCDPAllowDialog({ tabId }, 'Input.dispatchKeyEvent', { ...payload, type: 'keyUp' }).catch(() => {}); }
 }
 
 function keyInfo(value: string) {
@@ -525,6 +695,7 @@ async function waitForLoad(tabId: number) {
   const deadline = Date.now() + 30000;
   await delay(50);
   while (Date.now() < deadline) {
+    executionSignals.get(tabId)?.throwIfAborted();
     const tab = await chrome.tabs.get(tabId);
     if (tab.status === 'complete') return;
     await delay(100);
@@ -533,7 +704,14 @@ async function waitForLoad(tabId: number) {
 }
 
 function tabView(tab: chrome.tabs.Tab) {
-  return { id: tab.id, window_id: tab.windowId, title: tab.title || '', url: tab.url || '', active: !!tab.active, status: tab.status || '' };
+  if (!tab.id) throw new Error('tab has no native identity');
+  return { id: tabHandle(tab.id), window_id: tab.windowId, title: tab.title || '', url: tab.url || tab.pendingUrl || '', active: !!tab.active, status: tab.status || '' };
+}
+
+function tabHandle(tabId: number): string {
+  let handle = tabHandles.get(tabId);
+  if (!handle) { handle = `${bootId}.${crypto.randomUUID()}`; tabHandles.set(tabId, handle); nativeTabs.set(handle, tabId); }
+  return handle;
 }
 
 function isControllableTab(tab: chrome.tabs.Tab) {
@@ -541,8 +719,10 @@ function isControllableTab(tab: chrome.tabs.Tab) {
 }
 
 function requireTabID(params: Dynamic) {
-  if (!Number.isInteger(params.tab_id) || params.tab_id <= 0) throw new Error('tab_id must be a positive integer');
-  return params.tab_id;
+  if (typeof params.tab_id !== 'string') throw new Error('tab_id must be an opaque tab handle');
+  const tabId = nativeTabs.get(params.tab_id);
+  if (tabId === undefined) throw new Error('tab_id is stale or unknown; call browser_tabs again');
+  return tabId;
 }
 
 function requireString(value: unknown, name: string): string {

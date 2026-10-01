@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/hicancan/local-runtime-mcp/internal/config"
 	"github.com/hicancan/local-runtime-mcp/internal/runtimehost"
@@ -84,11 +85,13 @@ func TunnelCloudflare(ctx context.Context, cfg *config.Config, stderr io.Writer)
 		fmt.Fprintf(stderr, "Local Runtime MCP serving https://%s/mcp through Cloudflare Tunnel\n", cfg.HTTP.PublicHost)
 		select {
 		case err := <-httpErrors:
-			return err
+			cancel()
+			return errors.Join(err, <-tunnelErrors)
 		case err := <-tunnelErrors:
-			return err
+			cancel()
+			return errors.Join(err, <-httpErrors)
 		case <-tunnelContext.Done():
-			return nil
+			return errors.Join(<-httpErrors, <-tunnelErrors)
 		}
 	})
 }
@@ -101,17 +104,33 @@ func newHTTP(host *runtimehost.Host, cfg *config.Config) (*transport.HTTPServer,
 	})
 }
 
-func withHost(ctx context.Context, cfg *config.Config, run func(*runtimehost.Host) error) error {
+func withHost(ctx context.Context, cfg *config.Config, run func(*runtimehost.Host) error) (result error) {
 	host, err := runtimehost.Start(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	defer host.Close(context.Background())
+	defer func() {
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		result = errors.Join(result, host.Close(shutdown))
+	}()
 	return normalizeCancellation(run(host))
 }
 
 func normalizeCancellation(err error) error {
-	if err == nil || errors.Is(err, context.Canceled) || strings.HasPrefix(err.Error(), "server is closing:") {
+	if err == nil {
+		return nil
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		var remaining []error
+		for _, child := range joined.Unwrap() {
+			if cleaned := normalizeCancellation(child); cleaned != nil {
+				remaining = append(remaining, cleaned)
+			}
+		}
+		return errors.Join(remaining...)
+	}
+	if errors.Is(err, context.Canceled) || strings.HasPrefix(err.Error(), "server is closing:") {
 		return nil
 	}
 	return err

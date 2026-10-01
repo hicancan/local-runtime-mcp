@@ -3,6 +3,7 @@ package filesystem
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -13,10 +14,100 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"unicode/utf8"
 )
+
+// Service coordinates commits made through one runtime. External writers do not
+// participate in these locks.
+type Service struct {
+	mu       sync.Mutex
+	paths    map[string]*pathLock
+	capacity chan struct{}
+}
+
+type pathLock struct {
+	gate       chan struct{}
+	references int
+}
+
+func New() *Service {
+	return &Service{paths: make(map[string]*pathLock), capacity: make(chan struct{}, 256)}
+}
+
+func (s *Service) acquire(ctx context.Context, path string) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case s.capacity <- struct{}{}:
+	default:
+		return nil, errors.New("filesystem commit capacity is full")
+	}
+	key, err := commitIdentity(path)
+	if err != nil {
+		<-s.capacity
+		return nil, err
+	}
+	s.mu.Lock()
+	lock := s.paths[key]
+	if lock == nil {
+		lock = &pathLock{gate: make(chan struct{}, 1)}
+		s.paths[key] = lock
+	}
+	lock.references++
+	s.mu.Unlock()
+	cleanup := func() {
+		s.mu.Lock()
+		lock.references--
+		if lock.references == 0 {
+			delete(s.paths, key)
+		}
+		s.mu.Unlock()
+		<-s.capacity
+	}
+	select {
+	case lock.gate <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-lock.gate
+			cleanup()
+			return nil, err
+		}
+		return func() { <-lock.gate; cleanup() }, nil
+	case <-ctx.Done():
+		cleanup()
+		return nil, ctx.Err()
+	}
+}
+
+func commitIdentity(path string) (string, error) {
+	// Resolve existing parent aliases (including Windows junctions), while leaving
+	// the final component untouched so mutations can reject symbolic links.
+	parent := filepath.Dir(path)
+	suffix := filepath.Base(path)
+	for {
+		resolved, err := filepath.EvalSymlinks(parent)
+		if err == nil {
+			key := filepath.Clean(filepath.Join(resolved, suffix))
+			if runtime.GOOS == "windows" {
+				key = strings.ToLower(strings.TrimPrefix(key, `\\?\`))
+			}
+			return key, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		next := filepath.Dir(parent)
+		if next == parent {
+			return "", err
+		}
+		suffix = filepath.Join(filepath.Base(parent), suffix)
+		parent = next
+	}
+}
 
 const (
 	defaultTextBytes = 1 << 20
@@ -181,25 +272,25 @@ func ReadText(path string, options ReadTextOptions) (TextReadResult, error) {
 	line, endLine, nextLine := 0, 0, 0
 	truncated := false
 	for {
-		part, readErr := reader.ReadBytes('\n')
-		if len(part) > 0 {
+		part, present, readErr := readTextLine(reader, options.MaxBytes-len(data), line+1 >= options.StartLine)
+		if present {
 			line++
 			if line >= options.StartLine {
 				if options.LineCount > 0 && line >= options.StartLine+options.LineCount {
 					truncated, nextLine = true, line
 					break
 				}
-				if !utf8.Valid(part) || bytes.IndexByte(part, 0) >= 0 {
-					return TextReadResult{}, fmt.Errorf("file is not UTF-8 text at line %d", line)
-				}
-				if len(data)+len(part) > options.MaxBytes {
+				if errors.Is(readErr, errTextLineLimit) {
 					if len(data) == 0 {
 						return TextReadResult{}, fmt.Errorf("line %d exceeds max_bytes %d", line, options.MaxBytes)
 					}
 					truncated, nextLine = true, line
 					break
 				}
-				data = append(data, part...)
+				if !utf8.Valid(part) || bytes.IndexByte(part, 0) >= 0 {
+					return TextReadResult{}, fmt.Errorf("file is not UTF-8 text at line %d", line)
+				}
+				data = appendTextBytes(data, part, options.MaxBytes)
 				endLine = line
 			}
 		}
@@ -223,13 +314,62 @@ func ReadText(path string, options ReadTextOptions) (TextReadResult, error) {
 	return result, nil
 }
 
-func WriteText(path, content string, options WriteTextOptions) (TextWriteResult, error) {
+var errTextLineLimit = errors.New("text line exceeds retained byte budget")
+
+// readTextLine retains complete lines within a fixed budget. Skipped lines are
+// scanned in reader-sized fragments without allocating a full line.
+func readTextLine(reader *bufio.Reader, limit int, retain bool) ([]byte, bool, error) {
+	var data []byte
+	present := false
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		present = present || len(fragment) != 0
+		if retain {
+			if len(fragment) > limit-len(data) {
+				return data, present, errTextLineLimit
+			}
+			data = appendTextBytes(data, fragment, limit)
+		}
+		if !errors.Is(err, bufio.ErrBufferFull) {
+			return data, present, err
+		}
+	}
+}
+
+func appendTextBytes(data, fragment []byte, limit int) []byte {
+	if len(data)+len(fragment) > cap(data) {
+		capacity := min(limit, max(len(data)+len(fragment), cap(data)*2))
+		grown := make([]byte, len(data), capacity)
+		copy(grown, data)
+		data = grown
+	}
+	return append(data, fragment...)
+}
+
+func (s *Service) WriteText(ctx context.Context, path, content string, options WriteTextOptions) (TextWriteResult, error) {
 	resolved, err := resolve(path)
 	if err != nil {
 		return TextWriteResult{}, err
 	}
+	if options.Mode != "create" && options.Mode != "replace" {
+		return TextWriteResult{}, errors.New("mode must be create or replace")
+	}
+	if options.Mode == "replace" && !validHash(options.ExpectedSHA256) {
+		return TextWriteResult{}, errors.New("replace requires expected_sha256 containing 64 hexadecimal characters")
+	}
+	if options.Mode == "create" && options.ExpectedSHA256 != "" {
+		return TextWriteResult{}, errors.New("create cannot include expected_sha256")
+	}
+	unlock, err := s.acquire(ctx, resolved)
+	if err != nil {
+		return TextWriteResult{}, err
+	}
+	defer unlock()
 	data := []byte(content)
-	if !utf8.Valid(data) {
+	if len(data) > maxTextBytes {
+		return TextWriteResult{}, fmt.Errorf("content exceeds limit of %d bytes", maxTextBytes)
+	}
+	if !utf8.Valid(data) || bytes.IndexByte(data, 0) >= 0 {
 		return TextWriteResult{}, errors.New("content must be valid UTF-8")
 	}
 	created := false
@@ -240,7 +380,7 @@ func WriteText(path, content string, options WriteTextOptions) (TextWriteResult,
 		if info.Mode()&os.ModeSymlink != 0 {
 			return TextWriteResult{}, errors.New("write path cannot be a symbolic link")
 		}
-		if options.CreateOnly {
+		if options.Mode == "create" {
 			return TextWriteResult{}, errors.New("file already exists")
 		}
 		if !info.Mode().IsRegular() {
@@ -257,8 +397,8 @@ func WriteText(path, content string, options WriteTextOptions) (TextWriteResult,
 			}
 		}
 	case errors.Is(statErr, os.ErrNotExist):
-		if options.ExpectedSHA256 != "" {
-			return TextWriteResult{}, errors.New("expected_sha256 requires an existing file")
+		if options.Mode == "replace" {
+			return TextWriteResult{}, errors.New("replace requires an existing file")
 		}
 		created = true
 	default:
@@ -267,27 +407,29 @@ func WriteText(path, content string, options WriteTextOptions) (TextWriteResult,
 	if err := ensureParent(resolved, options.CreateParents); err != nil {
 		return TextWriteResult{}, err
 	}
-	if err := atomicWrite(resolved, data, mode); err != nil {
+	if err := atomicWrite(ctx, resolved, data, mode, options.Mode == "create"); err != nil {
 		return TextWriteResult{}, err
 	}
 	return TextWriteResult{Path: resolved, Bytes: len(data), Created: created, SHA256: hashBytes(data)}, nil
 }
 
-func PatchText(path string, options PatchTextOptions) (TextPatchResult, error) {
+func (s *Service) PatchText(ctx context.Context, path string, options PatchTextOptions) (TextPatchResult, error) {
 	resolved, err := resolve(path)
 	if err != nil {
 		return TextPatchResult{}, err
 	}
+	unlock, err := s.acquire(ctx, resolved)
+	if err != nil {
+		return TextPatchResult{}, err
+	}
+	defer unlock()
 	if len(options.Hunks) == 0 {
 		return TextPatchResult{}, errors.New("hunks cannot be empty")
 	}
 	if len(options.Hunks) > 1_000 {
 		return TextPatchResult{}, errors.New("hunks cannot contain more than 1000 items")
 	}
-	if len(options.ExpectedSHA256) != 64 {
-		return TextPatchResult{}, errors.New("expected_sha256 is required and must contain 64 hexadecimal characters")
-	}
-	if _, err := hex.DecodeString(options.ExpectedSHA256); err != nil {
+	if !validHash(options.ExpectedSHA256) {
 		return TextPatchResult{}, errors.New("expected_sha256 is required and must contain 64 hexadecimal characters")
 	}
 	info, err := os.Lstat(resolved)
@@ -303,9 +445,20 @@ func PatchText(path string, options PatchTextOptions) (TextPatchResult, error) {
 	if info.Size() > maxTextBytes {
 		return TextPatchResult{}, fmt.Errorf("file exceeds patch limit of %d bytes", maxTextBytes)
 	}
-	data, err := os.ReadFile(resolved)
+	file, err := os.Open(resolved)
 	if err != nil {
 		return TextPatchResult{}, err
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxTextBytes+1))
+	closeErr := file.Close()
+	if err != nil {
+		return TextPatchResult{}, err
+	}
+	if closeErr != nil {
+		return TextPatchResult{}, closeErr
+	}
+	if len(data) > maxTextBytes {
+		return TextPatchResult{}, fmt.Errorf("file exceeds patch limit of %d bytes", maxTextBytes)
 	}
 	if !utf8.Valid(data) || bytes.IndexByte(data, 0) >= 0 {
 		return TextPatchResult{}, errors.New("file is not UTF-8 text")
@@ -322,6 +475,12 @@ func PatchText(path string, options PatchTextOptions) (TextPatchResult, error) {
 	original := string(data)
 	located := make([]locatedHunk, 0, len(options.Hunks))
 	for index, hunk := range options.Hunks {
+		if len(hunk.Before)+len(hunk.Old)+len(hunk.After) > maxTextBytes || len(hunk.New) > maxTextBytes {
+			return TextPatchResult{}, fmt.Errorf("hunks[%d] exceeds text limit", index)
+		}
+		if !utf8.ValidString(hunk.New) || strings.IndexByte(hunk.New, 0) >= 0 {
+			return TextPatchResult{}, fmt.Errorf("hunks[%d] new must be UTF-8 text", index)
+		}
 		if hunk.Old == "" && hunk.Before == "" && hunk.After == "" {
 			return TextPatchResult{}, fmt.Errorf("hunks[%d] insertion requires before or after context", index)
 		}
@@ -343,16 +502,24 @@ func PatchText(path string, options PatchTextOptions) (TextPatchResult, error) {
 			return TextPatchResult{}, fmt.Errorf("hunks[%d] overlaps hunks[%d] in the original file", current.index, previous.index)
 		}
 	}
-	updated := append([]byte(nil), data...)
-	for index := len(located) - 1; index >= 0; index-- {
-		hunk := located[index]
-		updated = append(updated[:hunk.start], append([]byte(hunk.new), updated[hunk.end:]...)...)
+	updatedSize := int64(len(data))
+	for _, hunk := range located {
+		updatedSize += int64(len(hunk.new)) - int64(hunk.end-hunk.start)
 	}
-	updatedBytes := updated
-	if len(updatedBytes) > maxTextBytes {
+	if updatedSize > maxTextBytes {
 		return TextPatchResult{}, fmt.Errorf("patched file exceeds limit of %d bytes", maxTextBytes)
 	}
-	if err := atomicWrite(resolved, updatedBytes, info.Mode().Perm()); err != nil {
+	var updated bytes.Buffer
+	updated.Grow(int(updatedSize))
+	offset := 0
+	for _, hunk := range located {
+		updated.Write(data[offset:hunk.start])
+		updated.WriteString(hunk.new)
+		offset = hunk.end
+	}
+	updated.Write(data[offset:])
+	updatedBytes := updated.Bytes()
+	if err := atomicWrite(ctx, resolved, updatedBytes, info.Mode().Perm(), false); err != nil {
 		return TextPatchResult{}, err
 	}
 	return TextPatchResult{Path: resolved, Bytes: len(updatedBytes), Hunks: len(located), SHA256: hashBytes(updatedBytes)}, nil
@@ -491,7 +658,15 @@ func hashReader(reader io.Reader) (string, error) {
 	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
-func atomicWrite(path string, data []byte, mode os.FileMode) error {
+func validHash(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func atomicWrite(ctx context.Context, path string, data []byte, mode os.FileMode, createOnly bool) error {
 	temporary, err := os.CreateTemp(filepath.Dir(path), ".local-runtime-mcp-write-*")
 	if err != nil {
 		return err
@@ -518,7 +693,14 @@ func atomicWrite(path string, data []byte, mode os.FileMode) error {
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	if err := replaceFile(temporaryName, path); err != nil {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	commit := replaceFile
+	if createOnly {
+		commit = createFile
+	}
+	if err := commit(temporaryName, path); err != nil {
 		return err
 	}
 	committed = true

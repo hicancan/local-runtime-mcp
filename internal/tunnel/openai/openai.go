@@ -1,16 +1,31 @@
-// Package openai connects an MCP server to OpenAI Secure MCP Tunnel.
+// Package openai composes the official HTTP forwarding provider with a private
+// loopback MCP endpoint. The Runtime Host survives individual request failures.
 package openai
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"log/slog"
+	"net/url"
+	"strings"
 	"time"
 
+	"github.com/hicancan/local-runtime-mcp/internal/transport"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	tunnelclient "github.com/openai/tunnel-client"
+	controlplane "github.com/openai/tunnel-client/pkg/controlplane/fx"
+	"github.com/openai/tunnel-client/pkg/dispatcher"
+	providerlog "github.com/openai/tunnel-client/pkg/log"
+	"github.com/openai/tunnel-client/pkg/mcpclient"
+	"github.com/openai/tunnel-client/pkg/metrics"
+	"github.com/openai/tunnel-client/pkg/oauth"
+	providerprocess "github.com/openai/tunnel-client/pkg/process"
+	"github.com/openai/tunnel-client/pkg/runtimeconfig"
+	"github.com/openai/tunnel-client/pkg/tlsconfig"
+	"github.com/openai/tunnel-client/pkg/types"
+	"go.uber.org/fx"
 )
-
-const reconnectDelay = 250 * time.Millisecond
 
 type Config struct {
 	TunnelID string
@@ -18,94 +33,88 @@ type Config struct {
 }
 
 func Run(ctx context.Context, server *mcp.Server, cfg Config) error {
-	if cfg.TunnelID == "" {
-		return errors.New("OpenAI tunnel ID is required")
-	}
-	if cfg.APIKey == "" {
-		return errors.New("OpenAI tunnel API key is required")
-	}
-
-	return run(ctx, server, func(transport mcp.Transport) (tunnelRunner, error) {
-		return tunnelclient.New(tunnelclient.Config{TunnelID: cfg.TunnelID, APIKey: cfg.APIKey}, transport)
-	}, reconnectDelay)
+	return run(ctx, server, cfg, runtimeconfig.DefaultControlPlaneBaseURL)
 }
 
-type tunnelRunner interface {
-	Run(context.Context) error
-}
-
-type clientFactory func(mcp.Transport) (tunnelRunner, error)
-
-type generationExit int
-
-const (
-	generationStopped generationExit = iota
-	generationServerEnded
-	generationTunnelEnded
-)
-
-// run keeps the provider process alive when a request deadline closes the
-// embedded in-memory MCP session. A fresh transport pair is required because
-// the Go SDK implements that transport with net.Pipe, which cannot be reopened.
-func run(ctx context.Context, server *mcp.Server, newClient clientFactory, retryDelay time.Duration) error {
-	for {
-		exit, err := runGeneration(ctx, server, newClient)
-		switch exit {
-		case generationStopped:
-			return nil
-		case generationTunnelEnded:
-			return err
-		case generationServerEnded:
-			if !waitForReconnect(ctx, retryDelay) {
-				return nil
-			}
-		}
+func run(ctx context.Context, server *mcp.Server, cfg Config, controlPlaneURL string) error {
+	if err := runtimeconfig.ValidateTunnelID(cfg.TunnelID); err != nil {
+		return err
 	}
-}
-
-func runGeneration(ctx context.Context, server *mcp.Server, newClient clientFactory) (generationExit, error) {
-	serverTransport, tunnelTransport := mcp.NewInMemoryTransports()
-	client, err := newClient(tunnelTransport)
+	if err := runtimeconfig.ValidateControlPlaneAPIKey(cfg.APIKey); err != nil {
+		return err
+	}
+	baseURL, err := url.Parse(controlPlaneURL)
+	if err != nil || baseURL.Host == "" || (baseURL.Scheme != "https" && baseURL.Scheme != "http") {
+		return errors.New("invalid OpenAI control-plane URL")
+	}
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		return err
+	}
+	token := hex.EncodeToString(secret)
+	httpServer, err := transport.NewHTTP(server, transport.HTTPConfig{Listen: "127.0.0.1:0", BearerToken: token, InternalToken: true})
 	if err != nil {
-		return generationTunnelEnded, err
+		return err
 	}
-
-	generationContext, cancel := context.WithCancel(ctx)
-	serverErrors := make(chan error, 1)
-	tunnelErrors := make(chan error, 1)
-	go func() { serverErrors <- server.Run(generationContext, serverTransport) }()
-	go func() { tunnelErrors <- client.Run(generationContext) }()
-
+	endpoint, _ := url.Parse("http://" + httpServer.Address() + "/mcp")
+	runContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	httpDone := make(chan error, 1)
+	go func() { httpDone <- httpServer.Run(runContext) }()
+	client := newProvider(forwardingConfig(cfg, baseURL, endpoint, token))
+	startContext, stopStart := context.WithTimeout(runContext, 15*time.Second)
+	err = client.Start(startContext)
+	stopStart()
+	if err != nil {
+		cancel()
+		stopContext, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		return errors.Join(err, client.Stop(stopContext), <-httpDone)
+	}
+	var result error
 	select {
 	case <-ctx.Done():
-		cancel()
-		<-serverErrors
-		<-tunnelErrors
-		return generationStopped, nil
-	case err := <-serverErrors:
-		cancel()
-		<-tunnelErrors
-		return generationServerEnded, err
-	case err := <-tunnelErrors:
-		cancel()
-		<-serverErrors
-		if ctx.Err() != nil {
-			return generationStopped, nil
+	case signal := <-client.Wait():
+		// Fx and the CLI both observe OS shutdown signals. An orderly OS stop
+		// must not depend on which signal receiver's goroutine ran first.
+		if signal.ExitCode != 0 {
+			result = errors.New("OpenAI tunnel provider stopped unexpectedly")
 		}
-		return generationTunnelEnded, err
+	case result = <-httpDone:
+		cancel()
+		stopContext, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		return errors.Join(result, client.Stop(stopContext))
 	}
+	cancel()
+	stopContext, stop := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stop()
+	return errors.Join(result, client.Stop(stopContext), <-httpDone)
 }
 
-func waitForReconnect(ctx context.Context, delay time.Duration) bool {
-	if delay <= 0 {
-		return ctx.Err() == nil
-	}
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
+// Compose maintained public provider modules without optional admin listeners,
+// Harpoon, companion processes, or automatic OAuth discovery.
+func newProvider(cfg *runtimeconfig.Config) *fx.App {
+	return fx.New(
+		fx.Supply(&cfg.ControlPlane, &cfg.Logging, &cfg.Process, &cfg.MCP),
+		fx.Provide(func() *tlsconfig.Bundle { return nil }, oauth.NewDiscoveryState),
+		providerlog.Module, metrics.MetricModule, mcpclient.Module,
+		controlplane.Module, dispatcher.Module, providerprocess.Module, fx.NopLogger,
+	)
+}
+
+func forwardingConfig(cfg Config, baseURL, endpoint *url.URL, token string) *runtimeconfig.Config {
+	return &runtimeconfig.Config{
+		ControlPlane: runtimeconfig.ControlPlaneConfig{
+			BaseURL: baseURL, TunnelID: types.TunnelID(strings.TrimSpace(cfg.TunnelID)), APIKey: cfg.APIKey,
+			MaxInFlightRequests: 20, PollChannels: []types.Channel{types.DefaultChannel}, PollChannelsConfigured: true,
+		},
+		Logging: runtimeconfig.LoggingConfig{Level: slog.LevelInfo, Format: runtimeconfig.LogFormatStructText},
+		MCP: runtimeconfig.MCPConfig{
+			ServerURL: endpoint, TransportKind: runtimeconfig.MCPTransportHTTPStreamable,
+			ConnectionMaxTTL: 10 * time.Minute, MaxConcurrentRequests: 10,
+			ExtraHeaders:    map[string]string{transport.InternalTokenHeader: token},
+			ChannelBindings: []runtimeconfig.MCPChannelBinding{{Channel: types.DefaultChannel, TransportKind: runtimeconfig.MCPTransportHTTPStreamable, ServerURL: endpoint}},
+		},
 	}
 }

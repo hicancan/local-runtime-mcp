@@ -7,102 +7,65 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-Local Runtime MCP gives AI clients direct, native, multimodal access to the machine running `lrmcp`. One portable runtime exposes 20 MCP tools across processes, files, images, the Windows desktop, and Chromium.
+Give AI clients the programs, files, images, browser profiles, and desktop of the machine running `lrmcp`. Local Runtime MCP is a portable host-access runtime with **21 MCP tools across five capability domains**.
 
-The same capability server works locally over stdio, on loopback over Streamable HTTP, through OpenAI Secure MCP Tunnel, or behind a managed Cloudflare Tunnel. A Windows release directory can live on a fixed drive or removable storage and carries its executable, configuration, browser integration, and tunnel companion together.
+Use it locally over stdio or Streamable HTTP, or connect a remote client through OpenAI Secure MCP Tunnel or Cloudflare Tunnel. Independent process sessions and browser tabs run concurrently; shared files and desktop input have explicit coordination rules.
 
-## Highlights
-
-- **Five orthogonal capability domains**: process, filesystem, image, computer, and browser.
-- **One stable MCP surface**: every connection mode exposes the same 20 tools and state semantics.
-- **Native multimodal results**: images, browser captures, and desktop captures are returned as MCP image content.
-- **State-aware interaction**: browser references, screenshots, and desktop observations are versioned before actions use them.
-- **Portable operation**: `local-runtime-mcp.yaml` lives beside the executable and moves with the runtime directory.
-- **Purpose-built implementation boundaries**: Go hosts MCP and machine services, Rust implements the Windows computer engine, and TypeScript implements the Chromium extension.
+- **Native multimodal results.** Files, browser pages, and desktop observations return text and MCP image content directly.
+- **Explicit browser targets.** Connect several Chromium profiles, select a named browser instance, and operate its opaque tab handles.
+- **Visible desktop control.** Acquire desktop control, observe a window, act on that observation, and release control. A blue overlay and Stop affordance make interaction visible locally.
+- **Portable configuration.** Keep `local-runtime-mcp.yaml`, the executable, and browser integration together on a fixed or removable drive.
+- **Platform-specific engines.** Go hosts the runtime and MCP adapters; Rust implements Windows capture, UI Automation, and input; TypeScript implements Chromium integration.
 
 ## Architecture
 
-Local Runtime MCP separates two independent questions:
-
-1. **How does an MCP client reach this runtime?** — connection plane.
-2. **What can the runtime do on this machine?** — capability plane.
-
-Every command selects one connection mode, starts one Runtime Host, and publishes the same MCP Server.
+The connection layer delivers MCP requests. The capability layer defines machine operations. One Runtime Host owns the resources shared by all clients of a running instance.
 
 ```mermaid
 flowchart TB
-    subgraph Clients[Clients]
-		OP[Operator]
-        LOCAL[Local MCP client]
-        REMOTE[Remote AI client]
-    end
-
-    subgraph Commands[Command surface]
-        CLI[lrmcp]
-        SERVE[serve]
-        TUNNEL[tunnel]
-        SETUP[setup]
-    end
-
-    subgraph Connection[Connection plane]
-        STDIO[stdio transport]
-        HTTP[Streamable HTTP transport]
-        OAI[OpenAI Tunnel adapter]
-        CF[Cloudflare Tunnel adapter]
-        OAIE[OpenAI edge]
-        CFE[Cloudflare edge]
-        CFD[cloudflared companion]
-        MEMORY[in-memory MCP transport]
-    end
-
-    subgraph Runtime[Runtime plane]
-        CFG[Typed configuration]
-        HOST[Runtime Host]
-        MCP[MCP Server · 20 tools]
-    end
-
-    subgraph Capabilities[Capability plane]
-        P[Process]
-        F[Filesystem]
-        I[Image]
-        C[Computer]
-        B[Browser]
-    end
-
-    OP --> CLI
-    CLI --> SERVE
-    CLI --> TUNNEL
-    CLI --> SETUP
-
-    SERVE --> STDIO
-    SERVE --> HTTP
-    TUNNEL --> OAI
-    TUNNEL --> CF
-    OAI --> MEMORY
-    CF --> CFD
-    CFD --> HTTP
-	REMOTE --> OAIE
-	OAIE --> OAI
-	REMOTE --> CFE
-	CFE --> CFD
-	LOCAL --> STDIO
-	LOCAL --> HTTP
-
-    STDIO --> HOST
-    HTTP --> HOST
-    MEMORY --> HOST
-    CFG --> HOST
-    HOST --> MCP
-    MCP --> P
-    MCP --> F
-    MCP --> I
-    MCP --> C
-    MCP --> B
+    Operator[Operator] --> CLI[CLI + configuration]
+    CLI --> Host[Runtime Host]
+    Local[Local MCP client] --> Stdio[MCP stdio]
+    Local --> HTTP[MCP Streamable HTTP]
+    Remote[Remote AI clients] --> OpenAI[OpenAI Tunnel adapter]
+    Remote --> Cloudflare[Cloudflare adapter + cloudflared]
+    OpenAI --> HTTP
+    Cloudflare --> HTTP
+    Stdio --> MCP[MCP adapter · 21 tools]
+    HTTP --> MCP
+    MCP --> Process[Process]
+    MCP --> Files[Filesystem]
+    MCP --> Image[Image]
+    MCP --> Computer[Computer]
+    MCP --> Browser[Browser]
+    Process --> Machine[Machine processes + files]
+    Files --> Machine
+    Image --> Machine
+    Computer --> Native[Rust Windows engine]
+    Native --> Desktop[Interactive desktop]
+    Browser --> Bridge[Authenticated loopback bridge]
+    Bridge --> Profiles[Chromium profile extensions]
+    Profiles --> CDP[CDP tabs + frames]
+    Host -. resource lifetime .-> MCP
+    Host -. owns .-> Process
+    Host -. owns .-> Files
+    Host -. owns .-> Computer
+    Host -. owns .-> Bridge
 ```
 
-### Command surface
+Solid arrows show request flow; dotted arrows show lifetime ownership. Images and text are MCP content types carried by the selected transport.
 
-The command hierarchy mirrors the architecture:
+| Layer | Responsibility |
+| --- | --- |
+| CLI and configuration | Choose a connection mode and resolve configuration once. |
+| Connection adapters | Deliver requests through stdio, HTTP, or a tunnel provider. |
+| MCP adapter | Publish tool schemas, validate inputs, and encode results. |
+| Capability services | Define resource identities, observations, actions, and concurrency. |
+| Platform backends | Execute OS operations, Windows native interaction, and Chromium CDP commands. |
+
+The Host creates the Process Manager, Filesystem Service, Browser Bridge, and Computer Controller. Shutdown stops admission, cancels pending work, cleans up managed processes and input, and closes listeners and helpers. Individual request failures retain the running Host and its other resources.
+
+### Commands and transports
 
 ```text
 lrmcp
@@ -118,153 +81,219 @@ lrmcp
 └── help
 ```
 
-| Command | MCP path | Authentication | Typical use |
-| --- | --- | --- | --- |
-| `lrmcp serve stdio` | Standard MCP stdio | Process environment and host access | Local MCP hosts and developer tools |
-| `lrmcp serve http` | Standard MCP Streamable HTTP on loopback | Static Bearer token | Local integration and reverse-proxy origin |
-| `lrmcp tunnel openai` | Embedded OpenAI Tunnel adapter and in-memory MCP transport | OpenAI tunnel ID and API key | ChatGPT and supported OpenAI clients |
-| `lrmcp tunnel cloudflare` | `cloudflared` companion to loopback Streamable HTTP | Cloudflare tunnel token plus MCP Bearer token | Stable public hostname backed by this machine |
-| `lrmcp setup browser` | Extract and configure the Chromium extension | Generated loopback bridge token | Browser capability setup |
+Each runtime invocation selects one connection mode. The seven command paths cover connection startup, browser setup, and executable information.
 
-`serve` selects a standard MCP transport. `tunnel` selects a reachability provider. OpenAI uses its embeddable tunnel client directly; Cloudflare uses its maintained `cloudflared` companion and forwards to the HTTP transport. Each adapter follows the provider's native integration model while preserving one public command structure.
+| Command | Connection and credentials |
+| --- | --- |
+| `lrmcp serve stdio` | Standard MCP process pipes; the parent process supplies access. |
+| `lrmcp serve http` | Loopback Streamable HTTP with a configured Bearer token. |
+| `lrmcp tunnel openai` | Official OpenAI HTTP forwarding to a private loopback MCP endpoint; configure the tunnel ID and API key. |
+| `lrmcp tunnel cloudflare` | Official `cloudflared` companion forwards to loopback HTTP; configure a Cloudflare tunnel token and an MCP Bearer token. |
+| `lrmcp setup browser` | Generate bridge credentials and extract/configure the extension. |
+| `lrmcp version` | Print the executable version. |
+| `lrmcp help` | Show commands and flags. |
 
-### Runtime Host
+OpenAI starts its private endpoint on a dynamically assigned loopback port and uses a fresh, in-memory private-hop credential. Provider forwarding uses standard HTTP connections to the shared MCP server. Cloudflare uses the configured loopback origin and its maintained companion executable. Domain services remain independent of either provider.
 
-The Runtime Host owns the browser Bridge, Computer Controller, process sessions, and MCP Server. Connection adapters own message delivery and process lifetime. Closing `lrmcp` closes the selected connection and the machine runtime together.
-
-### Configuration flow
-
-All entry points resolve one typed configuration object with the same precedence:
+### Configuration
 
 ```mermaid
 flowchart LR
-    D[Built-in defaults] --> Y[local-runtime-mcp.yaml]
-    Y --> E[LOCAL_RUNTIME_MCP_* environment]
-    E --> A[Command-line flags]
-    A --> R[Resolved configuration]
-    R --> H[Connection + Runtime Host]
+    Defaults[Defaults] --> YAML[Adjacent YAML]
+    YAML --> Environment[Environment overrides]
+    Environment --> Flags[Command-line overrides]
+    Flags --> Config[Resolved configuration]
+    Config --> Connection[Connection adapter]
+    Config --> Host[Runtime Host]
 ```
 
-The configuration path is always `<directory containing lrmcp>/local-runtime-mcp.yaml`. This gives a copied runtime directory the same connection and browser identity on another machine.
+Precedence is **command line > environment > YAML > defaults**. The file path is always `<lrmcp directory>/local-runtime-mcp.yaml`. Browser instance identity belongs to each browser profile's extension storage; process, tab, and desktop observation handles belong to the current runtime lifecycle.
 
 ## Capability domains
 
-### Process
+| Domain | Tools |
+| --- | ---: |
+| Process | 2 |
+| Filesystem | 6 |
+| Image | 1 |
+| Computer | 4 |
+| Browser | 8 |
+| **Total** | **21** |
+
+### Process · 2 tools
 
 ```mermaid
-flowchart LR
-    RUN[process_run] --> START[Direct program launch]
-    START --> COMPLETE[Completed result]
-    START --> SESSION[Live session]
-    SESSION --> CONTINUE[process_continue]
-    CONTINUE --> STREAM[Incremental output]
-    CONTINUE --> INPUT[stdin · PTY resize]
-    CONTINUE --> LIFE[wait · terminate]
+flowchart TB
+    Run[process_run] --> Resolve[Resolve program using child PATH]
+    Resolve --> Launch[Direct launch · pipe or PTY]
+    Launch --> Final[Completed result]
+    Launch --> Sessions[Independent process sessions]
+    Sessions --> Continue[process_continue · session_id]
+    Continue --> Input[Serialized stdin + PTY resize]
+    Continue --> Output[Coordinated output drain + wait]
+    Continue --> Stop[Independent terminate path]
 ```
 
-`process_run` starts an executable directly with an argument array, working directory, environment overrides, initial stdin, timeout, output limits, and either pipe or PTY I/O. Installed program names are resolved through `PATH` consistently in both modes. Short commands return their final result; longer commands return a session ID. `process_continue` reads incremental output, writes input, closes stdin, resizes a PTY, waits, or terminates the complete process tree.
+- `process_run` accepts `program`, argument array, working directory, environment overrides, initial stdin, execution timeout, output limits, and pipe or PTY I/O.
+- `process_continue` reads incremental output, writes stdin, closes pipe input, resizes a PTY, waits, or terminates a managed session.
 
-### Filesystem
+Bare program names use the merged child `PATH` in both I/O modes; Windows also uses `PATHEXT`. Explicit relative executable paths resolve against the requested working directory. To execute shell syntax, launch the desired shell explicitly with its arguments.
+
+Different sessions run concurrently. Within one session, input writes are serialized and each result drains stdout and stderr together. Waiting for output leaves termination available, including when stdin is blocked. Output and queued input are bounded; a single stdin payload is limited to 16 MiB.
+
+Cancellation before `process_run` returns a live session terminates and collects that process. Cancellation of `process_continue` stops that call's wait; use `terminate=true` to end the session. Execution timeout and Host shutdown terminate managed processes independently of the MCP request deadline.
+
+### Filesystem · 6 tools
 
 ```mermaid
-flowchart LR
-    PATH[Direct machine path] --> DISCOVER[list · stat]
-    PATH --> OBSERVE[read · search]
-    PATH --> WRITE[atomic full write]
-    PATH --> PATCH[versioned patch]
-    OBSERVE --> HASH[optional SHA-256]
-    HASH --> WRITE
-    HASH --> PATCH
+flowchart TB
+    Read[List · stat · read · search] --> Files[Machine filesystem]
+    Write[Create · replace · patch] --> Path[Resolve commit path identity]
+    Path --> Lock[Per-path commit coordination]
+    Lock --> Version[Read and verify expected SHA-256]
+    Version --> Build[Build complete new content]
+    Build --> Commit[Atomic publish]
+    Commit --> Files
 ```
-
-Filesystem tools accept absolute paths and paths relative to the runtime working directory. Reads, searches, and traversal have explicit result limits. Full writes commit atomically. Patch operations combine an expected SHA-256 with uniquely anchored hunks, giving agents optimistic concurrency control without introducing a separate workspace model.
 
 | Tool | Operation |
 | --- | --- |
-| `filesystem_list` | Bounded directory traversal |
-| `filesystem_stat` | Metadata and optional SHA-256 |
-| `filesystem_read_text` | Bounded UTF-8 line ranges |
-| `filesystem_search_text` | Literal or Go-regexp search |
-| `filesystem_write_text` | Atomic create or complete replacement |
-| `filesystem_patch_text` | Atomic, version-checked contextual patch |
+| `filesystem_list` | Bounded directory traversal. |
+| `filesystem_stat` | File metadata and optional SHA-256. |
+| `filesystem_read_text` | UTF-8 line ranges with byte and line limits. |
+| `filesystem_search_text` | Literal text or Go-regexp search. |
+| `filesystem_write_text` | Explicit `mode=create` or `mode=replace`. |
+| `filesystem_patch_text` | Version-checked, uniquely anchored contextual hunks. |
 
-### Image
+`create` publishes a complete file only if the destination is absent. `replace` requires an existing file and `expected_sha256`. Patches also require the expected hash and resolve all hunks against one immutable source version.
 
-```mermaid
-flowchart LR
-    FILE[PNG · JPEG · GIF · WebP] --> VALIDATE[decode + validate]
-    VALIDATE --> CROP[optional crop]
-    CROP --> SCALE[optional proportional resize]
-    SCALE --> RESULT[MCP image content + metadata]
-```
+Text reads return complete lines. When the first selected line exceeds the byte budget, the call returns a bounded error; after earlier complete lines it reports truncation and the next line. Skipped lines are scanned with bounded memory, and requested SHA-256 values cover the entire file through streaming reads.
 
-`image_read` turns a machine path into native MCP image content. It validates encoded size and pixel count, supports cropping and proportional resizing, and returns media type, dimensions, and source metadata with the image.
+The Filesystem Service holds one path's commit lock from version validation through publication. Different paths and read operations remain concurrent. Final-component symbolic links are rejected for mutation; existing parent aliases are normalized for coordination.
 
-### Computer
+These locks coordinate calls made through this Host. External editors and invoked programs retain their own access to the filesystem. Concurrent coding tasks can use separate Git worktrees to separate indexes and build outputs.
+
+### Image · 1 tool
 
 ```mermaid
 flowchart LR
-    TOOLS[computer_targets · computer_state · computer_action] --> CONTRACT[Go contract layer]
-    CONTRACT --> IPC[framed worker protocol]
-    IPC --> RUST[embedded Rust engine]
-    RUST --> WGC[Windows Graphics Capture]
-    RUST --> UIA[UI Automation]
-    RUST --> INPUT[Windows input]
-    WGC --> DESKTOP[Interactive desktop]
-    UIA --> DESKTOP
-    INPUT --> DESKTOP
+    Read[image_read] --> Open[Open source once]
+    Open --> Bytes[Bound actual bytes read]
+    Bytes --> Header[Validate format + pixels + dimensions]
+    Header --> Original[Original encoded image]
+    Header --> Transform[Memory-bounded crop + resize]
+    Transform --> Encode[Byte-bounded PNG encoding]
+    Original --> Result[MCP image + metadata]
+    Encode --> Result
 ```
 
-The Windows Computer domain combines pixels, semantic UI elements, and native input into one observation/action loop:
+`image_read` supports PNG, JPEG, GIF, and WebP, returning native MCP image content with actual source bytes and dimensions. Optional crop and proportional resize produce PNG output. Encoded reads, pixel counts, dimensions, decoded transformation memory, and output encoding are bounded. Capacity waits respect request cancellation.
 
-- `computer_targets` lists validated top-level window identities.
-- `computer_state` captures the desktop or active target and returns a state ID plus bounded UI Automation references.
-- `computer_action` activates a target or performs `move`, `click`, `double_click`, `drag`, `type_text`, `set_value`, `press_key`, or `scroll`.
+Image reading is stateless. Browser and Computer captures carry their own observation identities and coordinate semantics.
 
-Activation and physical input advance the state epoch. Subsequent actions continue from a fresh `computer_state`, keeping coordinates and semantic references tied to the observation that produced them. The Rust worker owns capture, UI Automation, DPI and coordinate transforms, foreground validation, and input routing; Go owns the public MCP contract and worker lifecycle.
-
-### Browser
+### Computer · 4 tools
 
 ```mermaid
-flowchart LR
-    TOOLS[browser tools] --> BRIDGE[Authenticated loopback Bridge]
-    BRIDGE --> EXT[Chromium MV3 extension]
-    EXT --> CDP[chrome.debugger · CDP]
-    CDP --> TAB[Tabs + frames]
-    TAB --> SNAP[Accessibility snapshot]
-    TAB --> SHOT[Viewport + full-page capture]
-    TAB --> ACT[DOM + input + navigation]
+flowchart TB
+    Control[computer_control · acquire/status/release] --> Coordinator[Go Desktop Coordinator]
+    Targets[computer_targets] --> Coordinator
+    State[computer_state] --> Coordinator
+    Action[computer_action · control_id] --> Coordinator
+    Coordinator --> Worker[Rust native engine]
+    Worker --> Identity[Window identity + observation epoch]
+    Worker --> Capture[Windows Graphics Capture]
+    Worker --> UIA[UI Automation patterns + references]
+    Worker --> Input[Physical input + release cleanup]
+    Worker --> Overlay[Blue target outline + AI marker + Stop]
+    Overlay -. revoke control .-> Coordinator
 ```
 
-The Browser domain controls the Chromium profile chosen by the operator. The extension connects to the authenticated loopback Bridge and uses `chrome.debugger` with Chrome DevTools Protocol, preserving the profile's sessions, tabs, downloads, and browser permissions.
+The Windows desktop has one foreground, pointer, and keyboard input stream. `computer_control` allocates that shared input resource to one workflow:
 
-| Tool | Operation |
+```text
+computer_control(kind="acquire", label="Update a document") → control_id
+computer_targets() → target_id
+computer_action(kind="activate", control_id=..., target_id=...)
+computer_state(control_id=..., target_id=...) → actionable state_id
+computer_action(kind="click", control_id=..., state_id=..., element_ref=...)
+computer_state(control_id=..., target_id=...) → fresh state_id
+computer_control(kind="release", control_id=...)
+```
+
+- `computer_control` acquires control, reports occupancy, or releases a matching token. Status exposes the label and occupancy, while the owner retains its token.
+- `computer_targets` lists validated top-level windows.
+- `computer_state` returns pixels and bounded UI Automation information. Without a control token it is a read-only observation with `actionable=false`, an empty state ID, and descriptive elements; a valid token binds actionable references and a state ID to the current control generation and foreground target.
+- `computer_action` supports `activate`, `move`, `click`, `double_click`, `drag`, `type_text`, `set_value`, `press_key`, and `scroll`. Every action requires `control_id`; observation-based actions require the exact actionable `state_id`.
+
+Control has a five-minute idle expiry refreshed by controlled operations. Release, expiry, local Stop, and shutdown cancel pending work, clear injected input state, and invalidate prior actionable observations. A competing acquire reports that the desktop is busy.
+
+Control remains in `stopping` while submitted work or input cleanup is settling. An already-submitted native or UIA operation may have an uncertain outcome after cancellation; inspect the target before repeating it.
+
+Windows capture, target validation, DPI coordinates, UIA references, input routing, and overlay rendering live in the Rust engine. Semantic `set_value` uses a supported UI Automation ValuePattern. The `uia_status` field reports availability, truncation, or provider errors. Pixel and UIA observations describe a changing interface; callers obtain a fresh state after each action, including partial failures.
+
+The blue target outline and AI position marker show the current interaction. Click the local Stop strip to revoke control. The overlay is excluded from feedback capture. Physical actions use the system input stream, so independent desktop tasks use separate interactive machines or environments.
+
+### Browser · 8 tools
+
+```mermaid
+flowchart TB
+    Tools[Browser tools] --> Registry[Instance registry + tab routing]
+    Registry --> Bridge[Authenticated loopback bridge]
+    Bridge --> Edge[Edge profile extension]
+    Bridge --> Chrome[Chrome profile extension]
+    Chrome --> Intake[Command intake]
+    Intake --> Queue[Bounded per-tab FIFO scheduler]
+    Queue --> TabA[Tab A · CDP frames]
+    Queue --> TabB[Tab B · CDP frames]
+    TabA --> Observation[Document epoch + snapshots + screenshot space]
+    TabB --> Observation
+```
+
+Install the same MV3 extension in each intended Chromium profile. Give each instance a readable label in extension options, such as `Edge · Work` or `Chrome · Research`. The extension keeps a stable UUID in that profile and connects to the shared bridge using its token. `chrome.debugger` sends CDP operations directly to tabs and frames.
+
+| Tool | Target and operation |
 | --- | --- |
-| `browser_status` | Bridge and extension health |
-| `browser_tabs` | List attached browser tabs |
-| `browser_open` | Open a tab |
-| `browser_close` | Close a tab |
-| `browser_navigate` | URL, back, forward, or reload |
-| `browser_snapshot` | Bounded visible text and versioned element references across frames |
-| `browser_screenshot` | Viewport, full-page, or clipped PNG capture |
-| `browser_action` | Click, double-click, hover, drag, type, set value, press key, scroll, select, check, upload files, handle dialogs, or evaluate JavaScript |
+| `browser_status` | List named browser instances and their connection health. |
+| `browser_tabs` | Select `browser_id` and discover tabs. |
+| `browser_open` | Select `browser_id`; open a tab, with `active=false` by default. |
+| `browser_close` | Close an opaque `tab_id`. |
+| `browser_navigate` | URL, back, forward, or reload for `tab_id`. |
+| `browser_snapshot` | Bounded accessibility text and versioned element refs across frames. |
+| `browser_screenshot` | Viewport, full-page, or clipped PNG for `tab_id`. |
+| `browser_action` | Ref- or screenshot-targeted input, forms, files, dialogs, and JavaScript evaluation. |
 
-Snapshots produce versioned element references. Viewport screenshots produce versioned coordinate spaces. Actions explicitly identify one of those observations, so page changes cannot silently reuse stale targets.
+Copy `browser_id` from status and the opaque tab `id` from discovery or creation into subsequent `tab_id` arguments. The tab handle includes its instance and lifecycle identity internally; callers treat it as an opaque string. A missing or offline target returns an error, preserving the selected profile. After extension worker restart or reconnect generation change, discover tabs again and acquire fresh observations.
 
-## Tool surface
+Actions include `click`, `double_click`, `hover`, `drag`, `type_text`, `set_value`, `press_key`, `scroll`, `select`, `check`, `upload_files`, `handle_dialog`, and `evaluate`. Viewport coordinate actions require the matching screenshot ID. Element references belong to the observed document/frame generation; navigation, frame changes, reconnects, and side effects invalidate observations.
 
-| Domain | Tools | Count |
-| --- | --- | ---: |
-| Process | `process_run`, `process_continue` | 2 |
-| Filesystem | `filesystem_list`, `filesystem_stat`, `filesystem_read_text`, `filesystem_search_text`, `filesystem_write_text`, `filesystem_patch_text` | 6 |
-| Image | `image_read` | 1 |
-| Computer | `computer_targets`, `computer_state`, `computer_action` | 3 |
-| Browser | `browser_status`, `browser_tabs`, `browser_open`, `browser_close`, `browser_navigate`, `browser_snapshot`, `browser_screenshot`, `browser_action` | 8 |
-| **Total** |  | **20** |
+Different browser instances and tabs execute concurrently. Operations on one tab are serialized. Queue capacity and execution slots are bounded, and canceled queued work is discarded. Profiles keep their own browser data; tabs in one profile share that profile's sessions, cookies, and accounts.
+
+Browser operations that change the visible desktop coordinate with Computer control. Background tab work remains independent; when a visible operation conflicts with an owned desktop, supply the matching `control_id` or wait until control is released.
+
+## Concurrent workflows
+
+| Resource | Coordination |
+| --- | --- |
+| Process | Independent sessions; ordered input and coherent output per session. |
+| Filesystem | Parallel reads and different paths; serialized version-checked commits on one path. |
+| Image | Independent reads within bounded memory and execution capacity. |
+| Browser | Explicit instance/tab routing; parallel tabs with FIFO execution per tab. |
+| Computer | One desktop input owner; read-only observation remains available. |
+
+For two AI conversations, each can select a different browser instance and open its own background tab. Both can run independent process sessions while one workflow owns desktop input. If both choose the same tab, file, repository, or cloud account, they intentionally share that resource.
+
+Request cancellation is distinct from process execution timeout and Host shutdown. A failed or expired call retains other resources. When a side effect may already have occurred, observe the target before retrying a non-idempotent action.
 
 ## Installation
 
-Download a platform archive from [Releases](https://github.com/hicancan/local-runtime-mcp/releases/latest) and extract it into its own directory.
+Download a platform archive from [Releases](https://github.com/hicancan/local-runtime-mcp/releases/latest), verify its published SHA-256, and extract it into its own directory.
+
+| Platform | Process, Filesystem, Image | Browser | Computer |
+| --- | --- | --- | --- |
+| Windows amd64 | Supported | Chromium extension | Native Windows engine |
+| Linux / macOS | Supported | Chromium extension in a desktop browser | Reports platform unavailability |
+
+Browser control requires a running Chromium profile with the extension loaded. Windows Computer requires Windows 10 version 2004 or newer, including Windows 11, an interactive desktop, and permissions appropriate for the target applications.
 
 The Windows archive contains:
 
@@ -279,6 +308,7 @@ local-runtime-mcp/
 ├── PRIVACY.md
 ├── LICENSE
 ├── THIRD_PARTY_NOTICES.md
+├── licenses/
 └── cloudflared-LICENSE
 ```
 
@@ -302,21 +332,17 @@ cloudflare:
   tunnel_token: "replace-with-your-cloudflare-managed-tunnel-token"
 ```
 
-The configuration file contains connection credentials. Store the runtime directory with the same care as any other credential-bearing application directory.
+Protect the runtime directory as a credential-bearing application directory. Browser profile installation and identity stay with that machine's browser profile when the runtime directory moves.
 
 ### Browser setup
-
-Run:
 
 ```powershell
 ./lrmcp.exe setup browser
 ```
 
-The command creates a browser token when needed, saves it in the adjacent YAML file, and extracts the extension to `browser-extension` beside the executable. Open `edge://extensions` or `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select that directory.
+The command saves bridge credentials to the adjacent YAML and extracts `browser-extension` beside the executable. In each intended profile, open `edge://extensions` or `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select that directory. Open extension options to set a distinct label and confirm the bridge address and token. Start `lrmcp` and use `browser_status` to discover connected instances.
 
 ### Local stdio
-
-A typical MCP client configuration is:
 
 ```json
 {
@@ -331,25 +357,23 @@ A typical MCP client configuration is:
 
 ### OpenAI Tunnel
 
-Place the tunnel credentials in the `openai` section and run:
+Fill the `openai` section and run:
 
 ```powershell
 ./lrmcp.exe tunnel openai
 ```
 
-See the [OpenAI Secure MCP Tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) for tunnel creation and supported clients.
-
-The adapter rebuilds its embedded MCP session when a request deadline closes the in-memory connection, so one expired tool call does not terminate the `lrmcp` process or require a manual restart.
+See the [OpenAI Secure MCP Tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) for provider setup and supported clients. The private HTTP origin is created automatically; its port and private-hop credential remain runtime-only.
 
 ### Streamable HTTP
 
-Place an HTTP Bearer token in the `http` section and run:
+Fill `http.bearer_token` and run:
 
 ```powershell
 ./lrmcp.exe serve http
 ```
 
-The MCP endpoint is `http://127.0.0.1:9316/mcp` by default. The listener remains on loopback and is suitable as the origin for a local reverse proxy.
+The default MCP endpoint is `http://127.0.0.1:9316/mcp`. The loopback listener accepts the configured Bearer token and can serve as a reverse-proxy origin.
 
 ### Cloudflare Tunnel
 
@@ -359,11 +383,9 @@ Create a remotely managed Cloudflare Tunnel, route its hostname to `http://127.0
 ./lrmcp.exe tunnel cloudflare
 ```
 
-Release archives include the pinned `cloudflared` companion. The public endpoint is `https://<public_host>/mcp` and accepts the configured HTTP Bearer token.
+The release includes the pinned `cloudflared` companion. Configure the remote MCP client to use `https://<public_host>/mcp` with the MCP Bearer token. The Cloudflare tunnel token authenticates the tunnel process; the MCP token authenticates tool clients.
 
-## Environment and command-line overrides
-
-Portable YAML is the normal operating path. Automation can override individual fields:
+### Environment overrides
 
 | Environment variable | YAML field |
 | --- | --- |
@@ -377,31 +399,39 @@ Portable YAML is the normal operating path. Automation can override individual f
 | `LOCAL_RUNTIME_MCP_CLOUDFLARE_TUNNEL_TOKEN` | `cloudflare.tunnel_token` |
 | `LOCAL_RUNTIME_MCP_CLOUDFLARED` | `cloudflare.binary` |
 
-Run `lrmcp help` for the corresponding command-line flags.
+Run `lrmcp help` for corresponding command-line flags.
 
 ## Build and test
 
-Requirements: Go 1.27, Node.js 24, and the stable Rust MSVC toolchain for the Windows computer engine.
+Requirements: Go 1.27, Node.js 24, and stable Rust with the Windows MSVC toolchain for the Computer engine. Run the native build on Windows with the Visual Studio build environment loaded.
 
 ```powershell
 Push-Location browser-extension
 npm ci
 npm run build
+npm test
 Pop-Location
 ./scripts/build-native.ps1
+cargo fmt --manifest-path native/computer-windows/Cargo.toml --check
+cargo clippy --manifest-path native/computer-windows/Cargo.toml --all-targets -- -D warnings
 go test ./...
 go vet ./...
 go build ./cmd/lrmcp
 ```
 
-CI builds and tests Windows, Linux, and macOS. Windows CI also runs the Chromium extension end-to-end suite and Rust formatting and lint checks.
+Go tests cover resource lifetimes, response correlation, cancellation, competing file commits, process I/O, and browser identity routing. Extension scheduler tests cover ordering, fairness, cancellation, and queue limits. The opt-in Windows Chromium suite loads the real extension in disposable browser profiles:
 
-## Security and privacy
+```powershell
+$env:LOCAL_RUNTIME_MCP_BROWSER_E2E = '1'
+go test ./internal/browser -run TestEdgeExtensionEndToEnd -count=3 -v
+```
 
-Local Runtime MCP operates with the permissions of the account that starts it. Authenticated clients can execute programs, access files, observe and control the Windows desktop, and interact with browser sessions, so access to the runtime should be treated as privileged machine access.
+CI exercises Windows, Linux, and macOS. Local protocol and browser tests validate those execution paths; live ChatGPT multi-conversation acceptance is performed separately against the configured client and tunnel.
 
-See [SECURITY.md](SECURITY.md) for the security model, deployment guidance, and private vulnerability reporting. See [PRIVACY.md](PRIVACY.md) for capability data flows, local retention, and the boundaries of external MCP clients and tunnel providers.
+## Security, privacy, and license
 
-## License
+Authenticated clients operate with the authority of the account running `lrmcp`. Resource handles coordinate targets and workflows within that shared host. Use dedicated OS accounts and browser profiles where workload separation is appropriate.
 
-Local Runtime MCP is licensed under [GNU AGPL v3.0 only](LICENSE). Release archives include the separately licensed `cloudflared` companion; attribution and license details are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+See [SECURITY.md](SECURITY.md) for deployment guidance and private vulnerability reporting, and [PRIVACY.md](PRIVACY.md) for local storage and provider data flows.
+
+Local Runtime MCP is licensed under [GNU AGPL v3.0 only](LICENSE). The separately licensed `cloudflared` companion and dependency attributions are documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

@@ -6,6 +6,10 @@ func TestValidate(t *testing.T) {
 	x1, y2, x3, y4 := 1, 2, 3, 4
 	valid := []Action{{Kind: "activate", TargetID: "win-1-1"}, {Kind: "move", StateID: "s1", X: &x1, Y: &y2}, {Kind: "click", StateID: "s1", ElementRef: "s1:u1", Button: "left"}, {Kind: "double_click", StateID: "s1", X: &x1, Y: &y2}, {Kind: "drag", StateID: "s1", X: &x1, Y: &y2, ToX: &x3, ToY: &y4}, {Kind: "type_text", StateID: "s1", Text: "hello"}, {Kind: "set_value", StateID: "s1", Text: "hello"}, {Kind: "press_key", StateID: "s1", Key: "CTRL+L"}, {Kind: "scroll", StateID: "s1", ScrollY: 120}}
 	for _, action := range valid {
+		action.ControlID = "owned"
+		if action.Kind == "set_value" {
+			action.ElementRef = "s1:u1"
+		}
 		if err := Validate(action); err != nil {
 			t.Errorf("%+v: %v", action, err)
 		}

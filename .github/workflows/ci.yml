@@ -28,6 +28,8 @@ jobs:
         run: npm ci
       - working-directory: browser-extension
         run: npm run build
+      - working-directory: browser-extension
+        run: npm test
       - run: git diff --exit-code -- internal/browser/extension
       - if: runner.os == 'Windows'
         uses: dtolnay/rust-toolchain@stable
@@ -48,6 +50,13 @@ jobs:
         run: go test -race ./...
       - run: go vet ./...
       - run: go build ./cmd/lrmcp
+      - name: Verify executable MCP entry point
+        shell: pwsh
+        run: |
+          $executable = if ($IsWindows) { 'lrmcp.exe' } else { 'lrmcp' }
+          $env:LOCAL_RUNTIME_MCP_EXECUTABLE = (Get-Item -LiteralPath $executable).FullName
+          go test ./internal/runtimehost -run TestExecutableStdio -count=2 -v
+          if ($LASTEXITCODE -ne 0) { throw 'executable MCP smoke test failed' }
       - if: runner.os == 'Windows'
         name: Verify pinned cloudflared companion
         shell: pwsh

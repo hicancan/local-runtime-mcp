@@ -2,11 +2,13 @@ package process
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -118,6 +120,228 @@ func TestProcessHelper(t *testing.T) {
 		fmt.Print(string(data))
 	case "output":
 		fmt.Print(strings.Repeat("x", 100))
+	case "blocked_stdin":
+		fmt.Print("ready\n")
+		time.Sleep(30 * time.Second)
 	}
 	os.Exit(0)
+}
+
+func TestTerminateUnblocksStdinAndCloseJoins(t *testing.T) {
+	manager := NewManager(context.Background())
+	t.Cleanup(func() { _ = manager.Close() })
+	started, err := manager.Run(context.Background(), Options{Program: os.Args[0], Args: []string{"-test.run=TestProcessHelper", "--", "blocked_stdin"}, Environment: map[string]string{"LOCAL_RUNTIME_MCP_PROCESS_HELPER": "1"}, KeepStdinOpen: true, YieldTimeMS: 20})
+	if err != nil || !started.Running {
+		t.Fatalf("start = %+v, %v", started, err)
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := manager.Continue(context.Background(), ContinueOptions{SessionID: started.SessionID, Stdin: strings.Repeat("x", 8<<20)})
+		writeDone <- err
+	}()
+	// Observe the input gate instead of depending on child startup timing.
+	manager.mu.Lock()
+	entry := manager.sessions[started.SessionID]
+	manager.mu.Unlock()
+	deadline := time.After(3 * time.Second)
+	for len(entry.inputGate) == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("stdin writer did not start")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	terminated, err := manager.Continue(context.Background(), ContinueOptions{SessionID: started.SessionID, Terminate: true, YieldTimeMS: 3000})
+	if err != nil || terminated.Running {
+		t.Fatalf("terminate = %+v, %v", terminated, err)
+	}
+	select {
+	case <-writeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("blocked stdin was not released")
+	}
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Run(context.Background(), Options{Program: os.Args[0]}); err == nil {
+		t.Fatal("closed manager admitted a process")
+	}
+}
+
+func TestInitialStdinCancellationDoesNotLeak(t *testing.T) {
+	manager := NewManager(context.Background())
+	defer manager.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan error, 1)
+	go func() {
+		_, err := manager.Run(ctx, Options{Program: os.Args[0], Args: []string{"-test.run=TestProcessHelper", "--", "blocked_stdin"}, Environment: map[string]string{"LOCAL_RUNTIME_MCP_PROCESS_HELPER": "1"}, Stdin: strings.Repeat("x", 8<<20), YieldTimeMS: 60000})
+		finished <- err
+	}()
+	deadline := time.After(3 * time.Second)
+	for {
+		manager.mu.Lock()
+		count := len(manager.sessions)
+		manager.mu.Unlock()
+		if count > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("process did not start")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	cancel()
+	select {
+	case err := <-finished:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancel = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("initial stdin cancellation blocked")
+	}
+	manager.mu.Lock()
+	count := len(manager.sessions)
+	manager.mu.Unlock()
+	if count != 0 {
+		t.Fatalf("canceled Run left %d sessions", count)
+	}
+}
+
+func TestContinueCancellationOnlyCancelsWait(t *testing.T) {
+	manager := NewManager(context.Background())
+	defer manager.Close()
+	started, err := manager.Run(context.Background(), Options{Program: os.Args[0], Args: []string{"-test.run=TestProcessHelper", "--", "blocked_stdin"}, Environment: map[string]string{"LOCAL_RUNTIME_MCP_PROCESS_HELPER": "1"}, YieldTimeMS: 10})
+	if err != nil || !started.Running {
+		t.Fatalf("start = %+v, %v", started, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := manager.Continue(ctx, ContinueOptions{SessionID: started.SessionID, YieldTimeMS: 60000}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wait cancellation = %v", err)
+	}
+	result, err := manager.Continue(context.Background(), ContinueOptions{SessionID: started.SessionID, YieldTimeMS: 1})
+	if err != nil || !result.Running {
+		t.Fatalf("wait cancellation killed process: %+v, %v", result, err)
+	}
+}
+
+func TestConcurrentOutputDrainIsOneConsumer(t *testing.T) {
+	entry := &session{stdout: newStreamBuffer(100), stderr: newStreamBuffer(100), done: make(chan struct{}), started: time.Now(), exitCode: -1}
+	entry.stdout.Write([]byte("out"))
+	entry.stderr.Write([]byte("err"))
+	results := make(chan Result, 2)
+	var calls sync.WaitGroup
+	for range 2 {
+		calls.Add(1)
+		go func() { defer calls.Done(); results <- entry.result(true) }()
+	}
+	calls.Wait()
+	close(results)
+	owners := 0
+	for result := range results {
+		if result.Stdout != "" || result.Stderr != "" {
+			owners++
+			if result.Stdout != "out" || result.Stderr != "err" {
+				t.Fatalf("split result: %+v", result)
+			}
+		}
+	}
+	if owners != 1 {
+		t.Fatalf("output consumed %d times", owners)
+	}
+}
+
+func TestChildPATHOverridesApplyToPipeAndPTY(t *testing.T) {
+	executable, err := filepath.Abs(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"pipe", "pty"} {
+		t.Run(mode, func(t *testing.T) {
+			manager := NewManager(context.Background())
+			defer manager.Close()
+			result, err := manager.Run(context.Background(), Options{Program: filepath.Base(executable), Args: []string{"-test.run=TestProcessHelper", "--", "output"}, Environment: map[string]string{"PATH": filepath.Dir(executable), "LOCAL_RUNTIME_MCP_PROCESS_HELPER": "1"}, IOMode: mode, YieldTimeMS: 3000})
+			if err != nil || result.Running || result.ExitCode != 0 || !strings.Contains(result.Stdout, "xxx") {
+				t.Fatalf("child PATH result = %+v, %v", result, err)
+			}
+		})
+	}
+}
+
+func TestCloseUnblocksOutstandingStdin(t *testing.T) {
+	for _, mode := range []string{"pipe", "pty"} {
+		t.Run(mode, func(t *testing.T) {
+			manager := NewManager(context.Background())
+			defer manager.Close()
+			started, err := manager.Run(context.Background(), Options{Program: os.Args[0], Args: []string{"-test.run=TestProcessHelper", "--", "blocked_stdin"}, Environment: map[string]string{"LOCAL_RUNTIME_MCP_PROCESS_HELPER": "1"}, KeepStdinOpen: true, IOMode: mode, YieldTimeMS: 10})
+			if err != nil || !started.Running {
+				t.Fatalf("start = %+v, %v", started, err)
+			}
+			writeDone := make(chan error, 1)
+			go func() {
+				_, err := manager.Continue(context.Background(), ContinueOptions{SessionID: started.SessionID, Stdin: strings.Repeat("x", 8<<20)})
+				writeDone <- err
+			}()
+			manager.mu.Lock()
+			entry := manager.sessions[started.SessionID]
+			manager.mu.Unlock()
+			deadline := time.After(3 * time.Second)
+			for len(entry.inputGate) == 0 {
+				select {
+				case <-deadline:
+					t.Fatal("stdin writer did not start")
+				default:
+					time.Sleep(time.Millisecond)
+				}
+			}
+			closed := make(chan struct{})
+			go func() { _ = manager.Close(); close(closed) }()
+			select {
+			case <-closed:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Close did not join blocked process")
+			}
+			select {
+			case <-writeDone:
+			case <-time.After(time.Second):
+				t.Fatal("Close left blocked stdin")
+			}
+			manager.mu.Lock()
+			count := len(manager.sessions)
+			manager.mu.Unlock()
+			if count != 0 {
+				t.Fatalf("Close retained %d sessions", count)
+			}
+		})
+	}
+}
+
+func TestSeparateSessionsRunConcurrently(t *testing.T) {
+	manager := NewManager(context.Background())
+	defer manager.Close()
+	start := make(chan struct{})
+	results := make(chan Result, 2)
+	errors := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			result, err := manager.Run(context.Background(), Options{Program: os.Args[0], Args: []string{"-test.run=TestProcessHelper", "--", "blocked_stdin"}, Environment: map[string]string{"LOCAL_RUNTIME_MCP_PROCESS_HELPER": "1"}, YieldTimeMS: 10})
+			results <- result
+			errors <- err
+		}()
+	}
+	close(start)
+	first, second := <-results, <-results
+	if firstErr, secondErr := <-errors, <-errors; firstErr != nil || secondErr != nil || !first.Running || !second.Running || first.SessionID == second.SessionID {
+		t.Fatalf("parallel sessions = %+v %+v, %v %v", first, second, firstErr, secondErr)
+	}
+	manager.mu.Lock()
+	count := len(manager.sessions)
+	manager.mu.Unlock()
+	if count != 2 {
+		t.Fatalf("parallel sessions retained %d processes", count)
+	}
 }

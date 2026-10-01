@@ -2,8 +2,9 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::mem::size_of;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{OnceLock, atomic::AtomicU64};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -12,18 +13,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use windows::Win32::Foundation::{CloseHandle, FILETIME, HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO};
-use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
-};
 use windows::Win32::System::Threading::{
     AttachThreadInput, GetCurrentThreadId, GetProcessTimes, OpenProcess,
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, UIA_ButtonControlTypeId, UIA_CheckBoxControlTypeId,
-    UIA_ComboBoxControlTypeId, UIA_EditControlTypeId, UIA_HyperlinkControlTypeId,
-    UIA_ListItemControlTypeId, UIA_MenuItemControlTypeId, UIA_RadioButtonControlTypeId,
-    UIA_SliderControlTypeId, UIA_TabItemControlTypeId, UIA_TreeItemControlTypeId,
+    UIA_ButtonControlTypeId, UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId,
+    UIA_EditControlTypeId, UIA_HyperlinkControlTypeId, UIA_ListItemControlTypeId,
+    UIA_MenuItemControlTypeId, UIA_RadioButtonControlTypeId, UIA_SliderControlTypeId,
+    UIA_TabItemControlTypeId, UIA_TreeItemControlTypeId,
 };
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
@@ -31,8 +29,7 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId, IsIconic,
-    IsWindow, IsWindowVisible, SW_RESTORE, SetCursorPos, SetForegroundWindow, ShowWindow,
-    SwitchToThisWindow,
+    IsWindow, IsWindowVisible, SW_RESTORE, SetForegroundWindow, ShowWindow, SwitchToThisWindow,
 };
 use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame;
@@ -44,7 +41,12 @@ use windows_capture::settings::{
 };
 use windows_capture::window::Window as CaptureWindow;
 
-const VERSION: &str = "9.0.3";
+mod input;
+mod overlay;
+mod uia;
+use input::{check_cancel, mouse_button, move_to, press_key, send_mouse, type_text};
+
+const VERSION: &str = "10.0.0";
 const MAX_STATES: usize = 64;
 const MAX_ELEMENTS: usize = 500;
 
@@ -91,6 +93,8 @@ struct Element {
     name: String,
     bounds: Rectangle,
     disabled: bool,
+    #[serde(skip)]
+    native_ref: u64,
 }
 
 #[derive(Serialize)]
@@ -109,10 +113,14 @@ struct StateOutput {
     mime_type: &'static str,
     elements: Vec<Element>,
     elements_truncated: bool,
+    actionable: bool,
+    uia_status: String,
 }
 
 #[derive(Deserialize)]
 struct StateParams {
+    #[serde(default)]
+    control_id: String,
     #[serde(default)]
     target_id: String,
 }
@@ -144,11 +152,12 @@ struct ActionParams {
 
 #[derive(Clone)]
 struct StateRecord {
+    stop_generation: u64,
     epoch: u64,
     target_id: String,
     foreground: isize,
     bounds: Rectangle,
-    elements: HashMap<String, Rectangle>,
+    elements: HashMap<String, u64>,
 }
 
 struct Engine {
@@ -156,6 +165,8 @@ struct Engine {
     epoch: u64,
     sequence: u64,
     states: HashMap<String, StateRecord>,
+    uia: uia::Worker,
+    overlay: overlay::Overlay,
 }
 
 impl Engine {
@@ -168,6 +179,8 @@ impl Engine {
             epoch: 1,
             sequence: 0,
             states: HashMap::new(),
+            uia: uia::Worker::new(),
+            overlay: overlay::Overlay::new(),
         }
     }
 
@@ -196,6 +209,18 @@ impl Engine {
                 self.act(params)?;
                 Ok((json!({"success": true}), None))
             }
+            "show_control" => {
+                self.invalidate();
+                self.overlay.show(
+                    request.params["label"].as_str().unwrap_or("AI control"),
+                    desktop_bounds()?,
+                )?;
+                Ok((json!({"success":true}), None))
+            }
+            "invalidate" => {
+                self.invalidate();
+                Ok((json!({"success":true}), None))
+            }
             _ => Err(format!(
                 "unsupported computer worker method {:?}",
                 request.method
@@ -209,6 +234,9 @@ impl Engine {
         for window in CaptureWindow::enumerate().map_err(error_string)? {
             let title = window.title().map_err(error_string)?;
             let pid = window.process_id().map_err(error_string)?;
+            if pid == std::process::id() {
+                continue;
+            }
             let rect = window.rect().map_err(error_string)?;
             let bounds = rectangle(rect);
             if title.trim().is_empty() || bounds.width <= 0 || bounds.height <= 0 {
@@ -232,11 +260,14 @@ impl Engine {
     }
 
     fn state(&mut self, params: StateParams) -> Result<(StateOutput, Vec<u8>), String> {
+        check_cancel()?;
         let (target, title, bounds) = if params.target_id.is_empty() {
             (None, String::new(), desktop_bounds()?)
         } else {
             let window = resolve_target(&params.target_id)?;
-            require_foreground(window)?;
+            if !params.control_id.is_empty() {
+                require_foreground(window)?;
+            }
             let capture = CaptureWindow::from_raw_hwnd(window.0);
             (
                 Some(window),
@@ -256,21 +287,49 @@ impl Engine {
             );
         }
         let uia_window = target.unwrap_or(HWND(foreground_after as *mut _));
-        let (mut elements, elements_truncated) =
-            collect_accessibility(uia_window, bounds, MAX_ELEMENTS);
+        let (mut elements, elements_truncated, uia_status) = self.uia.collect(
+            uia_window,
+            bounds,
+            MAX_ELEMENTS,
+            !params.control_id.is_empty(),
+        );
+        check_cancel()?;
+        if unsafe { GetForegroundWindow() }.0 as isize != foreground_after {
+            return Err(
+                "foreground changed during accessibility observation; observe again".into(),
+            );
+        }
+        if let Some(window) = target {
+            if rectangle(
+                CaptureWindow::from_raw_hwnd(window.0)
+                    .rect()
+                    .map_err(error_string)?,
+            ) != bounds
+            {
+                return Err("target bounds changed during observation; observe again".into());
+            }
+        } else if desktop_bounds()? != bounds {
+            return Err("desktop bounds changed during observation; observe again".into());
+        }
         self.sequence += 1;
         let state_id = format!("c{:x}-{}-{}", self.nonce, self.epoch, self.sequence);
         let mut element_map = HashMap::new();
         for (index, element) in elements.iter_mut().enumerate() {
-            element.ref_id = format!("{}:u{}", state_id, index + 1);
-            element_map.insert(element.ref_id.clone(), element.bounds);
+            if !params.control_id.is_empty() {
+                element.ref_id = format!("{}:u{}", state_id, index + 1);
+                element_map.insert(element.ref_id.clone(), element.native_ref);
+            }
         }
         let mut cursor = POINT::default();
         unsafe {
             let _ = GetCursorPos(&mut cursor);
         }
         let state = StateOutput {
-            state_id: state_id.clone(),
+            state_id: if params.control_id.is_empty() {
+                String::new()
+            } else {
+                state_id.clone()
+            },
             target_id: params.target_id.clone(),
             title,
             origin_x: bounds.x,
@@ -282,30 +341,43 @@ impl Engine {
             mime_type: "image/png",
             elements,
             elements_truncated,
+            actionable: !params.control_id.is_empty(),
+            uia_status,
         };
         if self.states.len() >= MAX_STATES {
             self.states.clear();
         }
-        self.states.insert(
-            state_id,
-            StateRecord {
-                epoch: self.epoch,
-                target_id: params.target_id,
-                foreground: foreground_after,
-                bounds,
-                elements: element_map,
-            },
-        );
+        if !params.control_id.is_empty() {
+            self.states.insert(
+                state_id,
+                StateRecord {
+                    stop_generation: STOP_GENERATION.load(Ordering::SeqCst),
+                    epoch: self.epoch,
+                    target_id: params.target_id,
+                    foreground: foreground_after,
+                    bounds,
+                    elements: element_map,
+                },
+            );
+            self.overlay.target(bounds);
+        }
         Ok((state, image))
     }
 
     fn act(&mut self, params: ActionParams) -> Result<(), String> {
+        check_cancel()?;
         if params.kind == "activate" {
             if params.target_id.is_empty() || !params.state_id.is_empty() {
                 return Err("activate requires target_id and does not accept state_id".into());
             }
-            activate(resolve_target(&params.target_id)?)?;
+            let window = resolve_target(&params.target_id)?;
             self.invalidate();
+            activate(window)?;
+            self.overlay.target(rectangle(
+                CaptureWindow::from_raw_hwnd(window.0)
+                    .rect()
+                    .map_err(error_string)?,
+            ));
             return Ok(());
         }
         if params.state_id.is_empty() {
@@ -318,7 +390,10 @@ impl Engine {
             .get(&params.state_id)
             .cloned()
             .ok_or("state_id is unknown or stale; call computer_state again")?;
-        if record.epoch != self.epoch || record.target_id != params.target_id {
+        if record.epoch != self.epoch
+            || record.target_id != params.target_id
+            || record.stop_generation != STOP_GENERATION.load(Ordering::SeqCst)
+        {
             return Err("target_id does not match the referenced state".into());
         }
         let foreground = unsafe { GetForegroundWindow() }.0 as isize;
@@ -335,8 +410,42 @@ impl Engine {
                 return Err("target bounds changed; call computer_state again".into());
             }
         }
-        perform_action(&params, &record)?;
         self.invalidate();
+        let live = if params.element_ref.is_empty() {
+            None
+        } else {
+            let key = *record
+                .elements
+                .get(&params.element_ref)
+                .ok_or("element_ref unknown or stale")?;
+            if params.kind == "set_value" {
+                self.uia
+                    .set_value(key, params.text.clone(), record.foreground)?;
+                return Ok(());
+            }
+            Some(self.uia.resolve(key)?)
+        };
+        if params.kind == "set_value" {
+            return Err("set_value requires a UIA element_ref".into());
+        }
+        check_cancel()?;
+        if unsafe { GetForegroundWindow() }.0 as isize != record.foreground {
+            return Err("foreground changed during element resolution; observe again".into());
+        }
+        if !params.target_id.is_empty()
+            && rectangle(
+                CaptureWindow::from_raw_hwnd(resolve_target(&params.target_id)?.0)
+                    .rect()
+                    .map_err(error_string)?,
+            ) != record.bounds
+        {
+            return Err("target bounds changed during element resolution; observe again".into());
+        }
+        let result = perform_action(&params, &record, live, &self.overlay);
+        if !input::release_all() {
+            return Err("injected input cleanup incomplete; release desktop control".into());
+        }
+        result?;
         Ok(())
     }
 
@@ -459,96 +568,6 @@ fn capture_desktop(bounds: Rectangle) -> Result<(Vec<u8>, i32, i32), String> {
     Ok((encoded, bounds.width, bounds.height))
 }
 
-fn collect_accessibility(window: HWND, origin: Rectangle, limit: usize) -> (Vec<Element>, bool) {
-    let (sender, receiver) = mpsc::channel();
-    let raw_window = window.0 as isize;
-    std::thread::spawn(move || {
-        let result =
-            unsafe { collect_accessibility_inner(HWND(raw_window as *mut _), origin, limit) };
-        let _ = sender.send(result);
-    });
-    receiver
-        .recv_timeout(Duration::from_secs(2))
-        .unwrap_or_default()
-}
-
-unsafe fn collect_accessibility_inner(
-    window: HWND,
-    origin: Rectangle,
-    limit: usize,
-) -> (Vec<Element>, bool) {
-    if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() {
-        return (Vec::new(), false);
-    }
-    let result = (|| -> windows::core::Result<(Vec<Element>, bool)> {
-        let automation: IUIAutomation =
-            CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
-        let root = automation.ElementFromHandle(window)?;
-        let walker = automation.ControlViewWalker()?;
-        let mut stack = Vec::new();
-        if let Ok(first) = walker.GetFirstChildElement(&root) {
-            stack.push(first);
-        }
-        let mut elements = Vec::new();
-        let mut visited = 0usize;
-        let mut truncated = false;
-        while let Some(element) = stack.pop() {
-            visited += 1;
-            if visited > 5_000 {
-                truncated = true;
-                break;
-            }
-            if let Ok(sibling) = walker.GetNextSiblingElement(&element) {
-                stack.push(sibling);
-            }
-            if let Ok(child) = walker.GetFirstChildElement(&element) {
-                stack.push(child);
-            }
-            let control_type = match element.CurrentControlType() {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            if !interactive_control(control_type.0) {
-                continue;
-            }
-            let rect = match element.CurrentBoundingRectangle() {
-                Ok(value) => rectangle(value),
-                Err(_) => continue,
-            };
-            if rect.width <= 0 || rect.height <= 0 {
-                continue;
-            }
-            let name = element
-                .CurrentName()
-                .map(|value| value.to_string())
-                .unwrap_or_default();
-            elements.push(Element {
-                ref_id: String::new(),
-                role: role_name(control_type.0).into(),
-                name,
-                bounds: Rectangle {
-                    x: rect.x - origin.x,
-                    y: rect.y - origin.y,
-                    width: rect.width,
-                    height: rect.height,
-                },
-                disabled: element
-                    .CurrentIsEnabled()
-                    .map(|value| !value.as_bool())
-                    .unwrap_or(false),
-            });
-            if elements.len() == limit {
-                truncated = !stack.is_empty();
-                break;
-            }
-        }
-        Ok((elements, truncated))
-    })()
-    .unwrap_or_default();
-    CoUninitialize();
-    result
-}
-
 fn interactive_control(value: i32) -> bool {
     matches!(
         value,
@@ -583,16 +602,23 @@ fn role_name(value: i32) -> &'static str {
     }
 }
 
-fn perform_action(params: &ActionParams, record: &StateRecord) -> Result<(), String> {
+fn perform_action(
+    params: &ActionParams,
+    record: &StateRecord,
+    live: Option<Rectangle>,
+    overlay: &overlay::Overlay,
+) -> Result<(), String> {
     let point = if !params.element_ref.is_empty() {
-        let rect = record
-            .elements
-            .get(&params.element_ref)
-            .ok_or("element_ref is unknown or stale")?;
-        Some((
-            record.bounds.x + rect.x + rect.width / 2,
-            record.bounds.y + rect.y + rect.height / 2,
-        ))
+        let rect = live.ok_or("element_ref is unknown or stale")?;
+        let center = (rect.x + rect.width / 2, rect.y + rect.height / 2);
+        if center.0 < record.bounds.x
+            || center.1 < record.bounds.y
+            || center.0 >= record.bounds.x + record.bounds.width
+            || center.1 >= record.bounds.y + record.bounds.height
+        {
+            return Err("UIA element moved outside the observed target; observe again".into());
+        }
+        Some((rect.x + rect.width / 2, rect.y + rect.height / 2))
     } else if let (Some(x), Some(y)) = (params.x, params.y) {
         if x < 0 || y < 0 || x >= record.bounds.width || y >= record.bounds.height {
             return Err("coordinates are outside the referenced state".into());
@@ -601,6 +627,10 @@ fn perform_action(params: &ActionParams, record: &StateRecord) -> Result<(), Str
     } else {
         None
     };
+    if let Some(point) = point {
+        overlay.marker(point);
+    }
+    check_cancel()?;
     match params.kind.as_str() {
         "move" => move_to(point.ok_or("move requires coordinates or element_ref")?),
         "click" | "double_click" => {
@@ -633,14 +663,11 @@ fn perform_action(params: &ActionParams, record: &StateRecord) -> Result<(), Str
             }
             mouse_button(&params.button, false)
         }
-        "type_text" | "set_value" => {
+        "type_text" => {
             if let Some(value) = point {
                 move_to(value)?;
                 mouse_button("left", true)?;
                 mouse_button("left", false)?;
-            }
-            if params.kind == "set_value" {
-                press_key("CTRL+A")?;
             }
             type_text(&params.text)
         }
@@ -668,115 +695,6 @@ fn perform_action(params: &ActionParams, record: &StateRecord) -> Result<(), Str
     }
 }
 
-fn move_to(point: (i32, i32)) -> Result<(), String> {
-    unsafe {
-        SetCursorPos(point.0, point.1)
-            .ok()
-            .ok_or_else(|| "SetCursorPos failed".into())
-    }
-}
-fn mouse_button(button: &str, down: bool) -> Result<(), String> {
-    let flags = match (button, down) {
-        ("right", true) => MOUSEEVENTF_RIGHTDOWN,
-        ("right", false) => MOUSEEVENTF_RIGHTUP,
-        ("middle", true) => MOUSEEVENTF_MIDDLEDOWN,
-        ("middle", false) => MOUSEEVENTF_MIDDLEUP,
-        (_, true) => MOUSEEVENTF_LEFTDOWN,
-        _ => MOUSEEVENTF_LEFTUP,
-    };
-    send_mouse(flags, 0)
-}
-fn send_mouse(flags: MOUSE_EVENT_FLAGS, data: u32) -> Result<(), String> {
-    let input = INPUT {
-        r#type: INPUT_MOUSE,
-        Anonymous: INPUT_0 {
-            mi: MOUSEINPUT {
-                mouseData: data,
-                dwFlags: flags,
-                ..Default::default()
-            },
-        },
-    };
-    if unsafe { SendInput(&[input], size_of::<INPUT>() as i32) } != 1 {
-        return Err("SendInput rejected mouse input (possibly UIPI integrity isolation)".into());
-    }
-    Ok(())
-}
-fn send_key(key: u16, scan: u16, flags: KEYBD_EVENT_FLAGS) -> Result<(), String> {
-    let input = INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: VIRTUAL_KEY(key),
-                wScan: scan,
-                dwFlags: flags,
-                ..Default::default()
-            },
-        },
-    };
-    if unsafe { SendInput(&[input], size_of::<INPUT>() as i32) } != 1 {
-        return Err("SendInput rejected keyboard input (possibly UIPI integrity isolation)".into());
-    }
-    Ok(())
-}
-fn type_text(value: &str) -> Result<(), String> {
-    if value.is_empty() {
-        return Err("text cannot be empty".into());
-    }
-    for unit in value.encode_utf16() {
-        send_key(0, unit, KEYEVENTF_UNICODE)?;
-        send_key(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)?;
-    }
-    Ok(())
-}
-fn press_key(value: &str) -> Result<(), String> {
-    let parts: Vec<_> = value
-        .trim()
-        .to_uppercase()
-        .split('+')
-        .map(str::to_owned)
-        .collect();
-    if parts.is_empty() || parts[0].is_empty() {
-        return Err("key cannot be empty".into());
-    }
-    let mut keys = Vec::new();
-    for part in parts {
-        keys.push(virtual_key(&part).ok_or_else(|| format!("unsupported key {part:?}"))?);
-    }
-    for key in &keys {
-        send_key(*key, 0, KEYBD_EVENT_FLAGS(0))?;
-    }
-    for key in keys.iter().rev() {
-        send_key(*key, 0, KEYEVENTF_KEYUP)?;
-    }
-    Ok(())
-}
-fn virtual_key(value: &str) -> Option<u16> {
-    Some(match value {
-        "BACKSPACE" => 0x08,
-        "TAB" => 0x09,
-        "ENTER" => 0x0D,
-        "SHIFT" => 0x10,
-        "CTRL" | "CONTROL" => 0x11,
-        "ALT" => 0x12,
-        "ESC" | "ESCAPE" => 0x1B,
-        "SPACE" => 0x20,
-        "PAGEUP" => 0x21,
-        "PAGEDOWN" => 0x22,
-        "END" => 0x23,
-        "HOME" => 0x24,
-        "LEFT" => 0x25,
-        "UP" => 0x26,
-        "RIGHT" => 0x27,
-        "DOWN" => 0x28,
-        "DELETE" => 0x2E,
-        "META" | "WIN" => 0x5B,
-        one if one.len() == 1 => one.as_bytes()[0] as u16,
-        function if function.starts_with('F') => 0x6F + function[1..].parse::<u16>().ok()?,
-        _ => return None,
-    })
-}
-
 fn activate(window: HWND) -> Result<(), String> {
     unsafe {
         if !IsWindow(Some(window)).as_bool() || !IsWindowVisible(window).as_bool() {
@@ -790,6 +708,7 @@ fn activate(window: HWND) -> Result<(), String> {
         if wait_for_foreground(window, 10) {
             return Ok(());
         }
+        check_cancel()?;
 
         let foreground = GetForegroundWindow();
         let current_thread = GetCurrentThreadId();
@@ -815,6 +734,7 @@ fn activate(window: HWND) -> Result<(), String> {
         if activated_while_attached {
             return Ok(());
         }
+        check_cancel()?;
 
         SwitchToThisWindow(window, true);
         if wait_for_foreground(window, 20) {
@@ -829,6 +749,9 @@ fn activate(window: HWND) -> Result<(), String> {
 }
 unsafe fn wait_for_foreground(window: HWND, attempts: usize) -> bool {
     for _ in 0..attempts {
+        if check_cancel().is_err() {
+            return false;
+        }
         if unsafe { GetForegroundWindow() } == window {
             return true;
         }
@@ -949,22 +872,92 @@ fn read_request(reader: &mut impl Read) -> io::Result<Option<Request>> {
         .map(Some)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
-fn write_response(writer: &mut impl Write, response: &Response) -> io::Result<()> {
-    let data = serde_json::to_vec(response).map_err(io::Error::other)?;
-    writer.write_all(&(data.len() as u32).to_le_bytes())?;
-    writer.write_all(&data)?;
-    writer.flush()
+
+static OUTPUT: OnceLock<Mutex<io::Stdout>> = OnceLock::new();
+type ActiveRequest = Option<(u64, Arc<AtomicBool>)>;
+static ACTIVE: OnceLock<Mutex<ActiveRequest>> = OnceLock::new();
+static STOP_GENERATION: AtomicU64 = AtomicU64::new(0);
+pub static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+fn write_value(value: &Value) -> io::Result<()> {
+    let data = serde_json::to_vec(value).map_err(io::Error::other)?;
+    let mut output = OUTPUT
+        .get_or_init(|| Mutex::new(io::stdout()))
+        .lock()
+        .map_err(|_| io::Error::other("output lock poisoned"))?;
+    output.write_all(&(data.len() as u32).to_le_bytes())?;
+    output.write_all(&data)?;
+    output.flush()
+}
+fn emit_event(value: Value) {
+    let _ = write_value(&value);
+}
+fn cancel_active(request: Option<u64>) -> bool {
+    let mut matched = request.is_none();
+    if let Ok(active) = ACTIVE.get_or_init(|| Mutex::new(None)).lock()
+        && let Some((id, cancel)) = &*active
+        && (request.is_none() || request == Some(*id))
+    {
+        cancel.store(true, Ordering::SeqCst);
+        matched = true;
+    }
+    !matched || input::release_all()
+}
+fn local_stop() {
+    cancel_active(None);
+    STOP_GENERATION.fetch_add(1, Ordering::SeqCst);
+    overlay::hide_global();
+    emit_event(json!({"event":"local_stop"}));
 }
 
 fn main() -> io::Result<()> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
+    let (sender, receiver) = mpsc::sync_channel::<(Request, Arc<AtomicBool>)>(1);
+    std::thread::spawn(move || {
+        let mut input = io::stdin().lock();
+        while let Ok(Some(request)) = read_request(&mut input) {
+            if request.method == "cancel" || request.method == "stop" {
+                let target = if request.method == "cancel" {
+                    request.params["request_id"].as_u64()
+                } else {
+                    None
+                };
+                let cleaned = cancel_active(target);
+                if request.method == "stop" {
+                    STOP_GENERATION.fetch_add(1, Ordering::SeqCst);
+                    overlay::hide_global();
+                }
+                if !cleaned {
+                    emit_event(json!({"id":request.id,"error":"native input cleanup incomplete"}));
+                } else if request.method == "stop" && uia::semantic_settling() {
+                    emit_event(
+                        json!({"id":request.id,"error":"native semantic action still settling"}),
+                    );
+                } else {
+                    emit_event(json!({"id":request.id,"result":{"success":true}}));
+                }
+                continue;
+            }
+            let cancel = Arc::new(AtomicBool::new(false));
+            *ACTIVE.get_or_init(|| Mutex::new(None)).lock().unwrap() =
+                Some((request.id, cancel.clone()));
+            if sender.send((request, cancel)).is_err() {
+                break;
+            }
+        }
+        local_stop();
+        SHUTTING_DOWN.store(true, Ordering::SeqCst);
+    });
     let mut engine = Engine::new();
-    let mut input = io::stdin().lock();
-    let mut output = io::stdout().lock();
-    while let Some(request) = read_request(&mut input)? {
-        let response = match engine.execute(&request) {
+    while let Ok((request, cancel)) = receiver.recv() {
+        input::set_cancel(cancel);
+        let executed = check_cancel().and_then(|_| engine.execute(&request));
+        if executed.is_err() {
+            input::release_all();
+        }
+        let response = match executed {
             Ok((result, image)) => Response {
                 id: request.id,
                 result: Some(result),
@@ -979,7 +972,13 @@ fn main() -> io::Result<()> {
                 image_base64: None,
             },
         };
-        write_response(&mut output, &response)?;
+        write_value(&serde_json::to_value(response).map_err(io::Error::other)?)?;
+        let mut active = ACTIVE.get_or_init(|| Mutex::new(None)).lock().unwrap();
+        if active.as_ref().is_some_and(|(id, _)| *id == request.id) {
+            *active = None;
+        }
     }
+    input::release_all();
+    SHUTTING_DOWN.store(true, Ordering::SeqCst);
     Ok(())
 }

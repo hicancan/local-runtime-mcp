@@ -5,6 +5,7 @@ package process
 import (
 	"os"
 	"os/exec"
+	"time"
 	"unsafe"
 
 	pty "github.com/aymanbagabas/go-pty"
@@ -78,4 +79,24 @@ func (c *windowsProcessControl) Kill() error {
 
 func (c *windowsProcessControl) Close() error {
 	return windows.CloseHandle(c.job)
+}
+
+func finishTerminal(terminal pty.Pty, outputDone <-chan struct{}) {
+	console, ok := terminal.(pty.ConPty)
+	if !ok {
+		_ = terminal.Close()
+		<-outputDone
+		return
+	}
+	// Keep the reader open while ConHost publishes its final output. The upstream
+	// Close closes the read pipe immediately after ClosePseudoConsole and can lose
+	// the last frame from a short-lived executable.
+	windows.ClosePseudoConsole(windows.Handle(console.Fd()))
+	_ = console.InputPipe().Close()
+	select {
+	case <-outputDone:
+	case <-time.After(2 * time.Second):
+	}
+	_ = console.OutputPipe().Close()
+	<-outputDone
 }

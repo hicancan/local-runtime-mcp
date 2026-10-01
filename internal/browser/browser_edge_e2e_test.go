@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unsafe"
@@ -102,21 +103,49 @@ func TestEdgeExtensionEndToEnd(t *testing.T) {
 		t.Fatal("isolated Edge extension did not connect to the bridge")
 	}
 
-	callContext, stop := context.WithTimeout(ctx, 15*time.Second)
+	callContext, stop := context.WithTimeout(ctx, 90*time.Second)
 	defer stop()
-	tabs, err := bridge.Tabs(callContext)
+	tabs, err := bridge.Tabs(callContext, bridge.Status().Instances[0].BrowserID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var tabID int
+	var tabID string
 	for _, tab := range tabs {
 		if strings.HasPrefix(tab.URL, page.URL) {
 			tabID = tab.ID
 			break
 		}
 	}
-	if tabID == 0 {
+	if tabID == "" {
 		t.Fatalf("test page was not controllable: %+v", tabs)
+	}
+	firstBrowser := bridge.Status().Instances[0].BrowserID
+	launchIsolatedEdge(t, edge, extension, page.URL)
+	multipleDeadline := time.Now().Add(20 * time.Second)
+	for len(bridge.Status().Instances) < 2 && time.Now().Before(multipleDeadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if len(bridge.Status().Instances) != 2 {
+		t.Fatalf("second profile did not connect: %+v", bridge.Status())
+	}
+	var secondBrowser string
+	for _, instance := range bridge.Status().Instances {
+		if instance.BrowserID != firstBrowser {
+			secondBrowser = instance.BrowserID
+		}
+	}
+	secondTabs, err := bridge.Tabs(callContext, secondBrowser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secondTab string
+	for _, tab := range secondTabs {
+		if strings.HasPrefix(tab.URL, page.URL) {
+			secondTab = tab.ID
+		}
+	}
+	if secondTab == "" || secondTab == tabID {
+		t.Fatalf("profile handles collide: first=%s second=%s", tabID, secondTab)
 	}
 
 	var snapshot Snapshot
@@ -132,9 +161,7 @@ func TestEdgeExtensionEndToEnd(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	if err != nil {
-		bridge.mu.Lock()
-		t.Logf("bridge diagnostics: queued_commands=%d pending=%d last_seen=%s", len(bridge.commands), len(bridge.pending), bridge.lastSeen.Format(time.RFC3339Nano))
-		bridge.mu.Unlock()
+		t.Logf("bridge diagnostics: %+v", bridge.Status())
 		if log, readErr := os.ReadFile(logPath); readErr == nil {
 			var relevant []string
 			for _, line := range strings.Split(string(log), "\n") {
@@ -222,6 +249,165 @@ func TestEdgeExtensionEndToEnd(t *testing.T) {
 	if _, err := bridge.Navigate(callContext, Navigation{TabID: tabID, Kind: "reload"}); err != nil {
 		t.Fatal(err)
 	}
+	secondSnapshot, err := bridge.Snapshot(callContext, secondTab, 20, 1000)
+	if err != nil || strings.Contains(secondSnapshot.Text, "child clicked") || !strings.Contains(secondSnapshot.Text, "ready") {
+		t.Fatalf("profile isolation snapshot=%+v err=%v", secondSnapshot, err)
+	}
+	background, err := bridge.Open(callContext, firstBrowser, page.URL, false, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if background.Active {
+		t.Fatal("background open activated the tab")
+	}
+
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	blocking := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		once.Do(func() { close(started) })
+		select {
+		case <-release:
+			fmt.Fprint(w, "released")
+		case <-r.Context().Done():
+		}
+	}))
+	defer blocking.Close()
+	longDone := make(chan error, 1)
+	go func() {
+		_, err := bridge.Act(callContext, Action{TabID: background.ID, Kind: "evaluate", Script: fmt.Sprintf("fetch(%q).then(r=>r.text())", blocking.URL)})
+		longDone <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		close(release)
+		t.Fatal("long browser task did not start")
+	}
+	queuedContext, queuedCancel := context.WithCancel(callContext)
+	queuedDone := make(chan error, 1)
+	go func() {
+		_, err := bridge.Act(queuedContext, Action{TabID: background.ID, Kind: "evaluate", Script: "globalThis.canceledTaskRan=true"})
+		queuedDone <- err
+	}()
+	// Ensure the command crossed the Bridge intake boundary before canceling it.
+	queuedDeadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(queuedDeadline) {
+		bridge.mu.Lock()
+		dispatched := 0
+		for _, pending := range bridge.pending {
+			if pending.dispatched {
+				dispatched++
+			}
+		}
+		bridge.mu.Unlock()
+		if dispatched >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	queuedCancel()
+	if err := <-queuedDone; err == nil {
+		close(release)
+		t.Fatal("queued task did not cancel")
+	}
+	// A separate tab must complete while the first tab remains blocked.
+	parallelDone := make(chan error, 1)
+	go func() { _, err := bridge.Snapshot(callContext, tabID, 20, 1000); parallelDone <- err }()
+	select {
+	case err := <-parallelDone:
+		if err != nil {
+			close(release)
+			t.Fatal(err)
+		}
+	case <-time.After(8 * time.Second):
+		close(release)
+		t.Fatal("busy lane starved independent tab")
+	}
+	close(release)
+	if err := <-longDone; err != nil {
+		t.Fatal(err)
+	}
+	value, err := bridge.Act(callContext, Action{TabID: background.ID, Kind: "evaluate", Script: "globalThis.canceledTaskRan===true"})
+	if err != nil || value.Value != false {
+		t.Fatalf("canceled queued task executed: %+v %v", value, err)
+	}
+	if err := bridge.CloseTab(callContext, background.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bridge.Snapshot(callContext, background.ID, 20, 1000); err == nil {
+		t.Fatal("closed tab handle accepted")
+	}
+	openStarted, finishOpen := make(chan struct{}), make(chan struct{})
+	var openOnce sync.Once
+	slowPage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		openOnce.Do(func() { close(openStarted) })
+		select {
+		case <-finishOpen:
+			fmt.Fprint(w, "<!doctype html><title>late page</title><p>loaded</p>")
+		case <-r.Context().Done():
+		}
+	}))
+	defer slowPage.Close()
+	openDone := make(chan error, 1)
+	go func() { _, err := bridge.Open(callContext, firstBrowser, slowPage.URL, false, ""); openDone <- err }()
+	select {
+	case <-openStarted:
+	case <-time.After(5 * time.Second):
+		close(finishOpen)
+		t.Fatal("slow open did not begin")
+	}
+	listed, err := bridge.Tabs(callContext, firstBrowser)
+	if err != nil {
+		close(finishOpen)
+		t.Fatal(err)
+	}
+	var loadingTab string
+	for _, tab := range listed {
+		if strings.HasPrefix(tab.URL, slowPage.URL) {
+			loadingTab = tab.ID
+		}
+	}
+	if loadingTab == "" {
+		close(finishOpen)
+		t.Fatalf("opening target missing: %+v", listed)
+	}
+	loadingDone := make(chan error, 1)
+	go func() { _, err := bridge.Snapshot(callContext, loadingTab, 20, 1000); loadingDone <- err }()
+	// An unrelated existing tab is a synchronization barrier and must stay runnable.
+	if _, err := bridge.Snapshot(callContext, tabID, 20, 1000); err != nil {
+		close(finishOpen)
+		t.Fatal(err)
+	}
+	select {
+	case err := <-loadingDone:
+		close(finishOpen)
+		t.Fatalf("observation raced initial open: %v", err)
+	default:
+	}
+	close(finishOpen)
+	if err := <-openDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-loadingDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func launchIsolatedEdge(t *testing.T, edge, extension, url string) {
+	t.Helper()
+	profile := filepath.Join(t.TempDir(), "edge-profile")
+	command := exec.Command(edge, "--headless=new", "--disable-gpu", "--silent-debugger-extension-api", "--no-first-run", "--no-default-browser-check", "--host-resolver-rules=MAP child.local-runtime-mcp.invalid 127.0.0.1", "--user-data-dir="+profile, "--disable-extensions-except="+extension, "--load-extension="+extension, url)
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	job, err := createEdgeJob(command.Process.Pid)
+	if err != nil {
+		_ = command.Process.Kill()
+		_, _ = command.Process.Wait()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = windows.TerminateJobObject(job, 1); _ = windows.CloseHandle(job); _ = command.Wait() })
 }
 
 func createEdgeJob(processID int) (windows.Handle, error) {

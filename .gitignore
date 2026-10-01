@@ -4,7 +4,7 @@
 /lrmcp
 
 # Local configuration and secrets
-/config.yaml
+/local-runtime-mcp.yaml
 *.local.yaml
 .env
 

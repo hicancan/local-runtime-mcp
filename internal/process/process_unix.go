@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+	"time"
 
 	pty "github.com/aymanbagabas/go-pty"
 )
@@ -37,4 +38,14 @@ func (c *unixProcessControl) Kill() error {
 	return err
 }
 
-func (*unixProcessControl) Close() error { return nil }
+func (c *unixProcessControl) Close() error { return c.Kill() }
+
+func finishTerminal(terminal pty.Pty, outputDone <-chan struct{}) {
+	// Allow the master reader to collect the slave's final bytes before closing.
+	select {
+	case <-outputDone:
+	case <-time.After(100 * time.Millisecond):
+	}
+	_ = terminal.Close()
+	<-outputDone
+}

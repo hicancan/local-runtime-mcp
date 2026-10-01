@@ -13,11 +13,19 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const Version = "9.0.3"
+const Version = "10.0.0"
 
-const instructions = "Local Runtime MCP exposes the machine where lrmcp is running. Filesystem and image tools accept direct absolute paths or paths relative to the server process. Process tools execute installed programs directly without shell parsing and return sessions for longer programs. Browser tools use the bundled Chromium extension over an authenticated loopback bridge. Computer tools operate the current interactive desktop and target open windows. Prefer browser tools for web pages, computer tools for native UI, and native image-content tools for images and screenshots. Source code is available under AGPL-3.0-only at https://github.com/hicancan/local-runtime-mcp."
+const instructions = "Local Runtime MCP exposes the machine where lrmcp is running. Filesystem and image tools accept direct absolute paths or paths relative to the server process. Create new text paths with mode=create; replace or patch only an expected SHA-256 version. Process tools execute installed programs directly without shell parsing and return independent sessions for longer programs. Browser tools use the bundled Chromium extension: discover instances with browser_status, select browser_id for tabs/open, and use the returned opaque tab_id for all existing-tab operations. New tabs are inactive by default. Computer tools operate one shared interactive desktop: acquire computer_control, retain its control_id, observe an actionable computer_state, act using that exact state_id, and release control when finished. Tokenless desktop observations are read-only. Visible browser changes share the desktop gate and require the matching control_id while another task owns it. Independent process sessions, file paths, and background browser tabs can run concurrently; IDs route resources, not separate operating-system desktops or security tenants. Prefer browser tools for web pages, computer tools for native UI, and native image-content tools for images and screenshots. Source code is available under AGPL-3.0-only at https://github.com/hicancan/local-runtime-mcp."
 
-func New(ctx context.Context, browserBridge *browser.Bridge, computerController computer.Controller) *mcp.Server {
+// Dependencies are owned by the Runtime Host, never by a client connection.
+type Dependencies struct {
+	Process    *runtimeprocess.Manager
+	Filesystem *filesystem.Service
+	Browser    *browser.Bridge
+	Computer   computer.Controller
+}
+
+func New(deps Dependencies) *mcp.Server {
 	server := mcp.NewServer(
 		&mcp.Implementation{Name: "local-runtime-mcp", Version: Version},
 		&mcp.ServerOptions{Instructions: instructions, Capabilities: &mcp.ServerCapabilities{}},
@@ -26,20 +34,22 @@ func New(ctx context.Context, browserBridge *browser.Bridge, computerController 
 	mcp.AddTool(server, tool("filesystem_list", "List directory", "List a bounded number of files and directories below a direct machine path without following symbolic links.", true, false, true, false), filesystemList)
 	mcp.AddTool(server, tool("filesystem_stat", "Inspect path", "Inspect a direct path without following symbolic links; optionally calculate a regular file's SHA-256.", true, false, true, false), filesystemStat)
 	mcp.AddTool(server, tool("filesystem_read_text", "Read text file", "Read bounded complete UTF-8 lines from a direct machine path, starting at any one-based line.", true, false, true, false), filesystemReadText)
-	mcp.AddTool(server, tool("filesystem_write_text", "Write text file", "Atomically create or replace a complete UTF-8 text file, optionally requiring an expected SHA-256.", false, true, true, false), filesystemWriteText)
-	mcp.AddTool(server, tool("filesystem_patch_text", "Patch text file", "Apply uniquely anchored, non-overlapping UTF-8 hunks against one expected file version and commit them atomically.", false, true, true, false), filesystemPatchText)
+	writeTool := inputTool[writeTextInput](tool("filesystem_write_text", "Write text file", "Atomically create a new UTF-8 file or replace one expected file version. Writes to the same path are serialized by this host.", false, true, true, false), func(schema *jsonschema.Schema) {
+		schema.Properties["mode"].Enum = enum("create", "replace")
+	})
+	mcp.AddTool(server, writeTool, filesystemWriteText(deps.Filesystem))
+	mcp.AddTool(server, tool("filesystem_patch_text", "Patch text file", "Apply uniquely anchored, non-overlapping UTF-8 hunks against one expected file version and commit them atomically.", false, true, true, false), filesystemPatchText(deps.Filesystem))
 	mcp.AddTool(server, tool("filesystem_search_text", "Search text files", "Search bounded UTF-8 files below a direct path using literal text or a Go regular expression.", true, false, true, false), filesystemSearchText)
 	mcp.AddTool(server, tool("image_read", "Read image", "Return a direct PNG, JPEG, GIF, or WebP path as native MCP image content with metadata.", true, false, true, false), imageRead)
 
-	processManager := runtimeprocess.NewManager(ctx)
 	processRunTool := inputTool[processRunInput](tool("process_run", "Run process", "Start a program directly in pipe or interactive PTY mode. Completed programs return their result; longer programs return a session ID.", false, true, false, true), func(schema *jsonschema.Schema) {
 		schema.Properties["io_mode"].Enum = enum("pipe", "pty")
 	})
-	mcp.AddTool(server, processRunTool, processRun(processManager))
-	mcp.AddTool(server, tool("process_continue", "Continue process", "Read incremental output, write or close pipe stdin, resize a PTY, wait for, or terminate a process session.", false, true, false, true), processContinue(processManager))
+	mcp.AddTool(server, processRunTool, processRun(deps.Process))
+	mcp.AddTool(server, tool("process_continue", "Continue process", "Read incremental output, write or close pipe stdin, resize a PTY, wait for, or terminate a process session.", false, true, false, true), processContinue(deps.Process))
 
-	registerBrowserTools(server, browserBridge)
-	registerComputerTools(server, computerController)
+	registerBrowserTools(server, deps.Browser)
+	registerComputerTools(server, deps.Computer)
 	return server
 }
 
@@ -113,17 +123,16 @@ func filesystemReadText(_ context.Context, _ *mcp.CallToolRequest, in readTextIn
 type writeTextInput struct {
 	Path           string `json:"path" jsonschema:"absolute text-file path or path relative to the server process"`
 	Content        string `json:"content" jsonschema:"complete UTF-8 file content"`
-	CreateOnly     bool   `json:"create_only,omitempty" jsonschema:"fail if the target already exists"`
-	ExpectedSHA256 string `json:"expected_sha256,omitempty" jsonschema:"replace only when the existing file has this SHA-256; mutually exclusive with create_only"`
+	Mode           string `json:"mode" jsonschema:"create a new path or replace an existing file version"`
+	ExpectedSHA256 string `json:"expected_sha256,omitempty" jsonschema:"required for replace; forbidden for create"`
 	CreateParents  bool   `json:"create_parents,omitempty" jsonschema:"create missing parent directories; defaults to false"`
 }
 
-func filesystemWriteText(_ context.Context, _ *mcp.CallToolRequest, in writeTextInput) (*mcp.CallToolResult, filesystem.TextWriteResult, error) {
-	if in.CreateOnly && in.ExpectedSHA256 != "" {
-		return nil, filesystem.TextWriteResult{}, fmt.Errorf("create_only and expected_sha256 are mutually exclusive")
+func filesystemWriteText(service *filesystem.Service) func(context.Context, *mcp.CallToolRequest, writeTextInput) (*mcp.CallToolResult, filesystem.TextWriteResult, error) {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in writeTextInput) (*mcp.CallToolResult, filesystem.TextWriteResult, error) {
+		result, err := service.WriteText(ctx, in.Path, in.Content, filesystem.WriteTextOptions{Mode: in.Mode, ExpectedSHA256: in.ExpectedSHA256, CreateParents: in.CreateParents})
+		return nil, result, err
 	}
-	result, err := filesystem.WriteText(in.Path, in.Content, filesystem.WriteTextOptions{CreateOnly: in.CreateOnly, ExpectedSHA256: in.ExpectedSHA256, CreateParents: in.CreateParents})
-	return nil, result, err
 }
 
 type patchTextInput struct {
@@ -132,9 +141,11 @@ type patchTextInput struct {
 	ExpectedSHA256 string                     `json:"expected_sha256" jsonschema:"required SHA-256 of the original file"`
 }
 
-func filesystemPatchText(_ context.Context, _ *mcp.CallToolRequest, in patchTextInput) (*mcp.CallToolResult, filesystem.TextPatchResult, error) {
-	result, err := filesystem.PatchText(in.Path, filesystem.PatchTextOptions{Hunks: in.Hunks, ExpectedSHA256: in.ExpectedSHA256})
-	return nil, result, err
+func filesystemPatchText(service *filesystem.Service) func(context.Context, *mcp.CallToolRequest, patchTextInput) (*mcp.CallToolResult, filesystem.TextPatchResult, error) {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in patchTextInput) (*mcp.CallToolResult, filesystem.TextPatchResult, error) {
+		result, err := service.PatchText(ctx, in.Path, filesystem.PatchTextOptions{Hunks: in.Hunks, ExpectedSHA256: in.ExpectedSHA256})
+		return nil, result, err
+	}
 }
 
 type searchTextInput struct {
@@ -163,8 +174,8 @@ type imageReadInput struct {
 	MaxHeight  int    `json:"max_height,omitempty" jsonschema:"maximum projected height from 1 to 32768; aspect ratio is preserved"`
 }
 
-func imageRead(_ context.Context, _ *mcp.CallToolRequest, in imageReadInput) (*mcp.CallToolResult, runtimeimage.ReadResult, error) {
-	data, metadata, err := runtimeimage.Read(in.Path, runtimeimage.ReadOptions{MaxBytes: in.MaxBytes, MaxPixels: in.MaxPixels, CropX: in.CropX, CropY: in.CropY, CropWidth: in.CropWidth, CropHeight: in.CropHeight, MaxWidth: in.MaxWidth, MaxHeight: in.MaxHeight})
+func imageRead(ctx context.Context, _ *mcp.CallToolRequest, in imageReadInput) (*mcp.CallToolResult, runtimeimage.ReadResult, error) {
+	data, metadata, err := runtimeimage.Read(ctx, in.Path, runtimeimage.ReadOptions{MaxBytes: in.MaxBytes, MaxPixels: in.MaxPixels, CropX: in.CropX, CropY: in.CropY, CropWidth: in.CropWidth, CropHeight: in.CropHeight, MaxWidth: in.MaxWidth, MaxHeight: in.MaxHeight})
 	if err != nil {
 		return nil, runtimeimage.ReadResult{}, err
 	}

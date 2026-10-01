@@ -3,11 +3,14 @@ package runtimehost
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/hicancan/local-runtime-mcp/internal/browser"
 	"github.com/hicancan/local-runtime-mcp/internal/computer"
 	"github.com/hicancan/local-runtime-mcp/internal/config"
+	"github.com/hicancan/local-runtime-mcp/internal/filesystem"
 	"github.com/hicancan/local-runtime-mcp/internal/mcpserver"
+	runtimeprocess "github.com/hicancan/local-runtime-mcp/internal/process"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -17,23 +20,37 @@ type Host struct {
 	server     *mcp.Server
 	bridge     *browser.Bridge
 	controller computer.Controller
+	processes  *runtimeprocess.Manager
+	cancel     context.CancelFunc
+	closeOnce  sync.Once
+	closeErr   error
 }
 
 func Start(ctx context.Context, cfg *config.Config) (*Host, error) {
+	ctx, cancel := context.WithCancel(ctx)
 	bridge, err := browser.Start(ctx, cfg.Browser)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	controller := computer.New(ctx)
+	bridge.SetDesktopGate(controller.BeginDesktopOperation)
+	processes := runtimeprocess.NewManager(ctx)
 	return &Host{
-		server:     mcpserver.New(ctx, bridge, controller),
+		server:     mcpserver.New(mcpserver.Dependencies{Process: processes, Filesystem: filesystem.New(), Browser: bridge, Computer: controller}),
 		bridge:     bridge,
 		controller: controller,
+		processes:  processes,
+		cancel:     cancel,
 	}, nil
 }
 
 func (h *Host) Server() *mcp.Server { return h.server }
 
 func (h *Host) Close(ctx context.Context) error {
-	return errors.Join(h.bridge.Close(ctx), h.controller.Close())
+	h.closeOnce.Do(func() {
+		h.cancel()
+		h.closeErr = errors.Join(h.bridge.Close(ctx), h.controller.Close(), h.processes.Close())
+	})
+	return h.closeErr
 }

@@ -11,13 +11,12 @@ import (
 )
 
 func registerBrowserTools(server *mcp.Server, bridge *browser.Bridge) {
-	mcp.AddTool(server, tool("browser_status", "Get browser bridge status", "Check whether the bundled Chromium extension is connected to the authenticated loopback bridge.", true, false, true, false), browserStatus(bridge))
-	mcp.AddTool(server, tool("browser_tabs", "List browser tabs", "List controllable tabs in the Chromium profile running the bundled extension.", true, false, true, false), browserTabs(bridge))
+	mcp.AddTool(server, tool("browser_status", "Get browser instances", "List named browser instances and their connection status on the authenticated loopback bridge.", true, false, true, false), browserStatus(bridge))
+	mcp.AddTool(server, tool("browser_tabs", "List browser tabs", "List controllable tabs in one browser instance selected from browser_status.", true, false, true, false), browserTabs(bridge))
 	mcp.AddTool(server, tool("browser_open", "Open browser tab", "Open a URL in a new browser tab.", false, false, false, true), browserOpen(bridge))
-	mcp.AddTool(server, tool("browser_close", "Close browser tab", "Close a browser tab by its numeric ID.", false, true, true, false), browserClose(bridge))
+	mcp.AddTool(server, tool("browser_close", "Close browser tab", "Close a browser tab by its opaque tab ID.", false, true, true, false), browserClose(bridge))
 	navigationTool := inputTool[browser.Navigation](tool("browser_navigate", "Navigate browser tab", "Navigate an existing tab to a URL, through history, or by reloading, then wait until loading finishes.", false, false, false, true), func(schema *jsonschema.Schema) {
 		schema.Properties["kind"].Enum = enum("url", "back", "forward", "reload")
-		schema.Properties["tab_id"].Minimum = jsonschema.Ptr(1.0)
 	})
 	mcp.AddTool(server, navigationTool, browserNavigate(bridge))
 	mcp.AddTool(server, tool("browser_snapshot", "Read browser page", "Return bounded accessibility text and versioned references for interactive elements across the main document and cross-origin child frames.", true, false, true, true), browserSnapshot(bridge))
@@ -25,14 +24,17 @@ func registerBrowserTools(server *mcp.Server, bridge *browser.Bridge) {
 	browserActionTool := inputTool[browser.Action](tool("browser_action", "Act on browser page", "Use one accessibility-tree ref or one versioned viewport screenshot coordinate; also supports keys, scrolling, files, dialogs, and explicit JavaScript escape-hatch evaluation.", false, true, false, true), func(schema *jsonschema.Schema) {
 		schema.Properties["kind"].Enum = enum("click", "double_click", "hover", "drag", "type_text", "set_value", "press_key", "scroll", "select", "check", "upload_files", "handle_dialog", "evaluate")
 		schema.Properties["button"].Enum = enum("left", "middle", "right")
-		schema.Properties["tab_id"].Minimum = jsonschema.Ptr(1.0)
 	})
 	mcp.AddTool(server, browserActionTool, browserAction(bridge))
 }
 
 func registerComputerTools(server *mcp.Server, controller computer.Controller) {
+	controlTool := inputTool[computer.ControlOptions](tool("computer_control", "Manage desktop control", "Acquire the shared desktop control token, inspect ownership without revealing its token, or release control. Background browser work remains parallel.", false, false, false, false), func(schema *jsonschema.Schema) {
+		schema.Properties["kind"].Enum = enum("acquire", "status", "release")
+	})
+	mcp.AddTool(server, controlTool, computerControl(controller))
 	mcp.AddTool(server, tool("computer_targets", "List desktop targets", "List open top-level windows with opaque, validated target IDs. This does not list installed applications.", true, false, true, false), computerTargets(controller))
-	mcp.AddTool(server, tool("computer_state", "Read desktop state", "Return a WGC native PNG plus one state ID and bounded UI Automation references for the current desktop or selected foreground target.", true, false, true, false), computerState(controller))
+	mcp.AddTool(server, tool("computer_state", "Read desktop state", "Return WGC native PNG and bounded UI Automation state for the desktop or selected target. Supply control_id to retain actionable state and element IDs; tokenless observation is read-only.", true, false, true, false), computerState(controller))
 	computerActionTool := inputTool[computer.Action](tool("computer_action", "Control desktop", "Activate a target, or use coordinates or a UI Automation ref from the exact foreground computer_state. Every action invalidates every prior state.", false, true, false, false), func(schema *jsonschema.Schema) {
 		schema.Properties["kind"].Enum = enum("activate", "move", "click", "double_click", "drag", "type_text", "set_value", "press_key", "scroll")
 		schema.Properties["button"].Enum = enum("left", "middle", "right")
@@ -60,19 +62,25 @@ type browserTabsOutput struct {
 	Tabs []browser.Tab `json:"tabs"`
 }
 
-func browserTabs(bridge *browser.Bridge) func(context.Context, *mcp.CallToolRequest, emptyInput) (*mcp.CallToolResult, browserTabsOutput, error) {
-	return func(ctx context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, browserTabsOutput, error) {
+type browserInstanceInput struct {
+	BrowserID string `json:"browser_id" jsonschema:"browser instance ID from browser_status"`
+}
+
+func browserTabs(bridge *browser.Bridge) func(context.Context, *mcp.CallToolRequest, browserInstanceInput) (*mcp.CallToolResult, browserTabsOutput, error) {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in browserInstanceInput) (*mcp.CallToolResult, browserTabsOutput, error) {
 		if err := requireBridge(bridge); err != nil {
 			return nil, browserTabsOutput{}, err
 		}
-		tabs, err := bridge.Tabs(ctx)
+		tabs, err := bridge.Tabs(ctx, in.BrowserID)
 		return nil, browserTabsOutput{Tabs: tabs}, err
 	}
 }
 
 type browserOpenInput struct {
-	URL    string `json:"url" jsonschema:"absolute URL to open"`
-	Active *bool  `json:"active,omitempty" jsonschema:"make the new tab active; defaults to true"`
+	BrowserID string `json:"browser_id" jsonschema:"browser instance ID from browser_status"`
+	URL       string `json:"url" jsonschema:"absolute URL to open"`
+	Active    bool   `json:"active,omitempty" jsonschema:"make the new tab active; defaults to false; requires free desktop or matching control_id"`
+	ControlID string `json:"control_id,omitempty" jsonschema:"desktop control token when requesting visible activation"`
 }
 
 func browserOpen(bridge *browser.Bridge) func(context.Context, *mcp.CallToolRequest, browserOpenInput) (*mcp.CallToolResult, browser.Tab, error) {
@@ -80,14 +88,14 @@ func browserOpen(bridge *browser.Bridge) func(context.Context, *mcp.CallToolRequ
 		if err := requireBridge(bridge); err != nil {
 			return nil, browser.Tab{}, err
 		}
-		active := in.Active == nil || *in.Active
-		result, err := bridge.Open(ctx, in.URL, active)
+		result, err := bridge.Open(ctx, in.BrowserID, in.URL, in.Active, in.ControlID)
 		return nil, result, err
 	}
 }
 
 type browserTabInput struct {
-	TabID int `json:"tab_id" jsonschema:"positive browser tab ID"`
+	TabID     string `json:"tab_id" jsonschema:"opaque tab ID from browser_tabs or browser_open"`
+	ControlID string `json:"control_id,omitempty" jsonschema:"desktop control token for closing a visible tab while the desktop is owned"`
 }
 
 type operationOutput struct {
@@ -99,7 +107,7 @@ func browserClose(bridge *browser.Bridge) func(context.Context, *mcp.CallToolReq
 		if err := requireBridge(bridge); err != nil {
 			return nil, operationOutput{}, err
 		}
-		err := bridge.CloseTab(ctx, in.TabID)
+		err := bridge.CloseTab(ctx, in.TabID, in.ControlID)
 		return nil, operationOutput{Success: err == nil}, err
 	}
 }
@@ -115,9 +123,9 @@ func browserNavigate(bridge *browser.Bridge) func(context.Context, *mcp.CallTool
 }
 
 type browserSnapshotInput struct {
-	TabID       int `json:"tab_id" jsonschema:"positive browser tab ID"`
-	MaxElements int `json:"max_elements,omitempty" jsonschema:"maximum interactive elements from 1 to 5000; defaults to 500"`
-	MaxText     int `json:"max_text,omitempty" jsonschema:"maximum visible-text characters from 1 to 500000; defaults to 50000"`
+	TabID       string `json:"tab_id" jsonschema:"opaque tab ID from browser_tabs or browser_open"`
+	MaxElements int    `json:"max_elements,omitempty" jsonschema:"maximum interactive elements from 1 to 5000; defaults to 500"`
+	MaxText     int    `json:"max_text,omitempty" jsonschema:"maximum visible-text characters from 1 to 500000; defaults to 50000"`
 }
 
 func browserSnapshot(bridge *browser.Bridge) func(context.Context, *mcp.CallToolRequest, browserSnapshotInput) (*mcp.CallToolResult, browser.Snapshot, error) {
@@ -161,6 +169,16 @@ func browserAction(bridge *browser.Bridge) func(context.Context, *mcp.CallToolRe
 			return nil, browser.ActionResult{}, err
 		}
 		result, err := bridge.Act(ctx, in)
+		return nil, result, err
+	}
+}
+
+func computerControl(controller computer.Controller) func(context.Context, *mcp.CallToolRequest, computer.ControlOptions) (*mcp.CallToolResult, computer.ControlStatus, error) {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in computer.ControlOptions) (*mcp.CallToolResult, computer.ControlStatus, error) {
+		if controller == nil {
+			return nil, computer.ControlStatus{}, errors.New("computer control is unavailable on this platform")
+		}
+		result, err := controller.Control(ctx, in)
 		return nil, result, err
 	}
 }

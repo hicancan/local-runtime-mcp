@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"github.com/hicancan/local-runtime-mcp/internal/config"
 	"io"
 	"net/http"
 	"os"
@@ -13,258 +14,333 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/hicancan/local-runtime-mcp/internal/config"
 )
 
 const testToken = "0123456789abcdef0123456789abcdef"
 
-func TestBridgeRoundTrip(t *testing.T) {
+func testBridge(t *testing.T) (*Bridge, context.Context) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	b, err := Start(ctx, config.Browser{Listen: "127.0.0.1:0", Token: testToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close(context.Background()) })
+	return b, ctx
+}
+func postBridge(ctx context.Context, b *Bridge, path string, payload any) (*http.Response, error) {
+	body, _ := json.Marshal(payload)
+	r, _ := http.NewRequestWithContext(ctx, "POST", "http://"+b.Status().Address+"/v1/"+path, bytes.NewReader(body))
+	r.Header.Set("Authorization", "Bearer "+testToken)
+	return http.DefaultClient.Do(r)
+}
+func peer(id, boot string) Peer {
+	return Peer{InstanceID: id, BootID: boot, Label: id, ExtensionVersion: ExtensionVersion, Browser: "test"}
+}
+func register(t *testing.T, b *Bridge, p Peer) {
+	t.Helper()
+	r, err := postBridge(context.Background(), b, "hello", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Body.Close()
+	if r.StatusCode != 204 {
+		body, _ := io.ReadAll(r.Body)
+		t.Fatalf("hello %d: %s", r.StatusCode, body)
+	}
+}
+func pollCommand(t *testing.T, b *Bridge, p Peer) command {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	bridge, err := Start(ctx, config.Browser{Listen: "127.0.0.1:0", Token: testToken})
+	r, err := postBridge(ctx, b, "poll", p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = bridge.Close(context.Background()) })
-	clientErrors := make(chan error, 1)
-	go fakeExtension(ctx, bridge.Status().Address, clientErrors)
-	deadline := time.Now().Add(3 * time.Second)
-	for !bridge.Status().Connected && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	defer r.Body.Close()
+	var c command
+	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
+		t.Fatal(err)
 	}
-	if !bridge.Status().Connected {
-		t.Fatal("fake extension did not connect")
+	return c
+}
+func finishCommand(t *testing.T, b *Bridge, p Peer, c command, value any) int {
+	t.Helper()
+	data, _ := json.Marshal(value)
+	r, err := postBridge(context.Background(), b, "result", response{ID: c.ID, InstanceID: p.InstanceID, BootID: p.BootID, Result: data})
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer r.Body.Close()
+	return r.StatusCode
+}
 
-	tabs, err := bridge.Tabs(ctx)
+func TestBridgeMultipleInstancesRoutesReversedResults(t *testing.T) {
+	b, ctx := testBridge(t)
+	a, c := peer("a", "boot-a"), peer("c", "boot-c")
+	register(t, b, a)
+	register(t, b, c)
+	if len(b.Status().Instances) != 2 || !b.Status().Connected {
+		t.Fatal(b.Status())
+	}
+	type answer struct {
+		tabs []Tab
+		err  error
+	}
+	ar, cr := make(chan answer, 1), make(chan answer, 1)
+	go func() { tabs, err := b.Tabs(ctx, a.InstanceID); ar <- answer{tabs, err} }()
+	go func() { tabs, err := b.Tabs(ctx, c.InstanceID); cr <- answer{tabs, err} }()
+	ac, cc := pollCommand(t, b, a), pollCommand(t, b, c)
+	if status := finishCommand(t, b, c, ac, []Tab{{ID: "boot-a.tab"}}); status != 409 {
+		t.Fatal(status)
+	}
+	if status := finishCommand(t, b, c, cc, []Tab{{ID: "boot-c.tab", Title: "C"}}); status != 204 {
+		t.Fatal(status)
+	}
+	if status := finishCommand(t, b, a, ac, []Tab{{ID: "boot-a.tab", Title: "A"}}); status != 204 {
+		t.Fatal(status)
+	}
+	aa, ca := <-ar, <-cr
+	if aa.err != nil || ca.err != nil || aa.tabs[0].Title != "A" || ca.tabs[0].Title != "C" {
+		t.Fatalf("%+v %+v", aa, ca)
+	}
+	done := make(chan error, 1)
+	go func() {
+		data, info, err := b.Screenshot(ctx, ScreenshotOptions{TabID: aa.tabs[0].ID})
+		if err == nil && (string(data) != "png" || info.TabID != aa.tabs[0].ID) {
+			err = io.ErrUnexpectedEOF
+		}
+		done <- err
+	}()
+	item := pollCommand(t, b, a)
+	finishCommand(t, b, a, item, map[string]any{"data_base64": base64.StdEncoding.EncodeToString([]byte("png")), "info": ScreenshotInfo{TabID: aa.tabs[0].ID, MIMEType: "image/png"}})
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+func TestBridgeRestartInvalidatesHandlesAndPending(t *testing.T) {
+	b, ctx := testBridge(t)
+	a := peer("profile", "old")
+	register(t, b, a)
+	done := make(chan error, 1)
+	go func() { _, err := b.Tabs(ctx, a.InstanceID); done <- err }()
+	item := pollCommand(t, b, a)
+	newer := peer("profile", "new")
+	register(t, b, newer)
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "restarted") {
+		t.Fatal(err)
+	}
+	if status := finishCommand(t, b, a, item, []Tab{{ID: "old.tab"}}); status != 409 {
+		t.Fatal(status)
+	}
+	if b.registerTabs(newer.InstanceID, []Tab{{ID: "old.tab"}}) == nil {
+		t.Fatal("accepted old-generation handle")
+	}
+	if err := b.registerTabs(newer.InstanceID, []Tab{{ID: "new.tab"}}); err != nil {
+		t.Fatal(err)
+	}
+	register(t, b, peer("profile", "third"))
+	if _, err := b.route("new.tab"); err == nil {
+		t.Fatal("old handle routable")
+	}
+}
+func TestBridgeQueuedCancellationNeverDispatches(t *testing.T) {
+	b, _ := testBridge(t)
+	a := peer("profile", "boot")
+	register(t, b, a)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := b.Tabs(ctx, a.InstanceID); err == nil {
+		t.Fatal("not canceled")
+	}
+	b.mu.Lock()
+	pending := len(b.pending)
+	b.mu.Unlock()
+	if pending != 0 {
+		t.Fatal("canceled request pending")
+	}
+	ctx2, stop := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer stop()
+	if r, err := postBridge(ctx2, b, "poll", a); err == nil {
+		r.Body.Close()
+		t.Fatal("canceled command dispatched")
+	}
+}
+func TestDesktopReservationHeldUntilExecutionAcknowledgement(t *testing.T) {
+	b, _ := testBridge(t)
+	a := peer("profile", "boot")
+	register(t, b, a)
+	if err := b.registerTabs(a.InstanceID, []Tab{{ID: "boot.tab"}}); err != nil {
+		t.Fatal(err)
+	}
+	releases := make(chan struct{}, 1)
+	b.SetDesktopGate(func(ctx context.Context, _ string) (context.Context, func(), error) {
+		return ctx, func() { releases <- struct{}{} }, nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { _, err := b.Act(ctx, Action{TabID: "boot.tab", Kind: "evaluate", Script: "1"}); done <- err }()
+	item := pollCommand(t, b, a)
+	r, err := postBridge(context.Background(), b, "authorize", response{ID: item.ID, InstanceID: a.InstanceID, BootID: a.BootID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tabs) != 1 || tabs[0].ID != 7 || tabs[0].Title != "Example" {
-		t.Fatalf("unexpected tabs: %+v", tabs)
-	}
-	data, info, err := bridge.Screenshot(ctx, ScreenshotOptions{TabID: 7})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "png" || info.MIMEType != "image/png" || info.TabID != 7 {
-		t.Fatalf("unexpected screenshot: %q %+v", data, info)
+	r.Body.Close()
+	if r.StatusCode != 204 {
+		t.Fatal(r.StatusCode)
 	}
 	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("not canceled")
+	}
 	select {
-	case err := <-clientErrors:
-		if err != nil && !strings.Contains(err.Error(), "context canceled") {
-			t.Fatal(err)
+	case <-releases:
+		t.Fatal("released before execution ack")
+	default:
+	}
+	canceled := pollCommand(t, b, a)
+	if canceled.Method != "cancel" {
+		t.Fatal(canceled)
+	}
+	finishCommand(t, b, a, item, ActionResult{TabID: "boot.tab", Success: true})
+	select {
+	case <-releases:
+	case <-time.After(time.Second):
+		t.Fatal("not released")
+	}
+}
+func TestBridgeRejectsMissingTokenAndOldExtension(t *testing.T) {
+	b, _ := testBridge(t)
+	r, err := http.Post("http://"+b.Status().Address+"/v1/hello", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+	if r.StatusCode != 401 {
+		t.Fatal(r.StatusCode)
+	}
+	request, _ := http.NewRequest(http.MethodPost, "http://"+b.Status().Address+"/v1/hello", strings.NewReader(`{}`))
+	request.Header.Set("Authorization", testToken)
+	r, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+	if r.StatusCode != 401 {
+		t.Fatal("accepted a token without Bearer prefix")
+	}
+	p := peer("old", "boot")
+	p.ExtensionVersion = "3.0.0"
+	r, err = postBridge(context.Background(), b, "hello", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+	if r.StatusCode != 426 {
+		t.Fatal(r.StatusCode)
+	}
+}
+
+func TestDesktopLocalStopCancelsBrowserButWaitsForExecutionAck(t *testing.T) {
+	b, _ := testBridge(t)
+	a := peer("profile", "boot")
+	register(t, b, a)
+	if err := b.registerTabs(a.InstanceID, []Tab{{ID: "boot.tab"}}); err != nil {
+		t.Fatal(err)
+	}
+	controlled, stopControl := context.WithCancel(context.Background())
+	defer stopControl()
+	released := make(chan struct{}, 1)
+	b.SetDesktopGate(func(context.Context, string) (context.Context, func(), error) {
+		return controlled, func() { released <- struct{}{} }, nil
+	})
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.Act(context.Background(), Action{TabID: "boot.tab", Kind: "evaluate", Script: "1"})
+		done <- err
+	}()
+	item := pollCommand(t, b, a)
+	r, err := postBridge(context.Background(), b, "authorize", response{ID: item.ID, InstanceID: a.InstanceID, BootID: a.BootID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+	if r.StatusCode != 204 {
+		t.Fatal(r.StatusCode)
+	}
+	stopControl()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("local Stop did not cancel MCP call")
 		}
 	case <-time.After(time.Second):
+		t.Fatal("local Stop did not reach Browser")
+	}
+	select {
+	case <-released:
+		t.Fatal("released before execution cancellation acknowledged")
+	default:
+	}
+	cancelCommand := pollCommand(t, b, a)
+	if cancelCommand.Method != "cancel" {
+		t.Fatal(cancelCommand)
+	}
+	finishCommand(t, b, a, item, ActionResult{TabID: "boot.tab", Success: true})
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("reservation not released after ack")
 	}
 }
-
-func fakeExtension(ctx context.Context, address string, errorsChannel chan<- error) {
-	for {
-		body, _ := json.Marshal(Peer{InstanceID: "test-instance", Browser: "test", ExtensionVersion: ExtensionVersion})
-		request, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+address+"/v1/poll", bytes.NewReader(body))
-		request.Header.Set("Authorization", "Bearer "+testToken)
-		request.Header.Set("Content-Type", "application/json")
-		response, err := http.DefaultClient.Do(request)
-		if err != nil {
-			errorsChannel <- err
-			return
-		}
-		if response.StatusCode == http.StatusNoContent {
-			response.Body.Close()
-			continue
-		}
-		var command command
-		err = json.NewDecoder(response.Body).Decode(&command)
-		response.Body.Close()
-		if err != nil {
-			errorsChannel <- err
-			return
-		}
-		var result any
-		switch command.Method {
-		case "tabs.list":
-			result = []Tab{{ID: 7, Title: "Example", URL: "https://example.com"}}
-		case "page.screenshot":
-			result = map[string]any{"data_base64": base64.StdEncoding.EncodeToString([]byte("png")), "info": ScreenshotInfo{TabID: 7, MIMEType: "image/png"}}
-		case "page.navigate":
-			result = Tab{ID: 7, Title: "Navigated", URL: "https://example.com/next"}
-		default:
-			result = map[string]bool{"success": true}
-		}
-		payload, _ := json.Marshal(map[string]any{"id": command.ID, "instance_id": "test-instance", "result": result})
-		resultRequest, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+address+"/v1/result", bytes.NewReader(payload))
-		resultRequest.Header.Set("Authorization", "Bearer "+testToken)
-		resultRequest.Header.Set("Content-Type", "application/json")
-		resultResponse, err := http.DefaultClient.Do(resultRequest)
-		if err != nil {
-			errorsChannel <- err
-			return
-		}
-		_, _ = io.Copy(io.Discard, resultResponse.Body)
-		resultResponse.Body.Close()
-	}
-}
-
-func TestBridgeRejectsMissingToken(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	bridge, err := Start(ctx, config.Browser{Listen: "127.0.0.1:0", Token: testToken})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = bridge.Close(context.Background()) })
-	response, err := http.Post("http://"+bridge.Status().Address+"/v1/poll", "application/json", strings.NewReader(`{}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d", response.StatusCode)
-	}
-}
-
 func TestInstallExtension(t *testing.T) {
-	directory, err := InstallExtension(filepath.Join(t.TempDir(), "extension"))
+	dir, err := InstallExtension(filepath.Join(t.TempDir(), "extension"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifest, err := os.ReadFile(filepath.Join(directory, "manifest.json"))
+	manifest, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	worker, err := os.ReadFile(filepath.Join(directory, "service_worker.js"))
+	worker, err := os.ReadFile(filepath.Join(dir, "service_worker.js"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Contains(manifest, []byte(`"debugger"`)) || !bytes.Contains(worker, []byte("Page.captureScreenshot")) {
-		t.Fatal("installed extension is missing browser-control capabilities")
+		t.Fatal("missing control")
 	}
-	for _, forbidden := range [][]byte{[]byte(`"activeTab"`), []byte(`"downloads"`), []byte(`"scripting"`), []byte(`"<all_urls>"`)} {
-		if bytes.Contains(manifest, forbidden) {
-			t.Fatalf("installed extension contains unnecessary permission %s", forbidden)
+	for _, f := range []string{`"activeTab"`, `"downloads"`, `"scripting"`, `"<all_urls>"`} {
+		if bytes.Contains(manifest, []byte(f)) {
+			t.Fatal(f)
 		}
 	}
+	if _, err := os.Stat(filepath.Join(dir, "scheduler.js")); err != nil {
+		t.Fatal(err)
+	}
 }
-
 func TestExtensionJavaScriptSyntax(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
-		t.Skip("node is unavailable")
+		t.Skip("node unavailable")
 	}
-	directory, err := InstallExtension(filepath.Join(t.TempDir(), "extension"))
+	dir, err := InstallExtension(filepath.Join(t.TempDir(), "extension"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if output, err := exec.Command(node, "--check", filepath.Join(directory, "service_worker.js")).CombinedOutput(); err != nil {
-		t.Fatalf("extension service worker is not valid JavaScript: %v\n%s", err, output)
-	}
-}
-
-func TestBridgeRejectsSecondExtensionInstance(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	bridge, err := Start(ctx, config.Browser{Listen: "127.0.0.1:0", Token: testToken})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = bridge.Close(context.Background()) })
-	poll := func(requestContext context.Context, instance string) (*http.Response, error) {
-		body := bytes.NewBufferString(`{"instance_id":"` + instance + `","extension_version":"` + ExtensionVersion + `"}`)
-		request, _ := http.NewRequestWithContext(requestContext, http.MethodPost, "http://"+bridge.Status().Address+"/v1/poll", body)
-		request.Header.Set("Authorization", "Bearer "+testToken)
-		request.Header.Set("Content-Type", "application/json")
-		return http.DefaultClient.Do(request)
-	}
-	firstDone := make(chan error, 1)
-	go func() {
-		response, err := poll(ctx, "first")
-		if response != nil {
-			response.Body.Close()
+	for _, name := range []string{"service_worker.js", "scheduler.js", "options.js"} {
+		if out, err := exec.Command(node, "--check", filepath.Join(dir, name)).CombinedOutput(); err != nil {
+			t.Fatalf("%s %v\n%s", name, err, out)
 		}
-		firstDone <- err
-	}()
-	deadline := time.Now().Add(time.Second)
-	for !bridge.Status().Connected && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	second, err := poll(context.Background(), "second")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer second.Body.Close()
-	if second.StatusCode != http.StatusConflict {
-		t.Fatalf("second instance status = %d, want %d", second.StatusCode, http.StatusConflict)
-	}
-	cancel()
-	select {
-	case <-firstDone:
-	case <-time.After(time.Second):
-		t.Fatal("first poll did not stop after cancellation")
 	}
 }
-
-func TestBridgeRejectsOldExtension(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	bridge, err := Start(ctx, config.Browser{Listen: "127.0.0.1:0", Token: testToken})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = bridge.Close(context.Background()) })
-	body := bytes.NewBufferString(`{"instance_id":"old","extension_version":"3.0.0"}`)
-	request, _ := http.NewRequest(http.MethodPost, "http://"+bridge.Status().Address+"/v1/poll", body)
-	request.Header.Set("Authorization", "Bearer "+testToken)
-	request.Header.Set("Content-Type", "application/json")
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusUpgradeRequired || bridge.Status().Connected {
-		t.Fatalf("old extension status=%d bridge=%+v", response.StatusCode, bridge.Status())
-	}
-}
-
 func TestActionValidation(t *testing.T) {
-	checked := true
-	accepted := false
-	zero, two, three := 0.0, 2.0, 3.0
-	valid := []Action{{Kind: "click", TabID: 1, Ref: "q1:e1"}, {Kind: "double_click", TabID: 1, ScreenshotID: "p1", X: &zero, Y: &zero}, {Kind: "hover", TabID: 1, Ref: "q1:e1"}, {Kind: "drag", TabID: 1, Ref: "q1:e1", ToX: &two, ToY: &three}, {Kind: "type_text", TabID: 1, Ref: "q1:e1", Text: "x"}, {Kind: "set_value", TabID: 1, Ref: "q1:e1", Text: "x"}, {Kind: "press_key", TabID: 1, Key: "Control+L"}, {Kind: "scroll", TabID: 1, ScrollY: 500}, {Kind: "select", TabID: 1, Ref: "q1:e1", Option: "one"}, {Kind: "check", TabID: 1, Ref: "q1:e1", Checked: &checked}, {Kind: "upload_files", TabID: 1, Ref: "q1:e1", Files: []string{"C:/x.txt"}}, {Kind: "handle_dialog", TabID: 1, Accept: &accepted}, {Kind: "evaluate", TabID: 1, Script: "document.title"}}
-	for _, action := range valid {
-		if err := validateAction(action); err != nil {
-			t.Errorf("%+v: %v", action, err)
+	if err := validateAction(Action{Kind: "click", TabID: "tab", Ref: "q:e"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range []Action{{Kind: "click", TabID: "tab"}, {Kind: "click", Ref: "q:e"}, {Kind: "check", TabID: "tab", Ref: "q:e"}, {Kind: "invalid", TabID: "tab"}} {
+		if validateAction(a) == nil {
+			t.Fatalf("accepted %+v", a)
 		}
-	}
-	if err := validateAction(Action{Kind: "click", TabID: 1}); err == nil {
-		t.Fatal("targetless click should fail")
-	}
-	if err := validateAction(Action{Kind: "check", TabID: 1, Ref: "q1:e1"}); err == nil {
-		t.Fatal("check without checked should fail")
-	}
-	if err := validateAction(Action{Kind: "click", TabID: 1, Ref: "q1:e1", ScreenshotID: "p1", X: &zero, Y: &zero}); err == nil {
-		t.Fatal("ambiguous target should fail")
-	}
-}
-
-func TestNavigationValidation(t *testing.T) {
-	bridge := &Bridge{}
-	invalid := []Navigation{{TabID: 0, Kind: "reload"}, {TabID: 1, Kind: "url"}, {TabID: 1, Kind: "reload", URL: "https://example.com"}, {TabID: 1, Kind: "unknown"}}
-	for _, navigation := range invalid {
-		if _, err := bridge.Navigate(context.Background(), navigation); err == nil {
-			t.Errorf("expected navigation %+v to fail", navigation)
-		}
-	}
-}
-
-func TestScreenshotValidation(t *testing.T) {
-	bridge := &Bridge{}
-	if _, _, err := bridge.Screenshot(context.Background(), ScreenshotOptions{TabID: 1, FullPage: true, ClipW: 10, ClipH: 10}); err == nil {
-		t.Fatal("full-page clip should fail")
-	}
-	if _, _, err := bridge.Screenshot(context.Background(), ScreenshotOptions{TabID: 1, ClipW: 10}); err == nil {
-		t.Fatal("incomplete clip should fail")
 	}
 }

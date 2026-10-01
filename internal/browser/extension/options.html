@@ -16,6 +16,9 @@
   <body>
     <h1>Local Runtime MCP Browser Bridge</h1>
     <p>Enter the loopback address and token from your <code>lrmcp</code> configuration. The token never leaves this browser profile except when authenticating to that local address.</p>
+    <label for="label">Profile label</label>
+    <input id="label" placeholder="Chrome · Work" autocomplete="off">
+    <p id="identity"></p>
     <label for="address">Bridge address</label>
     <input id="address" value="127.0.0.1:9315" autocomplete="off">
     <label for="token">Bridge token</label>

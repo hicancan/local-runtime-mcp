@@ -11,6 +11,8 @@ import (
 // Coordinates are relative to the image returned by State: either the complete
 // virtual desktop or one selected window.
 type Controller interface {
+	Control(context.Context, ControlOptions) (ControlStatus, error)
+	BeginDesktopOperation(context.Context, string) (context.Context, func(), error)
 	Targets(context.Context) (TargetsResult, error)
 	State(context.Context, StateOptions) ([]byte, State, error)
 	Act(context.Context, Action) (ActionResult, error)
@@ -37,7 +39,8 @@ type TargetsResult struct {
 }
 
 type StateOptions struct {
-	TargetID string `json:"target_id,omitempty" jsonschema:"opaque target ID from computer_targets; omit for the complete virtual desktop"`
+	ControlID string `json:"control_id,omitempty" jsonschema:"control ID from computer_control acquire; omit for read-only observation"`
+	TargetID  string `json:"target_id,omitempty" jsonschema:"opaque target ID from computer_targets; omit for the complete virtual desktop"`
 }
 
 type Element struct {
@@ -49,6 +52,8 @@ type Element struct {
 }
 
 type State struct {
+	Actionable        bool      `json:"actionable"`
+	UIAStatus         string    `json:"uia_status"`
 	StateID           string    `json:"state_id"`
 	TargetID          string    `json:"target_id,omitempty"`
 	Title             string    `json:"title,omitempty"`
@@ -64,6 +69,7 @@ type State struct {
 }
 
 type Action struct {
+	ControlID  string `json:"control_id" jsonschema:"control ID from computer_control acquire"`
 	Kind       string `json:"kind" jsonschema:"desktop operation to perform"`
 	TargetID   string `json:"target_id,omitempty" jsonschema:"opaque target ID; omit for the complete virtual desktop"`
 	StateID    string `json:"state_id,omitempty" jsonschema:"state ID from computer_state; required for every action except activate"`
@@ -86,6 +92,9 @@ type ActionResult struct {
 }
 
 func Validate(action Action) error {
+	if action.ControlID == "" {
+		return errors.New("control_id is required; acquire computer_control first")
+	}
 	if action.Kind == "activate" {
 		if action.TargetID == "" {
 			return errors.New("activate requires target_id")
@@ -114,7 +123,12 @@ func Validate(action Action) error {
 			return err
 		}
 		return validateButton(action.Button)
-	case "type_text", "set_value":
+	case "set_value":
+		if action.ElementRef == "" || action.X != nil || action.Y != nil {
+			return errors.New("set_value requires element_ref and does not accept coordinates")
+		}
+		return nil
+	case "type_text":
 		if action.Text == "" {
 			return fmt.Errorf("text cannot be empty for %s", action.Kind)
 		}

@@ -2,17 +2,18 @@ package browser
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"embed"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,42 +22,82 @@ import (
 	"github.com/hicancan/local-runtime-mcp/internal/config"
 )
 
-const ExtensionVersion = "9.0.3"
+const ExtensionVersion = "10.0.0"
+
+// DesktopGate reserves the shared interactive desktop for a browser operation.
+// A successful reservation is released only once execution has acknowledged completion.
+type DesktopGate func(context.Context, string) (context.Context, func(), error)
 
 type Bridge struct {
 	configured bool
 	address    string
 	token      string
 	server     *http.Server
-	commands   chan command
 	mu         sync.Mutex
-	pending    map[string]chan response
-	lastSeen   time.Time
-	peer       Peer
+	pending    map[string]*pendingCall
+	instances  map[string]*instance
+	tabs       map[string]tabRoute
+	gate       DesktopGate
+	ctx        context.Context
+	cancel     context.CancelFunc
 	sequence   atomic.Uint64
+	prefix     string
+	closeOnce  sync.Once
+	closeErr   error
+}
+
+type instance struct {
+	peer     Peer
+	lastSeen time.Time
+	commands chan command
+	controls chan command
+}
+
+type tabRoute struct{ browserID, bootID string }
+type pendingCall struct {
+	result                       chan response
+	browserID, bootID, controlID string
+	ctx                          context.Context
+	cancel                       context.CancelFunc
+	release                      func()
+	authorizing                  bool
+	stopGateWatch                func() bool
+	cancelSent                   bool
+	dispatched, abandoned        bool
 }
 
 type Peer struct {
 	InstanceID       string `json:"instance_id,omitempty"`
+	BootID           string `json:"boot_id"`
+	Label            string `json:"label"`
 	Browser          string `json:"browser,omitempty"`
 	ExtensionVersion string `json:"extension_version,omitempty"`
 }
 
 type Status struct {
-	Configured bool      `json:"configured"`
-	Connected  bool      `json:"connected"`
-	Address    string    `json:"address,omitempty"`
-	LastSeen   time.Time `json:"last_seen,omitempty"`
-	Peer       Peer      `json:"peer,omitempty"`
+	Configured bool             `json:"configured"`
+	Connected  bool             `json:"connected"`
+	Address    string           `json:"address,omitempty"`
+	Instances  []InstanceStatus `json:"instances"`
+}
+
+type InstanceStatus struct {
+	BrowserID        string    `json:"browser_id"`
+	Label            string    `json:"label"`
+	Browser          string    `json:"browser"`
+	ExtensionVersion string    `json:"extension_version"`
+	Connected        bool      `json:"connected"`
+	LastSeen         time.Time `json:"last_seen"`
 }
 
 type Tab struct {
-	ID       int    `json:"id"`
-	WindowID int    `json:"window_id"`
-	Title    string `json:"title"`
-	URL      string `json:"url"`
-	Active   bool   `json:"active"`
-	Status   string `json:"status,omitempty"`
+	ID        string `json:"id"`
+	BrowserID string `json:"browser_id"`
+	WindowID  int    `json:"window_id"`
+	Title     string `json:"title"`
+	URL       string `json:"url"`
+	Active    bool   `json:"active"`
+	Status    string `json:"status,omitempty"`
 }
 
 type SnapshotElement struct {
@@ -68,7 +109,7 @@ type SnapshotElement struct {
 }
 
 type Snapshot struct {
-	TabID             int               `json:"tab_id"`
+	TabID             string            `json:"tab_id"`
 	PageEpoch         string            `json:"page_epoch"`
 	SnapshotID        string            `json:"snapshot_id"`
 	Title             string            `json:"title"`
@@ -80,16 +121,16 @@ type Snapshot struct {
 }
 
 type ScreenshotOptions struct {
-	TabID    int  `json:"tab_id" jsonschema:"positive browser tab ID"`
-	FullPage bool `json:"full_page,omitempty" jsonschema:"capture the entire scrollable page instead of the viewport"`
-	ClipX    int  `json:"clip_x,omitempty" jsonschema:"non-negative page X coordinate for a clipped capture"`
-	ClipY    int  `json:"clip_y,omitempty" jsonschema:"non-negative page Y coordinate for a clipped capture"`
-	ClipW    int  `json:"clip_width,omitempty" jsonschema:"positive clipped-capture width; requires clip_height"`
-	ClipH    int  `json:"clip_height,omitempty" jsonschema:"positive clipped-capture height; requires clip_width"`
+	TabID    string `json:"tab_id" jsonschema:"opaque tab handle returned by browser_tabs or browser_open"`
+	FullPage bool   `json:"full_page,omitempty" jsonschema:"capture the entire scrollable page instead of the viewport"`
+	ClipX    int    `json:"clip_x,omitempty" jsonschema:"non-negative page X coordinate for a clipped capture"`
+	ClipY    int    `json:"clip_y,omitempty" jsonschema:"non-negative page Y coordinate for a clipped capture"`
+	ClipW    int    `json:"clip_width,omitempty" jsonschema:"positive clipped-capture width; requires clip_height"`
+	ClipH    int    `json:"clip_height,omitempty" jsonschema:"positive clipped-capture height; requires clip_width"`
 }
 
 type ScreenshotInfo struct {
-	TabID        int    `json:"tab_id"`
+	TabID        string `json:"tab_id"`
 	PageEpoch    string `json:"page_epoch"`
 	ScreenshotID string `json:"screenshot_id"`
 	Title        string `json:"title"`
@@ -104,7 +145,8 @@ type ScreenshotInfo struct {
 
 type Action struct {
 	Kind         string   `json:"kind" jsonschema:"browser operation to perform"`
-	TabID        int      `json:"tab_id" jsonschema:"positive browser tab ID"`
+	TabID        string   `json:"tab_id" jsonschema:"opaque tab handle returned by browser_tabs or browser_open"`
+	ControlID    string   `json:"control_id,omitempty" jsonschema:"desktop control ID when modifying a currently visible page"`
 	Ref          string   `json:"ref,omitempty" jsonschema:"versioned element reference from a retained browser_snapshot in the current page epoch"`
 	ScreenshotID string   `json:"screenshot_id,omitempty" jsonschema:"viewport screenshot ID required for coordinate targeting"`
 	X            *float64 `json:"x,omitempty" jsonschema:"viewport X coordinate associated with screenshot_id"`
@@ -125,33 +167,38 @@ type Action struct {
 }
 
 type Navigation struct {
-	TabID int    `json:"tab_id" jsonschema:"positive browser tab ID"`
-	Kind  string `json:"kind" jsonschema:"navigation operation: url, back, forward, or reload"`
-	URL   string `json:"url,omitempty" jsonschema:"absolute URL required when kind is url"`
+	TabID     string `json:"tab_id" jsonschema:"opaque tab handle returned by browser_tabs or browser_open"`
+	ControlID string `json:"control_id,omitempty" jsonschema:"desktop control ID when navigating a currently visible page"`
+	Kind      string `json:"kind" jsonschema:"navigation operation: url, back, forward, or reload"`
+	URL       string `json:"url,omitempty" jsonschema:"absolute URL required when kind is url"`
 }
 
 type ActionResult struct {
-	TabID   int    `json:"tab_id"`
+	TabID   string `json:"tab_id"`
 	Kind    string `json:"kind"`
 	Success bool   `json:"success"`
 	Value   any    `json:"value,omitempty"`
 }
 
 type command struct {
-	ID     string          `json:"id"`
-	Method string          `json:"method"`
-	Params json.RawMessage `json:"params,omitempty"`
+	ID       string          `json:"id"`
+	BootID   string          `json:"boot_id"`
+	Deadline int64           `json:"deadline"`
+	Method   string          `json:"method"`
+	Params   json.RawMessage `json:"params,omitempty"`
 }
 
 type response struct {
 	ID         string          `json:"id"`
 	InstanceID string          `json:"instance_id"`
+	BootID     string          `json:"boot_id"`
 	Result     json.RawMessage `json:"result,omitempty"`
 	Error      string          `json:"error,omitempty"`
 }
 
 func Start(ctx context.Context, configuration config.Browser) (*Bridge, error) {
-	bridge := &Bridge{configured: configuration.Token != "", token: configuration.Token, commands: make(chan command), pending: make(map[string]chan response)}
+	bridgeContext, cancel := context.WithCancel(ctx)
+	bridge := &Bridge{configured: configuration.Token != "", token: configuration.Token, pending: make(map[string]*pendingCall), instances: make(map[string]*instance), tabs: make(map[string]tabRoute), ctx: bridgeContext, cancel: cancel, prefix: rand.Text()}
 	if !bridge.configured {
 		return bridge, nil
 	}
@@ -160,62 +207,109 @@ func Start(ctx context.Context, configuration config.Browser) (*Bridge, error) {
 	}
 	listener, err := net.Listen("tcp", configuration.Listen)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("start browser extension bridge: %w", err)
 	}
 	bridge.address = listener.Addr().String()
 	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/hello", bridge.hello)
+	mux.HandleFunc("/v1/heartbeat", bridge.heartbeat)
 	mux.HandleFunc("/v1/poll", bridge.poll)
 	mux.HandleFunc("/v1/result", bridge.receiveResult)
+	mux.HandleFunc("/v1/authorize", bridge.authorizeDesktop)
 	bridge.server = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
-		<-ctx.Done()
+		<-bridgeContext.Done()
 		shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = bridge.server.Shutdown(shutdownContext)
+		_ = bridge.Close(shutdownContext)
 	}()
 	go func() { _ = bridge.server.Serve(listener) }()
 	return bridge, nil
 }
 
 func (b *Bridge) Close(ctx context.Context) error {
-	if b.server == nil {
-		return nil
-	}
-	shutdownContext, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	err := b.server.Shutdown(shutdownContext)
-	if errors.Is(err, context.DeadlineExceeded) {
-		return b.server.Close()
-	}
-	return err
+	b.closeOnce.Do(func() {
+		if b.cancel != nil {
+			b.cancel()
+		}
+		b.mu.Lock()
+		for id, pending := range b.pending {
+			if pending.stopGateWatch != nil {
+				pending.stopGateWatch()
+			}
+			pending.cancel()
+			if pending.release != nil {
+				pending.release()
+			}
+			delete(b.pending, id)
+		}
+		b.mu.Unlock()
+		if b.server == nil {
+			return
+		}
+		shutdownContext, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		b.closeErr = b.server.Shutdown(shutdownContext)
+		if errors.Is(b.closeErr, context.DeadlineExceeded) {
+			b.closeErr = b.server.Close()
+		}
+	})
+	return b.closeErr
 }
 
 func (b *Bridge) Status() Status {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return Status{Configured: b.configured, Connected: b.connectedLocked(), Address: b.address, LastSeen: b.lastSeen, Peer: b.peer}
+	status := Status{Configured: b.configured, Address: b.address, Instances: make([]InstanceStatus, 0, len(b.instances))}
+	for id, instance := range b.instances {
+		connected := time.Since(instance.lastSeen) < 35*time.Second
+		status.Connected = status.Connected || connected
+		status.Instances = append(status.Instances, InstanceStatus{BrowserID: id, Label: instance.peer.Label, Browser: instance.peer.Browser, ExtensionVersion: instance.peer.ExtensionVersion, Connected: connected, LastSeen: instance.lastSeen})
+	}
+	sort.Slice(status.Instances, func(i, j int) bool { return status.Instances[i].BrowserID < status.Instances[j].BrowserID })
+	return status
 }
 
-func (b *Bridge) Tabs(ctx context.Context) ([]Tab, error) {
+func (b *Bridge) SetDesktopGate(gate DesktopGate) { b.mu.Lock(); b.gate = gate; b.mu.Unlock() }
+
+func (b *Bridge) Tabs(ctx context.Context, browserID string) ([]Tab, error) {
 	var result []Tab
-	err := b.call(ctx, "tabs.list", struct{}{}, &result)
+	err := b.call(ctx, browserID, "tabs.list", struct{}{}, "", &result)
+	if err == nil {
+		err = b.registerTabs(browserID, result)
+	}
 	return result, err
 }
 
-func (b *Bridge) Open(ctx context.Context, url string, active bool) (Tab, error) {
+func (b *Bridge) Open(ctx context.Context, browserID, url string, active bool, controlID string) (Tab, error) {
 	var result Tab
-	err := b.call(ctx, "tabs.open", map[string]any{"url": url, "active": active}, &result)
+	err := b.call(ctx, browserID, "tabs.open", map[string]any{"url": url, "active": active}, controlID, &result)
+	if err == nil {
+		err = b.registerTabs(browserID, []Tab{result})
+		result.BrowserID = browserID
+	}
 	return result, err
 }
 
-func (b *Bridge) CloseTab(ctx context.Context, tabID int) error {
-	return b.call(ctx, "tabs.close", map[string]any{"tab_id": tabID}, &struct{}{})
+func (b *Bridge) CloseTab(ctx context.Context, tabID, controlID string) error {
+	browserID, err := b.route(tabID)
+	if err != nil {
+		return err
+	}
+	err = b.call(ctx, browserID, "tabs.close", map[string]any{"tab_id": tabID}, controlID, &struct{}{})
+	if err == nil {
+		b.mu.Lock()
+		delete(b.tabs, tabID)
+		b.mu.Unlock()
+	}
+	return err
 }
 
 func (b *Bridge) Navigate(ctx context.Context, navigation Navigation) (Tab, error) {
 	var result Tab
-	if navigation.TabID <= 0 {
-		return result, errors.New("tab_id must be positive")
+	if navigation.TabID == "" {
+		return result, errors.New("tab_id is required")
 	}
 	switch navigation.Kind {
 	case "url":
@@ -229,13 +323,22 @@ func (b *Bridge) Navigate(ctx context.Context, navigation Navigation) (Tab, erro
 	default:
 		return result, fmt.Errorf("unsupported browser navigation %q", navigation.Kind)
 	}
-	err := b.call(ctx, "page.navigate", navigation, &result)
+	browserID, err := b.route(navigation.TabID)
+	if err != nil {
+		return result, err
+	}
+	err = b.call(ctx, browserID, "page.navigate", navigation, navigation.ControlID, &result)
+	result.BrowserID = browserID
 	return result, err
 }
 
-func (b *Bridge) Snapshot(ctx context.Context, tabID, maxElements, maxText int) (Snapshot, error) {
+func (b *Bridge) Snapshot(ctx context.Context, tabID string, maxElements, maxText int) (Snapshot, error) {
 	var result Snapshot
-	err := b.call(ctx, "page.snapshot", map[string]any{"tab_id": tabID, "max_elements": maxElements, "max_text": maxText}, &result)
+	browserID, err := b.route(tabID)
+	if err != nil {
+		return result, err
+	}
+	err = b.call(ctx, browserID, "page.snapshot", map[string]any{"tab_id": tabID, "max_elements": maxElements, "max_text": maxText}, "", &result)
 	return result, err
 }
 
@@ -244,8 +347,8 @@ func (b *Bridge) Screenshot(ctx context.Context, options ScreenshotOptions) ([]b
 		Data string         `json:"data_base64"`
 		Info ScreenshotInfo `json:"info"`
 	}
-	if options.TabID <= 0 {
-		return nil, ScreenshotInfo{}, errors.New("tab_id must be positive")
+	if options.TabID == "" {
+		return nil, ScreenshotInfo{}, errors.New("tab_id is required")
 	}
 	if options.FullPage && (options.ClipW != 0 || options.ClipH != 0 || options.ClipX != 0 || options.ClipY != 0) {
 		return nil, ScreenshotInfo{}, errors.New("full_page and clip fields are mutually exclusive")
@@ -253,7 +356,11 @@ func (b *Bridge) Screenshot(ctx context.Context, options ScreenshotOptions) ([]b
 	if (options.ClipW == 0) != (options.ClipH == 0) || options.ClipW < 0 || options.ClipH < 0 || options.ClipX < 0 || options.ClipY < 0 {
 		return nil, ScreenshotInfo{}, errors.New("clip requires positive clip_width and clip_height with non-negative coordinates")
 	}
-	if err := b.call(ctx, "page.screenshot", options, &result); err != nil {
+	browserID, err := b.route(options.TabID)
+	if err != nil {
+		return nil, ScreenshotInfo{}, err
+	}
+	if err := b.call(ctx, browserID, "page.screenshot", options, "", &result); err != nil {
 		return nil, ScreenshotInfo{}, err
 	}
 	data, err := decodeBase64(result.Data)
@@ -265,41 +372,97 @@ func (b *Bridge) Act(ctx context.Context, action Action) (ActionResult, error) {
 		return ActionResult{}, err
 	}
 	var result ActionResult
-	err := b.call(ctx, "page.action", action, &result)
+	browserID, err := b.route(action.TabID)
+	if err != nil {
+		return result, err
+	}
+	err = b.call(ctx, browserID, "page.action", action, action.ControlID, &result)
 	return result, err
 }
 
-func (b *Bridge) call(ctx context.Context, method string, params, output any) error {
+func (b *Bridge) route(tabID string) (string, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	route, ok := b.tabs[tabID]
+	if !ok {
+		return "", errors.New("tab_id is unknown or stale; call browser_tabs again")
+	}
+	instance := b.instances[route.browserID]
+	if instance == nil || instance.peer.BootID != route.bootID || time.Since(instance.lastSeen) >= 35*time.Second {
+		return "", errors.New("browser instance is offline or restarted; call browser_tabs again")
+	}
+	return route.browserID, nil
+}
+
+func (b *Bridge) registerTabs(browserID string, tabs []Tab) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	instance := b.instances[browserID]
+	if instance == nil {
+		return errors.New("browser instance is offline")
+	}
+	for i := range tabs {
+		if tabs[i].ID == "" {
+			return errors.New("extension returned an empty tab handle")
+		}
+		if !strings.HasPrefix(tabs[i].ID, instance.peer.BootID+".") {
+			return errors.New("extension returned a stale-generation tab handle")
+		}
+		if existing, ok := b.tabs[tabs[i].ID]; ok && (existing.browserID != browserID || existing.bootID != instance.peer.BootID) {
+			return errors.New("extension returned a colliding tab handle")
+		}
+		b.tabs[tabs[i].ID] = tabRoute{browserID, instance.peer.BootID}
+		tabs[i].BrowserID = browserID
+	}
+	return nil
+}
+
+func (b *Bridge) call(ctx context.Context, browserID, method string, params any, controlID string, output any) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !b.configured {
 		return errors.New("browser is not configured; run lrmcp setup browser")
 	}
 	callContext, cancel := context.WithTimeout(ctx, 35*time.Second)
 	defer cancel()
 	b.mu.Lock()
-	if !b.connectedLocked() {
+	instance := b.instances[browserID]
+	if instance == nil || time.Since(instance.lastSeen) >= 35*time.Second {
 		b.mu.Unlock()
-		return errors.New("browser extension is not connected")
+		return errors.New("browser_id is unknown or offline; call browser_status")
 	}
-	id := fmt.Sprintf("%d", b.sequence.Add(1))
+	if len(b.pending) >= 256 {
+		b.mu.Unlock()
+		return errors.New("browser command capacity reached")
+	}
+	id := fmt.Sprintf("%s-%d", b.prefix, b.sequence.Add(1))
 	resultChannel := make(chan response, 1)
-	b.pending[id] = resultChannel
+	operationContext, operationCancel := context.WithCancel(b.ctx)
+	pending := &pendingCall{result: resultChannel, browserID: browserID, bootID: instance.peer.BootID, controlID: controlID, ctx: operationContext, cancel: operationCancel}
+	b.pending[id] = pending
 	b.mu.Unlock()
 	defer func() {
 		b.mu.Lock()
-		delete(b.pending, id)
+		if b.pending[id] == pending {
+			pending.abandoned = true
+			b.cancelPendingLocked(id, pending)
+		}
 		b.mu.Unlock()
 	}()
 	payload, err := json.Marshal(params)
 	if err != nil {
 		return err
 	}
+	deadline, _ := callContext.Deadline()
 	select {
-	case b.commands <- command{ID: id, Method: method, Params: payload}:
+	case instance.commands <- command{ID: id, BootID: pending.bootID, Deadline: deadline.UnixMilli(), Method: method, Params: payload}:
 	case <-callContext.Done():
 		return callContext.Err()
+	case <-b.ctx.Done():
+		return b.ctx.Err()
 	}
-	select {
-	case response := <-resultChannel:
+	decodeResponse := func(response response) error {
 		if response.Error != "" {
 			return errors.New(response.Error)
 		}
@@ -310,51 +473,171 @@ func (b *Bridge) call(ctx context.Context, method string, params, output any) er
 			return fmt.Errorf("decode browser extension response: %w", err)
 		}
 		return nil
+	}
+	select {
+	case response := <-resultChannel:
+		return decodeResponse(response)
+	case <-pending.ctx.Done():
+		select {
+		case response := <-resultChannel:
+			return decodeResponse(response)
+		default:
+			return pending.ctx.Err()
+		}
 	case <-callContext.Done():
 		return callContext.Err()
+	case <-b.ctx.Done():
+		return b.ctx.Err()
+	}
+}
+
+func (b *Bridge) cancelPendingLocked(id string, pending *pendingCall) {
+	pending.cancel()
+	if !pending.dispatched {
+		delete(b.pending, id)
+		return
+	}
+	instance := b.instances[pending.browserID]
+	if !pending.cancelSent && instance != nil && instance.peer.BootID == pending.bootID {
+		select {
+		case instance.controls <- command{ID: id, BootID: pending.bootID, Method: "cancel"}:
+			pending.cancelSent = true
+		default:
+		}
+	}
+}
+
+func (b *Bridge) decodePeer(writer http.ResponseWriter, request *http.Request) (Peer, bool) {
+	if request.Method != http.MethodPost {
+		http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+		return Peer{}, false
+	}
+	if !b.authorized(request) {
+		http.Error(writer, "unauthorized", http.StatusUnauthorized)
+		return Peer{}, false
+	}
+	var peer Peer
+	if err := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 4096)).Decode(&peer); err != nil {
+		http.Error(writer, "invalid peer metadata", http.StatusBadRequest)
+		return Peer{}, false
+	}
+	if peer.ExtensionVersion != ExtensionVersion {
+		http.Error(writer, "browser extension version does not match lrmcp; run lrmcp setup browser and reload the extension", http.StatusUpgradeRequired)
+		return Peer{}, false
+	}
+	if strings.TrimSpace(peer.InstanceID) == "" || strings.TrimSpace(peer.BootID) == "" {
+		http.Error(writer, "instance_id and boot_id are required", http.StatusBadRequest)
+		return Peer{}, false
+	}
+	return peer, true
+}
+
+func (b *Bridge) hello(writer http.ResponseWriter, request *http.Request) {
+	peer, ok := b.decodePeer(writer, request)
+	if !ok {
+		return
+	}
+	b.mu.Lock()
+	old := b.instances[peer.InstanceID]
+	if old == nil && len(b.instances) >= 32 {
+		b.mu.Unlock()
+		http.Error(writer, "browser instance capacity reached", http.StatusServiceUnavailable)
+		return
+	}
+	if old != nil && old.peer.BootID != peer.BootID {
+		for tabID, route := range b.tabs {
+			if route.browserID == peer.InstanceID {
+				delete(b.tabs, tabID)
+			}
+		}
+		for id, pending := range b.pending {
+			if pending.browserID == peer.InstanceID {
+				if pending.stopGateWatch != nil {
+					pending.stopGateWatch()
+				}
+				pending.cancel()
+				if pending.release != nil {
+					pending.release()
+				}
+				delete(b.pending, id)
+				pending.result <- response{Error: "browser extension restarted; operation outcome may be unknown"}
+			}
+		}
+	}
+	if old == nil || old.peer.BootID != peer.BootID {
+		old = &instance{commands: make(chan command, 64), controls: make(chan command, 256)}
+		b.instances[peer.InstanceID] = old
+	}
+	old.peer = peer
+	old.lastSeen = time.Now()
+	b.mu.Unlock()
+	writer.Header().Set("X-LRMCP-Bridge-ID", b.prefix)
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+func (b *Bridge) livePeer(writer http.ResponseWriter, request *http.Request) (*instance, bool) {
+	peer, ok := b.decodePeer(writer, request)
+	if !ok {
+		return nil, false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	instance := b.instances[peer.InstanceID]
+	if instance == nil || instance.peer.BootID != peer.BootID {
+		http.Error(writer, "extension generation changed; register again", http.StatusConflict)
+		return nil, false
+	}
+	instance.lastSeen = time.Now()
+	return instance, true
+}
+
+func (b *Bridge) heartbeat(writer http.ResponseWriter, request *http.Request) {
+	if _, ok := b.livePeer(writer, request); ok {
+		writer.WriteHeader(http.StatusNoContent)
 	}
 }
 
 func (b *Bridge) poll(writer http.ResponseWriter, request *http.Request) {
-	if request.Method != http.MethodPost {
-		http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+	instance, ok := b.livePeer(writer, request)
+	if !ok {
 		return
 	}
-	if !b.authorized(request) {
-		http.Error(writer, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-	var peer Peer
-	if err := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 4096)).Decode(&peer); err != nil && !errors.Is(err, io.EOF) {
-		http.Error(writer, "invalid peer metadata", http.StatusBadRequest)
-		return
-	}
-	if strings.TrimSpace(peer.InstanceID) == "" {
-		http.Error(writer, "instance_id is required", http.StatusBadRequest)
-		return
-	}
-	if peer.ExtensionVersion != ExtensionVersion {
-		http.Error(writer, "browser extension version does not match lrmcp; run lrmcp setup browser and reload the extension", http.StatusUpgradeRequired)
-		return
-	}
-	b.mu.Lock()
-	if b.connectedLocked() && b.peer.InstanceID != "" && b.peer.InstanceID != peer.InstanceID {
-		b.mu.Unlock()
-		http.Error(writer, "another browser extension instance is connected", http.StatusConflict)
-		return
-	}
-	b.lastSeen = time.Now()
-	b.peer = peer
-	b.mu.Unlock()
 	timer := time.NewTimer(25 * time.Second)
 	defer timer.Stop()
-	select {
-	case item := <-b.commands:
+	for {
+		var item command
+		select {
+		case item = <-instance.controls:
+		default:
+			select {
+			case item = <-instance.controls:
+			case item = <-instance.commands:
+			case <-timer.C:
+				writer.WriteHeader(http.StatusNoContent)
+				return
+			case <-request.Context().Done():
+				return
+			case <-b.ctx.Done():
+				return
+			}
+		}
+		b.mu.Lock()
+		pending := b.pending[item.ID]
+		valid := pending != nil && pending.bootID == instance.peer.BootID && (item.Method == "cancel" || !pending.abandoned && pending.ctx.Err() == nil && time.Now().UnixMilli() < item.Deadline)
+		if valid && item.Method != "cancel" {
+			pending.dispatched = true
+		}
+		if !valid && pending != nil && !pending.dispatched {
+			pending.cancel()
+			delete(b.pending, item.ID)
+		}
+		b.mu.Unlock()
+		if !valid {
+			continue
+		}
 		writer.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(writer).Encode(item)
-	case <-timer.C:
-		writer.WriteHeader(http.StatusNoContent)
-	case <-request.Context().Done():
+		return
 	}
 }
 
@@ -368,42 +651,130 @@ func (b *Bridge) receiveResult(writer http.ResponseWriter, request *http.Request
 		return
 	}
 	var result response
-	if err := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 64<<20)).Decode(&result); err != nil || result.ID == "" || result.InstanceID == "" {
+	if err := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 64<<20)).Decode(&result); err != nil || result.ID == "" || result.InstanceID == "" || result.BootID == "" {
 		http.Error(writer, "invalid result", http.StatusBadRequest)
 		return
 	}
 	b.mu.Lock()
-	if b.peer.InstanceID == "" || result.InstanceID != b.peer.InstanceID {
+	instance := b.instances[result.InstanceID]
+	pending := b.pending[result.ID]
+	if instance == nil || result.BootID != instance.peer.BootID || pending != nil && (pending.browserID != result.InstanceID || pending.bootID != result.BootID) {
 		b.mu.Unlock()
-		http.Error(writer, "browser extension instance does not own this bridge", http.StatusConflict)
+		http.Error(writer, "result does not belong to this instance generation", http.StatusConflict)
 		return
 	}
-	channel := b.pending[result.ID]
-	b.lastSeen = time.Now()
-	b.mu.Unlock()
-	if channel == nil {
+	instance.lastSeen = time.Now()
+	if pending == nil {
+		b.mu.Unlock()
 		http.Error(writer, "unknown command", http.StatusNotFound)
 		return
 	}
-	select {
-	case channel <- result:
-		writer.WriteHeader(http.StatusNoContent)
-	case <-request.Context().Done():
+	delete(b.pending, result.ID)
+	if pending.stopGateWatch != nil {
+		pending.stopGateWatch()
 	}
+	if pending.release != nil {
+		pending.release()
+	}
+	if !pending.abandoned {
+		pending.result <- result
+	}
+	pending.cancel()
+	b.mu.Unlock()
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+func (b *Bridge) authorizeDesktop(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		http.Error(writer, "method not allowed", 405)
+		return
+	}
+	if !b.authorized(request) {
+		http.Error(writer, "unauthorized", 401)
+		return
+	}
+	var identity response
+	if json.NewDecoder(http.MaxBytesReader(writer, request.Body, 4096)).Decode(&identity) != nil {
+		http.Error(writer, "invalid command identity", 400)
+		return
+	}
+	b.mu.Lock()
+	pending := b.pending[identity.ID]
+	gate := b.gate
+	if pending == nil || !pending.dispatched || pending.abandoned || pending.browserID != identity.InstanceID || pending.bootID != identity.BootID {
+		b.mu.Unlock()
+		http.Error(writer, "command canceled or generation changed", 409)
+		return
+	}
+	if pending.release != nil {
+		b.mu.Unlock()
+		writer.WriteHeader(204)
+		return
+	}
+	if pending.authorizing {
+		b.mu.Unlock()
+		http.Error(writer, "desktop authorization is already in progress", http.StatusConflict)
+		return
+	}
+	pending.authorizing = true
+	operationContext, controlID := pending.ctx, pending.controlID
+	b.mu.Unlock()
+	if gate == nil {
+		b.mu.Lock()
+		pending.authorizing = false
+		b.mu.Unlock()
+		writer.WriteHeader(204)
+		return
+	}
+	controlledContext, release, err := gate(operationContext, controlID)
+	if err != nil {
+		b.mu.Lock()
+		pending.authorizing = false
+		b.mu.Unlock()
+		http.Error(writer, err.Error(), 409)
+		return
+	}
+	b.mu.Lock()
+	if b.pending[identity.ID] != pending || pending.abandoned {
+		b.mu.Unlock()
+		if release != nil {
+			release()
+		}
+		http.Error(writer, "command canceled", 409)
+		return
+	}
+	if controlledContext != nil && controlledContext.Err() != nil {
+		b.mu.Unlock()
+		if release != nil {
+			release()
+		}
+		http.Error(writer, "desktop control was canceled", http.StatusConflict)
+		return
+	}
+	pending.release = release
+	pending.authorizing = false
+	if controlledContext == nil {
+		controlledContext = operationContext
+	}
+	pending.stopGateWatch = context.AfterFunc(controlledContext, func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		if b.pending[identity.ID] == pending {
+			b.cancelPendingLocked(identity.ID, pending)
+		}
+	})
+	b.mu.Unlock()
+	writer.WriteHeader(204)
 }
 
 func (b *Bridge) authorized(request *http.Request) bool {
-	provided := strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
-	return len(provided) == len(b.token) && subtle.ConstantTimeCompare([]byte(provided), []byte(b.token)) == 1
-}
-
-func (b *Bridge) connectedLocked() bool {
-	return !b.lastSeen.IsZero() && time.Since(b.lastSeen) < 35*time.Second
+	provided, bearer := strings.CutPrefix(request.Header.Get("Authorization"), "Bearer ")
+	return bearer && len(provided) == len(b.token) && subtle.ConstantTimeCompare([]byte(provided), []byte(b.token)) == 1
 }
 
 func validateAction(action Action) error {
-	if action.TabID <= 0 {
-		return errors.New("tab_id must be positive")
+	if action.TabID == "" {
+		return errors.New("tab_id is required")
 	}
 	targetCount := func() int {
 		count := 0
