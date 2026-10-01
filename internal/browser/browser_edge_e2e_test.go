@@ -5,6 +5,7 @@ package browser
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -61,10 +62,10 @@ func TestEdgeExtensionEndToEnd(t *testing.T) {
 	profile := filepath.Join(t.TempDir(), "edge-profile")
 	logPath := filepath.Join(t.TempDir(), "edge.log")
 	launchContainedEdge(t, edge, []string{
-		"--headless=new", "--disable-gpu", "--silent-debugger-extension-api", "--no-first-run", "--no-default-browser-check", "--enable-logging", "--v=1", "--log-file=" + logPath,
+		"--headless=new", "--disable-gpu", "--silent-debugger-extension-api", "--no-first-run", "--no-default-browser-check", "--enable-logging=stderr", "--v=1",
 		"--host-resolver-rules=MAP child.local-runtime-mcp.invalid 127.0.0.1",
 		"--user-data-dir=" + profile, "--disable-extensions-except=" + extension, "--load-extension=" + extension, page.URL,
-	}, filepath.Dir(profile), filepath.Dir(logPath))
+	}, logPath, filepath.Dir(profile), filepath.Dir(logPath))
 
 	deadline := time.Now().Add(20 * time.Second)
 	for !bridge.Status().Connected && time.Now().Before(deadline) {
@@ -369,16 +370,49 @@ func launchIsolatedEdge(t *testing.T, edge, extension, url string) {
 	t.Helper()
 	profile := filepath.Join(t.TempDir(), "edge-profile")
 	launchContainedEdge(t, edge, []string{
-		"--headless=new", "--disable-gpu", "--silent-debugger-extension-api", "--no-first-run", "--no-default-browser-check",
+		"--headless=new", "--disable-gpu", "--silent-debugger-extension-api", "--no-first-run", "--no-default-browser-check", "--enable-logging=stderr",
 		"--host-resolver-rules=MAP child.local-runtime-mcp.invalid 127.0.0.1", "--user-data-dir=" + profile,
 		"--disable-extensions-except=" + extension, "--load-extension=" + extension, url,
-	}, filepath.Dir(profile))
+	}, filepath.Join(filepath.Dir(profile), "edge.log"), filepath.Dir(profile))
 }
 
 // Suspend before assignment: Chromium can spawn children immediately, before
 // exec.Cmd.Start followed by AssignProcessToJobObject would contain them.
-func launchContainedEdge(t *testing.T, edge string, args []string, directories ...string) {
+func launchContainedEdge(t *testing.T, edge string, args []string, logPath string, directories ...string) {
 	t.Helper()
+	// Keep the log file handle in Go. Chromium receives an anonymous pipe,
+	// so background brokers cannot retain a handle to the test's disk log.
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logReader, logWriter, err := os.Pipe()
+	if err != nil {
+		_ = logFile.Close()
+		t.Fatal(err)
+	}
+	defer logWriter.Close()
+	logDone := make(chan struct{})
+	go func() { _, _ = io.Copy(logFile, logReader); close(logDone) }()
+	var finishLogOnce sync.Once
+	finishLog := func() {
+		finishLogOnce.Do(func() {
+			_ = logReader.Close()
+			<-logDone
+			_ = logFile.Close()
+		})
+	}
+	t.Cleanup(finishLog)
+	input, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	for _, handle := range []windows.Handle{windows.Handle(logWriter.Fd()), windows.Handle(input.Fd())} {
+		if err := windows.SetHandleInformation(handle, windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT); err != nil {
+			t.Fatal(err)
+		}
+	}
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -402,8 +436,12 @@ func launchContainedEdge(t *testing.T, edge string, args []string, directories .
 	}
 	startup := windows.StartupInfo{}
 	startup.Cb = uint32(unsafe.Sizeof(startup))
+	startup.Flags = windows.STARTF_USESTDHANDLES
+	startup.StdInput = windows.Handle(input.Fd())
+	startup.StdOutput = windows.Handle(logWriter.Fd())
+	startup.StdErr = windows.Handle(logWriter.Fd())
 	process := windows.ProcessInformation{}
-	if err := windows.CreateProcess(application, commandLine, nil, nil, false,
+	if err := windows.CreateProcess(application, commandLine, nil, nil, true,
 		windows.CREATE_SUSPENDED|windows.CREATE_NO_WINDOW, nil, nil, &startup, &process); err != nil {
 		_ = windows.CloseHandle(job)
 		t.Fatal(err)
@@ -444,6 +482,7 @@ func launchContainedEdge(t *testing.T, edge string, args []string, directories .
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
+		finishLog()
 		for _, directory := range directories {
 			deadline := time.Now().Add(5 * time.Second)
 			for {
