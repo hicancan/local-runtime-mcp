@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -61,39 +60,11 @@ func TestEdgeExtensionEndToEnd(t *testing.T) {
 	}
 	profile := filepath.Join(t.TempDir(), "edge-profile")
 	logPath := filepath.Join(t.TempDir(), "edge.log")
-	command := exec.Command(edge,
-		"--headless=new", "--disable-gpu", "--silent-debugger-extension-api", "--no-first-run", "--no-default-browser-check", "--enable-logging", "--v=1", "--log-file="+logPath,
+	launchContainedEdge(t, edge, []string{
+		"--headless=new", "--disable-gpu", "--silent-debugger-extension-api", "--no-first-run", "--no-default-browser-check", "--enable-logging", "--v=1", "--log-file=" + logPath,
 		"--host-resolver-rules=MAP child.local-runtime-mcp.invalid 127.0.0.1",
-		"--user-data-dir="+profile,
-		"--disable-extensions-except="+extension,
-		"--load-extension="+extension,
-		page.URL,
-	)
-	if err := command.Start(); err != nil {
-		t.Fatal(err)
-	}
-	job, err := createEdgeJob(command.Process.Pid)
-	if err != nil {
-		_ = command.Process.Kill()
-		_, _ = command.Process.Wait()
-		t.Fatalf("contain Edge process tree: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = windows.TerminateJobObject(job, 1)
-		_ = windows.CloseHandle(job)
-		_ = command.Wait()
-		deadline := time.Now().Add(5 * time.Second)
-		for {
-			err := os.RemoveAll(profile)
-			if err == nil || time.Now().After(deadline) {
-				if err != nil {
-					t.Errorf("remove isolated Edge profile: %v", err)
-				}
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-	})
+		"--user-data-dir=" + profile, "--disable-extensions-except=" + extension, "--load-extension=" + extension, page.URL,
+	}, filepath.Dir(profile), filepath.Dir(logPath))
 
 	deadline := time.Now().Add(20 * time.Second)
 	for !bridge.Status().Connected && time.Now().Before(deadline) {
@@ -397,46 +368,100 @@ func TestEdgeExtensionEndToEnd(t *testing.T) {
 func launchIsolatedEdge(t *testing.T, edge, extension, url string) {
 	t.Helper()
 	profile := filepath.Join(t.TempDir(), "edge-profile")
-	command := exec.Command(edge, "--headless=new", "--disable-gpu", "--silent-debugger-extension-api", "--no-first-run", "--no-default-browser-check", "--host-resolver-rules=MAP child.local-runtime-mcp.invalid 127.0.0.1", "--user-data-dir="+profile, "--disable-extensions-except="+extension, "--load-extension="+extension, url)
-	if err := command.Start(); err != nil {
-		t.Fatal(err)
-	}
-	job, err := createEdgeJob(command.Process.Pid)
-	if err != nil {
-		_ = command.Process.Kill()
-		_, _ = command.Process.Wait()
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = windows.TerminateJobObject(job, 1); _ = windows.CloseHandle(job); _ = command.Wait() })
+	launchContainedEdge(t, edge, []string{
+		"--headless=new", "--disable-gpu", "--silent-debugger-extension-api", "--no-first-run", "--no-default-browser-check",
+		"--host-resolver-rules=MAP child.local-runtime-mcp.invalid 127.0.0.1", "--user-data-dir=" + profile,
+		"--disable-extensions-except=" + extension, "--load-extension=" + extension, url,
+	}, filepath.Dir(profile))
 }
 
-func createEdgeJob(processID int) (windows.Handle, error) {
+// Suspend before assignment: Chromium can spawn children immediately, before
+// exec.Cmd.Start followed by AssignProcessToJobObject would contain them.
+func launchContainedEdge(t *testing.T, edge string, args []string, directories ...string) {
+	t.Helper()
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
-		return 0, err
+		t.Fatal(err)
 	}
 	information := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
 	information.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-	if _, err := windows.SetInformationJobObject(
-		job,
-		windows.JobObjectExtendedLimitInformation,
-		uintptr(unsafe.Pointer(&information)),
-		uint32(unsafe.Sizeof(information)),
-	); err != nil {
+	if _, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&information)), uint32(unsafe.Sizeof(information))); err != nil {
 		_ = windows.CloseHandle(job)
-		return 0, err
+		t.Fatal(err)
 	}
-	process, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(processID))
+	application, err := windows.UTF16PtrFromString(edge)
 	if err != nil {
 		_ = windows.CloseHandle(job)
-		return 0, err
+		t.Fatal(err)
 	}
-	defer windows.CloseHandle(process)
-	if err := windows.AssignProcessToJobObject(job, process); err != nil {
+	commandLine, err := windows.UTF16PtrFromString(windows.ComposeCommandLine(append([]string{edge}, args...)))
+	if err != nil {
 		_ = windows.CloseHandle(job)
-		return 0, err
+		t.Fatal(err)
 	}
-	return job, nil
+	startup := windows.StartupInfo{}
+	startup.Cb = uint32(unsafe.Sizeof(startup))
+	process := windows.ProcessInformation{}
+	if err := windows.CreateProcess(application, commandLine, nil, nil, false,
+		windows.CREATE_SUSPENDED|windows.CREATE_NO_WINDOW, nil, nil, &startup, &process); err != nil {
+		_ = windows.CloseHandle(job)
+		t.Fatal(err)
+	}
+	defer windows.CloseHandle(process.Thread)
+	if err := windows.AssignProcessToJobObject(job, process.Process); err != nil {
+		_ = windows.TerminateProcess(process.Process, 1)
+		_, _ = windows.WaitForSingleObject(process.Process, 5000)
+		_ = windows.CloseHandle(process.Process)
+		_ = windows.CloseHandle(job)
+		t.Fatalf("contain suspended Edge process: %v", err)
+	}
+	// Cleanup is registered before resuming, including the resume-failure path.
+	t.Cleanup(func() {
+		defer windows.CloseHandle(process.Process)
+		defer windows.CloseHandle(job)
+		if err := windows.TerminateJobObject(job, 1); err != nil {
+			t.Errorf("terminate isolated Edge tree: %v", err)
+		}
+		_, _ = windows.WaitForSingleObject(process.Process, 5000)
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			var accounting struct {
+				TotalUserTime, TotalKernelTime, ThisPeriodTotalUserTime, ThisPeriodTotalKernelTime int64
+				TotalPageFaultCount, TotalProcesses, ActiveProcesses, TotalTerminatedProcesses     uint32
+			}
+			if err := windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation,
+				uintptr(unsafe.Pointer(&accounting)), uint32(unsafe.Sizeof(accounting)), nil); err != nil {
+				t.Errorf("query isolated Edge tree: %v", err)
+				break
+			}
+			if accounting.ActiveProcesses == 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Errorf("isolated Edge tree still has %d active processes", accounting.ActiveProcesses)
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		for _, directory := range directories {
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				err := os.RemoveAll(directory)
+				if err == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Errorf("remove owned Edge fixture directory: %v", err)
+					break
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+	})
+	if _, err := windows.ResumeThread(process.Thread); err != nil {
+		t.Fatalf("resume contained Edge: %v", err)
+	}
 }
 
 func findEdge() string {

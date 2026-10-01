@@ -1,0 +1,201 @@
+Source-file copyright declarations retained from production Go and assembly
+files selected for the five release targets. Applicable component licenses
+and versions are listed in THIRD_PARTY_NOTICES.md.
+
+github.com/bahlo/generic-list-go v0.2.0
+Copyright 2009 The Go Authors. All rights reserved.
+
+github.com/go-logr/logr v1.4.3
+Copyright 2019 The logr Authors.
+Copyright 2020 The logr Authors.
+Copyright 2021 The logr Authors.
+Copyright 2023 The logr Authors.
+
+github.com/go-logr/stdr v1.2.2
+Copyright 2019 The logr Authors.
+
+github.com/google/jsonschema-go v0.4.3
+Copyright 2025 The JSON Schema Go Project Authors. All rights reserved.
+
+github.com/google/uuid v1.6.0
+Copyright 2016 Google Inc.  All rights reserved.
+Copyright 2017 Google Inc.  All rights reserved.
+Copyright 2018 Google Inc.  All rights reserved.
+Copyright 2021 Google Inc.  All rights reserved.
+Copyright 2023 Google Inc.  All rights reserved.
+
+github.com/grafana/regexp v0.0.0-20240518133315-a468a5bfb3bc
+Copyright 2009 The Go Authors. All rights reserved.
+Copyright 2011 The Go Authors. All rights reserved.
+Copyright 2014 The Go Authors. All rights reserved.
+Copyright 2015 The Go Authors. All rights reserved.
+
+github.com/modelcontextprotocol/go-sdk v1.8.0
+Copyright 2018 The Go MCP SDK Authors. All rights reserved.
+Copyright 2019 The Go MCP SDK Authors. All rights reserved.
+Copyright 2025 The Go MCP SDK Authors. All rights reserved.
+Copyright 2026 The Go MCP SDK Authors. All rights reserved.
+
+github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822
+Copyright (c) 2011, Open Knowledge Foundation Ltd.
+
+github.com/panjf2000/ants/v2 v2.11.3
+Copyright (c) 2018 Andy Pan
+Copyright (c) 2018. Andy Pan. All rights reserved.
+Copyright (c) 2019. Ants Authors. All rights reserved.
+Copyright (c) 2023 Andy Pan
+Copyright (c) 2025 Andy Pan
+Copyright (c) 2025. Andy Pan. All rights reserved.
+Copyright 2019 Andy Pan & Dietoad. All rights reserved.
+
+github.com/prometheus/client_golang v1.23.2
+Copyright (c) 2015 Björn Rabenstein
+Copyright 2013 The Go Authors. All rights reserved.
+Copyright 2014 The Prometheus Authors
+Copyright 2015 The Prometheus Authors
+Copyright 2016 The Prometheus Authors
+Copyright 2017 The Prometheus Authors
+Copyright 2018 The Prometheus Authors
+Copyright 2019 The Prometheus Authors
+Copyright 2021 The Prometheus Authors
+Copyright 2022 The Prometheus Authors
+Copyright 2024 The Prometheus Authors
+Copyright 2025 The Prometheus Authors
+
+github.com/prometheus/client_model v0.6.2
+Copyright 2013 Prometheus Team
+
+github.com/prometheus/common v0.66.1
+Copyright 2013 The Prometheus Authors
+Copyright 2014 The Prometheus Authors
+Copyright 2015 The Prometheus Authors
+Copyright 2020 The Prometheus Authors
+Copyright 2023 The Prometheus Authors
+Copyright 2024 The Prometheus Authors
+
+github.com/prometheus/otlptranslator v0.0.2
+Copyright 2025 The Prometheus Authors
+
+github.com/prometheus/procfs v0.17.0
+Copyright 2014 Prometheus Team
+Copyright 2017 Prometheus Team
+Copyright 2017 The Prometheus Authors
+Copyright 2018 The Prometheus Authors
+Copyright 2019 The Prometheus Authors
+Copyright 2020 The Prometheus Authors
+Copyright 2021 The Prometheus Authors
+Copyright 2022 The Prometheus Authors
+Copyright 2023 Prometheus Team
+Copyright 2023 The Prometheus Authors
+Copyright 2025 The Prometheus Authors
+
+github.com/segmentio/encoding v0.5.4
+Copyright 2009 The Go Authors. All rights reserved.
+
+github.com/spf13/pflag v1.0.7
+Copyright 2009 The Go Authors. All rights reserved.
+
+github.com/u-root/u-root v0.16.0
+Copyright 2015-2017 the u-root Authors. All rights reserved
+Copyright 2021 the u-root Authors. All rights reserved
+
+github.com/yosida95/uritemplate/v3 v3.0.2
+Copyright (C) 2016 Kohei YOSHIDA. All rights reserved.
+
+go.uber.org/dig v1.19.0
+Copyright (c) 2019 Uber Technologies, Inc.
+Copyright (c) 2019-2021 Uber Technologies, Inc.
+Copyright (c) 2020 Uber Technologies, Inc.
+Copyright (c) 2021 Uber Technologies, Inc.
+Copyright (c) 2022 Uber Technologies, Inc.
+Copyright (c) 2023 Uber Technologies, Inc.
+Copyright (c) 2024 Uber Technologies, Inc.
+Copyright (c) 2025 Uber Technologies, Inc.
+
+go.uber.org/fx v1.23.0
+Copyright (c) 2019 Uber Technologies, Inc.
+Copyright (c) 2019-2021 Uber Technologies, Inc.
+Copyright (c) 2020 Uber Technologies, Inc.
+Copyright (c) 2020-2021 Uber Technologies, Inc.
+Copyright (c) 2021 Uber Technologies, Inc.
+Copyright (c) 2022 Uber Technologies, Inc.
+Copyright (c) 2024 Uber Technologies, Inc.
+
+go.uber.org/multierr v1.11.0
+Copyright (c) 2017-2023 Uber Technologies, Inc.
+
+go.uber.org/zap v1.27.0
+Copyright (c) 2016 Uber Technologies, Inc.
+Copyright (c) 2016-2022 Uber Technologies, Inc.
+Copyright (c) 2017 Uber Technologies, Inc.
+Copyright (c) 2020 Uber Technologies, Inc.
+Copyright (c) 2021 Uber Technologies, Inc.
+Copyright (c) 2022 Uber Technologies, Inc.
+Copyright (c) 2023 Uber Technologies, Inc.
+
+golang.org/x/crypto v0.51.0
+Copyright 2010 The Go Authors. All rights reserved.
+Copyright 2011 The Go Authors. All rights reserved.
+Copyright 2012 The Go Authors. All rights reserved.
+Copyright 2013 The Go Authors. All rights reserved.
+Copyright 2014 The Go Authors. All rights reserved.
+Copyright 2016 The Go Authors. All rights reserved.
+Copyright 2018 The Go Authors. All rights reserved.
+Copyright 2019 The Go Authors. All rights reserved.
+Copyright 2024 The Go Authors. All rights reserved.
+
+golang.org/x/image v0.46.0
+Copyright 2011 The Go Authors. All rights reserved.
+Copyright 2014 The Go Authors. All rights reserved.
+Copyright 2015 The Go Authors. All rights reserved.
+Copyright 2016 The Go Authors. All rights reserved.
+
+golang.org/x/net v0.53.0
+Copyright 2012 The Go Authors. All rights reserved.
+
+golang.org/x/oauth2 v0.35.0
+Copyright 2014 The Go Authors. All rights reserved.
+Copyright 2017 The Go Authors. All rights reserved.
+Copyright 2023 The Go Authors. All rights reserved.
+
+golang.org/x/sync v0.20.0
+Copyright 2013 The Go Authors. All rights reserved.
+Copyright 2016 The Go Authors. All rights reserved.
+Copyright 2017 The Go Authors. All rights reserved.
+
+golang.org/x/sys v0.48.0
+Copyright 2009 The Go Authors. All rights reserved.
+Copyright 2009,2010 The Go Authors. All rights reserved.
+Copyright 2010 The Go Authors. All rights reserved.
+Copyright 2011 The Go Authors. All rights reserved.
+Copyright 2012 The Go Authors. All rights reserved.
+Copyright 2014 The Go Authors. All rights reserved.
+Copyright 2015 The Go Authors. All rights reserved.
+Copyright 2016 The Go Authors. All rights reserved.
+Copyright 2017 The Go Authors. All rights reserved.
+Copyright 2018 The Go Authors. All rights reserved.
+Copyright 2019 The Go Authors. All rights reserved.
+Copyright 2020 The Go Authors. All rights reserved.
+Copyright 2021 The Go Authors. All rights reserved.
+Copyright 2022 The Go Authors. All rights reserved.
+Copyright 2023 The Go Authors. All rights reserved.
+Copyright 2024 The Go Authors. All rights reserved.
+Copyright 2025 The Go Authors. All rights reserved.
+Copyright 2026 The Go Authors. All rights reserved.
+
+golang.org/x/time v0.15.0
+Copyright 2015 The Go Authors. All rights reserved.
+Copyright 2022 The Go Authors. All rights reserved.
+
+google.golang.org/protobuf v1.36.8
+Copyright 2008 Google Inc.  All rights reserved.
+Copyright 2018 The Go Authors. All rights reserved.
+Copyright 2019 The Go Authors. All rights reserved.
+Copyright 2020 The Go Authors. All rights reserved.
+Copyright 2022 The Go Authors. All rights reserved.
+Copyright 2024 The Go Authors. All rights reserved.
+Copyright 2025 The Go Authors. All rights reserved.
+
+gopkg.in/yaml.v3 v3.0.1
+Copyright (c) 2006-2010 Kirill Simonov
+Copyright (c) 2011-2019 Canonical Ltd

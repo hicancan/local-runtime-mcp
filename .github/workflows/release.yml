@@ -53,6 +53,8 @@ jobs:
       - run: git diff --exit-code -- internal/browser/extension
       - if: runner.os == 'Windows'
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.96.0'
       - if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/build-native.ps1
@@ -60,6 +62,8 @@ jobs:
         run: cargo fmt --manifest-path native/computer-windows/Cargo.toml --check
       - if: runner.os == 'Windows'
         run: cargo clippy --manifest-path native/computer-windows/Cargo.toml --all-targets -- -D warnings
+      - if: runner.os == 'Windows'
+        run: cargo test --manifest-path native/computer-windows/Cargo.toml --locked
       - run: go test ./...
       - run: go vet ./...
       - if: runner.os == 'Windows'

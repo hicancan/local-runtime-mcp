@@ -403,7 +403,7 @@ Provider 设置和受支持的客户端见 [OpenAI Secure MCP Tunnel 指南](htt
 
 ## 构建与测试
 
-需要 Go 1.27、Node.js 24。Windows Computer 引擎使用稳定版 Rust MSVC 工具链，原生构建前加载 Visual Studio 构建环境。
+需要 Go 1.27、Node.js 24。Windows Computer 引擎使用 Rust 1.96.0 MSVC 工具链，CI 与发布构建固定使用 Rust 1.96.0，Windows 原生 Worker 静态链接 Microsoft CRT。原生构建前加载 Visual Studio 构建环境。
 
 ```powershell
 Push-Location browser-extension
@@ -414,6 +414,7 @@ Pop-Location
 ./scripts/build-native.ps1
 cargo fmt --manifest-path native/computer-windows/Cargo.toml --check
 cargo clippy --manifest-path native/computer-windows/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path native/computer-windows/Cargo.toml --locked
 go test ./...
 go vet ./...
 go build ./cmd/lrmcp

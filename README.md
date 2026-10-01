@@ -403,7 +403,7 @@ Run `lrmcp help` for corresponding command-line flags.
 
 ## Build and test
 
-Requirements: Go 1.27, Node.js 24, and stable Rust with the Windows MSVC toolchain for the Computer engine. Run the native build on Windows with the Visual Studio build environment loaded.
+Requirements: Go 1.27, Node.js 24, and Rust 1.96.0 with the Windows MSVC toolchain for the Computer engine. CI and release builds pin Rust 1.96.0, and the Windows native worker statically links the Microsoft CRT. Run the native build on Windows with the Visual Studio build environment loaded.
 
 ```powershell
 Push-Location browser-extension
@@ -414,6 +414,7 @@ Pop-Location
 ./scripts/build-native.ps1
 cargo fmt --manifest-path native/computer-windows/Cargo.toml --check
 cargo clippy --manifest-path native/computer-windows/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path native/computer-windows/Cargo.toml --locked
 go test ./...
 go vet ./...
 go build ./cmd/lrmcp
