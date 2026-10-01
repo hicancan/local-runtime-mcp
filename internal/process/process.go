@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	pty "github.com/aymanbagabas/go-pty"
 )
@@ -49,29 +50,38 @@ type Options struct {
 }
 
 type ContinueOptions struct {
-	SessionID   string `json:"session_id"`
-	Stdin       string `json:"stdin,omitempty"`
-	CloseStdin  bool   `json:"close_stdin,omitempty"`
-	Terminate   bool   `json:"terminate,omitempty"`
-	YieldTimeMS int    `json:"yield_time_ms,omitempty"`
-	Columns     int    `json:"columns,omitempty"`
-	Rows        int    `json:"rows,omitempty"`
+	SessionID    string       `json:"session_id"`
+	OutputCursor OutputCursor `json:"output_cursor,omitempty"`
+	Stdin        string       `json:"stdin,omitempty"`
+	CloseStdin   bool         `json:"close_stdin,omitempty"`
+	Terminate    bool         `json:"terminate,omitempty"`
+	YieldTimeMS  int          `json:"yield_time_ms,omitempty"`
+	Columns      int          `json:"columns,omitempty"`
+	Rows         int          `json:"rows,omitempty"`
+}
+
+type OutputCursor struct {
+	Stdout int64 `json:"stdout"`
+	Stderr int64 `json:"stderr"`
 }
 
 type Result struct {
-	SessionID       string   `json:"session_id,omitempty"`
-	Running         bool     `json:"running"`
-	Program         string   `json:"program"`
-	Args            []string `json:"args,omitempty"`
-	Directory       string   `json:"directory"`
-	ExitCode        int      `json:"exit_code"`
-	Stdout          string   `json:"stdout"`
-	Stderr          string   `json:"stderr"`
-	StdoutTruncated bool     `json:"stdout_truncated"`
-	StderrTruncated bool     `json:"stderr_truncated"`
-	DurationMS      int64    `json:"duration_ms"`
-	TimedOut        bool     `json:"timed_out"`
-	IOMode          string   `json:"io_mode"`
+	SessionID       string       `json:"session_id,omitempty"`
+	Running         bool         `json:"running"`
+	Program         string       `json:"program"`
+	Args            []string     `json:"args,omitempty"`
+	Directory       string       `json:"directory"`
+	ExitCode        int          `json:"exit_code"`
+	Stdout          string       `json:"stdout"`
+	Stderr          string       `json:"stderr"`
+	OutputCursor    OutputCursor `json:"output_cursor"`
+	StdoutOffset    int64        `json:"stdout_offset"`
+	StderrOffset    int64        `json:"stderr_offset"`
+	StdoutTruncated bool         `json:"stdout_truncated"`
+	StderrTruncated bool         `json:"stderr_truncated"`
+	DurationMS      int64        `json:"duration_ms"`
+	TimedOut        bool         `json:"timed_out"`
+	IOMode          string       `json:"io_mode"`
 }
 
 type processControl interface {
@@ -106,6 +116,7 @@ type session struct {
 	stderr      *streamBuffer
 	started     time.Time
 	done        chan struct{}
+	retired     chan struct{}
 
 	mu             sync.Mutex
 	finished       time.Time
@@ -141,19 +152,6 @@ func (m *Manager) Run(callContext context.Context, options Options) (Result, err
 	if err := callContext.Err(); err != nil {
 		return Result{}, err
 	}
-	m.mu.Lock()
-	if m.closed || m.ctx.Err() != nil {
-		m.mu.Unlock()
-		return Result{}, errors.New("process manager is closed")
-	}
-	if len(m.sessions)+m.startingCount >= maxSessions {
-		m.mu.Unlock()
-		return Result{}, errors.New("process session capacity is full")
-	}
-	m.starting.Add(1)
-	m.startingCount++
-	m.mu.Unlock()
-	defer func() { m.mu.Lock(); m.startingCount--; m.mu.Unlock(); m.starting.Done() }()
 	directory, timeout, outputLimit, yield, err := validateOptions(options)
 	if err != nil {
 		return Result{}, err
@@ -163,10 +161,36 @@ func (m *Manager) Run(callContext context.Context, options Options) (Result, err
 	if err != nil {
 		return Result{}, fmt.Errorf("resolve program %q: %w", options.Program, err)
 	}
-
+	m.mu.Lock()
+	if err := callContext.Err(); err != nil {
+		m.mu.Unlock()
+		return Result{}, err
+	}
+	if m.closed || m.ctx.Err() != nil {
+		m.mu.Unlock()
+		return Result{}, errors.New("process manager is closed")
+	}
+	for len(m.sessions)+m.startingCount >= maxSessions {
+		if !m.evictCompletedLocked() {
+			m.mu.Unlock()
+			return Result{}, errors.New("process session capacity is full")
+		}
+	}
+	m.starting.Add(1)
+	m.startingCount++
+	m.mu.Unlock()
+	reserved := true
+	defer func() {
+		m.mu.Lock()
+		if reserved {
+			m.startingCount--
+		}
+		m.mu.Unlock()
+		m.starting.Done()
+	}()
 	entry := &session{
 		id: newSessionID(), program: options.Program, args: append([]string(nil), options.Args...), directory: filepath.Clean(directory),
-		stdout: newStreamBuffer(outputLimit), stderr: newStreamBuffer(outputLimit), done: make(chan struct{}), exitCode: -1, inputGate: make(chan struct{}, 1),
+		stdout: newStreamBuffer(outputLimit), stderr: newStreamBuffer(outputLimit), done: make(chan struct{}), retired: make(chan struct{}), exitCode: -1, inputGate: make(chan struct{}, 1),
 	}
 	mode := options.IOMode
 	if mode == "" {
@@ -235,6 +259,8 @@ func (m *Manager) Run(callContext context.Context, options Options) (Result, err
 
 	m.mu.Lock()
 	m.sessions[entry.id] = entry
+	m.startingCount--
+	reserved = false
 	m.workers.Add(3)
 	m.mu.Unlock()
 	go func() {
@@ -247,13 +273,16 @@ func (m *Manager) Run(callContext context.Context, options Options) (Result, err
 			m.remove(entry.id)
 		case <-m.ctx.Done():
 			m.remove(entry.id)
+		case <-entry.retired:
 		}
 	}()
 	go func() { defer m.workers.Done(); entry.watch(m.ctx, time.Duration(timeout)*time.Second) }()
 	// Cancellation must also reach a blocked initial stdin write.
 	initialDone := make(chan struct{})
+	initialWatcherDone := make(chan struct{})
 	go func() {
 		defer m.workers.Done()
+		defer close(initialWatcherDone)
 		select {
 		case <-callContext.Done():
 			entry.terminate(false)
@@ -262,7 +291,15 @@ func (m *Manager) Run(callContext context.Context, options Options) (Result, err
 		case <-initialDone:
 		}
 	}()
-	defer close(initialDone)
+	initialFinished := false
+	finishInitial := func() {
+		if !initialFinished {
+			close(initialDone)
+			initialFinished = true
+		}
+		<-initialWatcherDone
+	}
+	defer finishInitial()
 
 	if entry.stdin != nil && options.Stdin != "" {
 		if err := entry.writeStdin(callContext, options.Stdin); err != nil {
@@ -290,8 +327,12 @@ func (m *Manager) Run(callContext context.Context, options Options) (Result, err
 		if err := m.ctx.Err(); err != nil {
 			return Result{}, err
 		}
-		return entry.result(false), nil
+		return entry.result(false, OutputCursor{})
 	case <-timer.C:
+		// Retire the initial cancellation watcher before handing off a live
+		// session. A racing cancellation either finishes here and is reported
+		// below, or happens after the handoff and cannot kill the session.
+		finishInitial()
 		if err := callContext.Err(); err != nil {
 			entry.terminate(false)
 			<-entry.done
@@ -304,7 +345,11 @@ func (m *Manager) Run(callContext context.Context, options Options) (Result, err
 			m.remove(entry.id)
 			return Result{}, err
 		}
-		return entry.result(true), nil
+		result, err := entry.result(true, OutputCursor{})
+		if !result.Running || err != nil {
+			m.remove(entry.id)
+		}
+		return result, err
 	case <-callContext.Done():
 		entry.terminate(false)
 		<-entry.done
@@ -341,8 +386,23 @@ func (m *Manager) Continue(callContext context.Context, options ContinueOptions)
 	if entry == nil {
 		return Result{}, errors.New("process session was not found or has already been collected")
 	}
+	// Cursor errors must be rejected before any input or process control action.
+	if err := entry.validateCursor(options.OutputCursor); err != nil {
+		return Result{}, err
+	}
 	if options.Terminate && (options.Stdin != "" || options.CloseStdin || options.Columns != 0 || options.Rows != 0) {
 		return Result{}, errors.New("terminate cannot be combined with input or resize")
+	}
+	if options.CloseStdin && entry.terminal != nil {
+		return Result{}, errors.New("PTY input cannot be half-closed; terminate the session instead")
+	}
+	if options.Columns != 0 || options.Rows != 0 {
+		if entry.terminal == nil {
+			return Result{}, errors.New("columns and rows are only valid for PTY sessions")
+		}
+		if options.Columns < 1 || options.Columns > 1000 || options.Rows < 1 || options.Rows > 1000 {
+			return Result{}, errors.New("columns and rows must both be between 1 and 1000")
+		}
 	}
 	if options.Stdin != "" {
 		if err := entry.writeStdin(callContext, options.Stdin); err != nil {
@@ -355,12 +415,6 @@ func (m *Manager) Continue(callContext context.Context, options ContinueOptions)
 		}
 	}
 	if options.Columns != 0 || options.Rows != 0 {
-		if entry.terminal == nil {
-			return Result{}, errors.New("columns and rows are only valid for PTY sessions")
-		}
-		if options.Columns < 1 || options.Columns > 1000 || options.Rows < 1 || options.Rows > 1000 {
-			return Result{}, errors.New("columns and rows must both be between 1 and 1000")
-		}
 		entry.terminalMu.Lock()
 		if entry.terminalClosed {
 			entry.terminalMu.Unlock()
@@ -380,10 +434,9 @@ func (m *Manager) Continue(callContext context.Context, options ContinueOptions)
 	defer timer.Stop()
 	select {
 	case <-entry.done:
-		m.remove(entry.id)
-		return entry.result(false), nil
+		return entry.result(false, options.OutputCursor)
 	case <-timer.C:
-		return entry.result(true), nil
+		return entry.result(true, options.OutputCursor)
 	case <-callContext.Done():
 		return Result{}, callContext.Err()
 	case <-m.ctx.Done():
@@ -391,10 +444,45 @@ func (m *Manager) Continue(callContext context.Context, options ContinueOptions)
 	}
 }
 
+// evictCompletedLocked makes room for a new process without interrupting active
+// sessions. Completed asynchronous results otherwise remain available for retry.
+// The caller holds m.mu.
+func (m *Manager) evictCompletedLocked() bool {
+	var oldest *session
+	var oldestTime time.Time
+	for _, entry := range m.sessions {
+		select {
+		case <-entry.done:
+		default:
+			continue
+		}
+		entry.mu.Lock()
+		finished := entry.finished
+		entry.mu.Unlock()
+		if oldest == nil || finished.Before(oldestTime) || (finished.Equal(oldestTime) && entry.id < oldest.id) {
+			oldest, oldestTime = entry, finished
+		}
+	}
+	if oldest == nil {
+		return false
+	}
+	m.removeLocked(oldest.id)
+	return true
+}
+
 func (m *Manager) remove(id string) {
 	m.mu.Lock()
-	delete(m.sessions, id)
+	m.removeLocked(id)
 	m.mu.Unlock()
+}
+
+func (m *Manager) removeLocked(id string) {
+	if entry := m.sessions[id]; entry != nil {
+		delete(m.sessions, id)
+		if entry.retired != nil {
+			close(entry.retired)
+		}
+	}
 }
 
 // Close stops admission, terminates process trees, and joins process/output workers.
@@ -551,7 +639,17 @@ func (s *session) writeStdin(ctx context.Context, text string) error {
 	}
 }
 
-func (s *session) result(running bool) Result {
+func (s *session) validateCursor(cursor OutputCursor) error {
+	if err := s.stdout.validateCursor(cursor.Stdout); err != nil {
+		return fmt.Errorf("stdout output cursor: %w", err)
+	}
+	if err := s.stderr.validateCursor(cursor.Stderr); err != nil {
+		return fmt.Errorf("stderr output cursor: %w", err)
+	}
+	return nil
+}
+
+func (s *session) result(running bool, cursor OutputCursor) (Result, error) {
 	s.resultMu.Lock()
 	defer s.resultMu.Unlock()
 	select {
@@ -559,8 +657,14 @@ func (s *session) result(running bool) Result {
 		running = false
 	default:
 	}
-	stdout, stdoutTruncated := s.stdout.Drain()
-	stderr, stderrTruncated := s.stderr.Drain()
+	stdout, stdoutOffset, stdoutNext, stdoutTruncated, err := s.stdout.Read(cursor.Stdout, !running)
+	if err != nil {
+		return Result{}, fmt.Errorf("stdout output cursor: %w", err)
+	}
+	stderr, stderrOffset, stderrNext, stderrTruncated, err := s.stderr.Read(cursor.Stderr, !running)
+	if err != nil {
+		return Result{}, fmt.Errorf("stderr output cursor: %w", err)
+	}
 	s.mu.Lock()
 	exitCode, timedOut := s.exitCode, s.timedOut
 	finished := s.finished
@@ -571,12 +675,13 @@ func (s *session) result(running bool) Result {
 	result := Result{
 		Running: running, Program: s.program, Args: append([]string(nil), s.args...), Directory: s.directory,
 		ExitCode: exitCode, Stdout: stdout, Stderr: stderr, StdoutTruncated: stdoutTruncated,
+		OutputCursor: OutputCursor{Stdout: stdoutNext, Stderr: stderrNext}, StdoutOffset: stdoutOffset, StderrOffset: stderrOffset,
 		StderrTruncated: stderrTruncated, DurationMS: finished.Sub(s.started).Milliseconds(), TimedOut: timedOut, IOMode: s.ioMode,
 	}
 	if running {
 		result.SessionID = s.id
 	}
-	return result
+	return result, nil
 }
 
 func validateOptions(options Options) (string, int, int, int, error) {
@@ -738,10 +843,10 @@ func newSessionID() string {
 }
 
 type streamBuffer struct {
-	mu        sync.Mutex
-	data      []byte
-	limit     int
-	truncated bool
+	mu    sync.Mutex
+	data  []byte
+	limit int
+	total int64
 }
 
 func newStreamBuffer(limit int) *streamBuffer {
@@ -751,27 +856,84 @@ func newStreamBuffer(limit int) *streamBuffer {
 func (b *streamBuffer) Write(data []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.total += int64(len(data))
 	if len(data) >= b.limit {
 		b.data = append(b.data[:0], data[len(data)-b.limit:]...)
-		b.truncated = true
 		return len(data), nil
 	}
 	if overflow := len(b.data) + len(data) - b.limit; overflow > 0 {
 		copy(b.data, b.data[overflow:])
 		b.data = b.data[:len(b.data)-overflow]
-		b.truncated = true
 	}
 	b.data = append(b.data, data...)
 	return len(data), nil
 }
 
-func (b *streamBuffer) Drain() (string, bool) {
+func (b *streamBuffer) validateCursor(cursor int64) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	value, truncated := string(b.data), b.truncated
-	b.data = b.data[:0]
-	b.truncated = false
-	return value, truncated
+	return b.checkCursor(cursor)
+}
+
+func (b *streamBuffer) checkCursor(cursor int64) error {
+	if cursor < 0 {
+		return errors.New("cannot be negative")
+	}
+	if cursor > b.total {
+		return errors.New("exceeds produced output")
+	}
+	return nil
+}
+
+// Read returns a retained suffix without consuming it. Offsets count original
+// stream bytes, so a cursor behind the bounded tail reports the exact gap.
+func (b *streamBuffer) Read(cursor int64, complete bool) (value string, start, next int64, truncated bool, err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err = b.checkCursor(cursor); err != nil {
+		return
+	}
+	head := b.total - int64(len(b.data))
+	index := int(max(cursor, head) - head)
+	// A bounded tail may begin in a rune whose leading byte was discarded.
+	// Explicit cursors can also point inside an otherwise retained rune.
+	if index < len(b.data) && !utf8.RuneStart(b.data[index]) {
+		leading := 0
+		if head > 0 {
+			for leading < len(b.data) && !utf8.RuneStart(b.data[leading]) {
+				leading++
+			}
+		}
+		if index < leading {
+			index = leading
+		} else {
+			for previous := max(0, index-utf8.UTFMax+1); previous < index; previous++ {
+				if !utf8.RuneStart(b.data[previous]) {
+					continue
+				}
+				_, width := utf8.DecodeRune(b.data[previous:])
+				if width > 1 && previous+width > index {
+					index = previous + width
+					break
+				}
+			}
+		}
+	}
+	end := len(b.data)
+	if !complete {
+		// FullRune distinguishes a valid unfinished prefix from invalid bytes,
+		// which keep the usual JSON replacement behavior instead of waiting.
+		for last := max(0, end-utf8.UTFMax+1); last < end; last++ {
+			if utf8.RuneStart(b.data[last]) && !utf8.FullRune(b.data[last:]) {
+				end = max(index, last)
+				break
+			}
+		}
+	}
+	start, next = head+int64(index), head+int64(end)
+	truncated = cursor < start
+	value = string(b.data[index:end])
+	return
 }
 
 var _ io.Writer = (*streamBuffer)(nil)

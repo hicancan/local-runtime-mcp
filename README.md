@@ -130,20 +130,26 @@ flowchart TB
     Launch --> Sessions[Independent process sessions]
     Sessions --> Continue[process_continue · session_id]
     Continue --> Input[Serialized stdin + PTY resize]
-    Continue --> Output[Coordinated output drain + wait]
+    Continue --> Output[Bounded output · cursor read + wait]
+    Output --> Cursor[Received output_cursor → next read]
+    Sessions --> Retain[Completed async result · up to 10 minutes]
     Continue --> Stop[Independent terminate path]
 ```
 
 - `process_run` accepts `program`, argument array, working directory, environment overrides, initial stdin, execution timeout, output limits, and pipe or PTY I/O.
-- `process_continue` reads incremental output, writes stdin, closes pipe input, resizes a PTY, waits, or terminates a managed session.
+- `process_continue` reads retained output from explicit byte offsets, writes stdin, closes pipe input, resizes a PTY, waits, or terminates a managed session.
 
 Bare program names use the merged child `PATH` in both I/O modes; Windows also uses `PATHEXT`. Explicit relative executable paths resolve against the requested working directory. To execute shell syntax, launch the desired shell explicitly with its arguments.
 
-Different sessions run concurrently. Within one session, input writes are serialized and each result drains stdout and stderr together. Waiting for output leaves termination available, including when stdin is blocked. Output and queued input are bounded; a single stdin payload is limited to 16 MiB.
+Different sessions run concurrently. Within one session, input writes are serialized and output reads preserve the bounded stdout and stderr buffers. Waiting for output leaves termination available, including when stdin is blocked. Output and queued input are bounded; a single stdin payload is limited to 16 MiB.
+
+Each result includes `output_cursor: {stdout, stderr}` with the next byte offsets. Pass the last successfully received cursor to `process_continue` to collect only new output. Omitting the cursor starts at zero and rereads the retained output. The returned `stdout_offset` and `stderr_offset` identify the actual start of each stream; a truncation flag indicates that the requested prefix has aged out of its buffer. Completed asynchronous sessions remain readable for up to ten minutes. Under capacity pressure, the oldest completed session makes room for a new process; active sessions keep their place.
+
+If a pure-read response is lost, repeat `process_continue` with the same `session_id` and cursor. The response can include output produced since the previous attempt. Advance the cursor and append output only after receiving a successful result. Calls that start a process or change stdin, PTY size, or process lifetime require checking the resource before retrying after an uncertain response. A lost initial launch response may leave the client without a session ID.
 
 `duration_ms` is elapsed process time while the program runs and its fixed lifetime after exit. Collecting a completed session later leaves that duration unchanged.
 
-Cancellation before `process_run` returns a live session terminates and collects that process. Cancellation of `process_continue` stops that call's wait; use `terminate=true` to end the session. Execution timeout and Host shutdown terminate managed processes independently of the MCP request deadline.
+Cancellation delivered to `process_run` before it returns a live session terminates and collects that process. Cancellation delivered to `process_continue` stops that call's wait; use `terminate=true` to end the session. HTTP disconnect cancellation follows the negotiated MCP protocol: SDK request-context propagation applies to protocol `2026-07-28` and newer; older stateless requests may finish their bounded wait after the client disconnects. Execution timeout and Host shutdown terminate managed processes independently of the MCP request deadline.
 
 ### Filesystem · 6 tools
 
@@ -280,7 +286,7 @@ Browser operations that change the visible desktop coordinate with Computer cont
 
 | Resource | Coordination |
 | --- | --- |
-| Process | Independent sessions; ordered input and coherent output per session. |
+| Process | Independent sessions; ordered input and replayable cursor reads within retained output. |
 | Filesystem | Parallel reads and different paths; serialized version-checked commits on one path. |
 | Image | Independent reads within bounded memory and execution capacity. |
 | Browser | Explicit instance/tab routing; parallel tabs with FIFO execution per tab. |
@@ -289,6 +295,8 @@ Browser operations that change the visible desktop coordinate with Computer cont
 For two AI conversations, each can select a different browser instance and open its own background tab. Both can run independent process sessions while one workflow owns desktop input. If both choose the same tab, file, repository, or cloud account, they intentionally share that resource.
 
 Request cancellation is distinct from process execution timeout and Host shutdown. A failed or expired call retains other resources. When a side effect may already have occurred, observe the target before retrying a non-idempotent action.
+
+Transport recovery tests cover failed requests before response headers, incomplete response bodies, protocol-specific cancellation, and transient tunnel poll and response-delivery errors. A surviving peer client and a newly connected client must remain usable after an individual failure. A cloud connection error alone identifies neither the failing hop nor whether the tool executed; diagnosis uses the individual tool name, machine time, and provider logs. Keep credentials and tool payloads private when sharing those logs.
 
 The [two-conversation acceptance prompts](docs/concurrency-acceptance.zh-CN.md) exercise idle browser connectivity, independent process output, explicit profile routing, and desktop ownership through a configured ChatGPT connection.
 

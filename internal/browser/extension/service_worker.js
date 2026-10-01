@@ -1,7 +1,7 @@
 import { packagedConfig } from './runtime_config.js';
 import { LaneScheduler } from './scheduler.js';
 import { commandStream } from './connection.js';
-const VERSION = '10.0.1';
+const VERSION = '11.0.0';
 const attachedTabs = new Set();
 const childSessions = new Map();
 const dialogWaiters = new Map();

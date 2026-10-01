@@ -34,7 +34,7 @@ External MCP clients and tunnel providers may process request content and connec
 | `local-runtime-mcp.yaml` beside the executable | Persistent connection settings and browser, HTTP, OpenAI, or Cloudflare credentials selected by the operator. |
 | Unpacked extension directory | Packaged loopback bridge address and token written by browser setup. |
 | Each profile's extension storage | Bridge settings, readable profile label, and stable extension instance UUID. The operator can remove them by resetting or uninstalling that profile's extension. |
-| Process memory | Bounded output and active session state; completed, uncollected sessions expire after ten minutes. Host shutdown cleans up owned processes. |
+| Process memory | Bounded output and active session state. Completed asynchronous sessions remain readable for up to ten minutes; capacity pressure evicts the oldest completed session. Synchronous completed results are collected immediately. Host shutdown cleans up owned processes and in-memory output. |
 | Bridge and extension memory | Bounded pending commands, connection generations, tab handles, page epochs, retained references, and screenshot identities. Extension restart invalidates prior observation handles. |
 | Computer memory | Control token, task label, expiry, actionable state IDs, UIA references, and current operation state. Release, idle expiry, local Stop, and shutdown clear actionable control state. |
 | Runtime-only OpenAI state | Private loopback port and freshly generated private-hop credential held in memory, discarded with that invocation. |

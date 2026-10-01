@@ -120,7 +120,7 @@ func TestHTTPProcessSessionsOverlapAndDurationExcludesCollectionDelay(t *testing
 	for index, client := range clients {
 		go func(index int, client *mcp.ClientSession) {
 			completed, err := callProcessTool(ctx, client, "process_continue", map[string]any{
-				"session_id": started[index].result.SessionID, "yield_time_ms": 1000,
+				"session_id": started[index].result.SessionID, "output_cursor": started[index].result.OutputCursor, "yield_time_ms": 1000,
 			})
 			launches <- launch{index: index, result: completed, err: err}
 		}(index, client)

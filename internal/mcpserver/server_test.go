@@ -54,8 +54,10 @@ func TestToolCatalogAndIdentity(t *testing.T) {
 		"computer_control": {false, false, false, false},
 	}
 	type propertySchema struct {
-		Enum []string `json:"enum"`
-		Type any      `json:"type"`
+		Enum       []string                  `json:"enum"`
+		Type       any                       `json:"type"`
+		Properties map[string]propertySchema `json:"properties"`
+		Required   []string                  `json:"required"`
 	}
 	schemas := make(map[string]map[string]propertySchema, len(expected))
 	required := make(map[string][]string, len(expected))
@@ -120,6 +122,50 @@ func TestToolCatalogAndIdentity(t *testing.T) {
 	}
 	if _, ok := schemas["filesystem_write_text"]["create_parents"]; !ok {
 		t.Fatal("filesystem_write_text is missing explicit create_parents")
+	}
+	cursorSchema, ok := schemas["process_continue"]["output_cursor"]
+	if !ok {
+		t.Fatal("process_continue is missing its explicit output cursor")
+	}
+	for _, field := range required["process_continue"] {
+		if field == "output_cursor" {
+			t.Fatal("output_cursor must be optional for an initial reread")
+		}
+	}
+	for _, field := range []string{"stdout", "stderr"} {
+		if cursorSchema.Properties[field].Type != "integer" {
+			t.Fatalf("output_cursor.%s must use integer byte offsets", field)
+		}
+		found := false
+		for _, name := range cursorSchema.Required {
+			found = found || name == field
+		}
+		if !found {
+			t.Fatalf("an explicit output_cursor must contain %s", field)
+		}
+	}
+	for _, registered := range listed.Tools {
+		if registered.Name != "process_run" && registered.Name != "process_continue" {
+			continue
+		}
+		data, err := json.Marshal(registered.OutputSchema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var schema struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+		}
+		if err := json.Unmarshal(data, &schema); err != nil {
+			t.Fatal(err)
+		}
+		for _, field := range []string{"output_cursor", "stdout_offset", "stderr_offset"} {
+			if _, ok := schema.Properties[field]; !ok {
+				t.Fatalf("%s result is missing %s", registered.Name, field)
+			}
+		}
+	}
+	if !strings.Contains(initialized.Instructions, "last successfully received output_cursor") || !strings.Contains(initialized.Instructions, "Do not automatically repeat process_run") {
+		t.Fatal("server instructions must explain cursor collection and uncertain side effects")
 	}
 	if _, ok := schemas["computer_action"]["element_ref"]; !ok {
 		t.Fatal("computer_action is missing UI Automation element_ref")

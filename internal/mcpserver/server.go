@@ -13,9 +13,9 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const Version = "10.0.1"
+const Version = "11.0.0"
 
-const instructions = "Local Runtime MCP exposes the machine where lrmcp is running. Filesystem and image tools accept direct absolute paths or paths relative to the server process. Create new text paths with mode=create; replace or patch only an expected SHA-256 version. Process tools execute installed programs directly without shell parsing and return independent sessions for longer programs. Process duration_ms is elapsed time while running and fixed after exit. Browser tools use the bundled Chromium extension: discover online instances with browser_status, select their browser_id for tabs/open, and use the returned opaque tab_id for all existing-tab operations. Read page content with browser_snapshot. New tabs are inactive by default. Computer tools operate one shared interactive desktop: acquire computer_control, retain its control_id, observe an actionable computer_state, act using that exact state_id, and release control when finished. Tokenless desktop observations are read-only. Visible browser changes share the desktop gate and require the matching control_id while another task owns it. Independent process sessions, file paths, and background browser tabs can run concurrently; IDs route resources, not separate operating-system desktops or security tenants. Prefer browser tools for web pages, computer tools for native UI, and native image-content tools for images and screenshots. Source code is available under AGPL-3.0-only at https://github.com/hicancan/local-runtime-mcp."
+const instructions = "Local Runtime MCP exposes the machine where lrmcp is running. Filesystem and image tools accept direct absolute paths or paths relative to the server process. Create new text paths with mode=create; replace or patch only an expected SHA-256 version. Process tools execute installed programs directly without shell parsing and return independent sessions for longer programs. Pass the last successfully received output_cursor to process_continue for incremental output. Omit it or use zero to reread the retained output; reads do not consume data. After a lost response, retry a read-only continue using the same cursor. Do not automatically repeat process_run, stdin, resize, or terminate after an uncertain response. Completed async sessions remain readable for up to ten minutes, subject to session capacity. Process duration_ms is elapsed time while running and fixed after exit. Browser tools use the bundled Chromium extension: discover online instances with browser_status, select their browser_id for tabs/open, and use the returned opaque tab_id for all existing-tab operations. Read page content with browser_snapshot. New tabs are inactive by default. Computer tools operate one shared interactive desktop: acquire computer_control, retain its control_id, observe an actionable computer_state, act using that exact state_id, and release control when finished. Tokenless desktop observations are read-only. Visible browser changes share the desktop gate and require the matching control_id while another task owns it. Independent process sessions, file paths, and background browser tabs can run concurrently; IDs route resources, not separate operating-system desktops or security tenants. Prefer browser tools for web pages, computer tools for native UI, and native image-content tools for images and screenshots. Source code is available under AGPL-3.0-only at https://github.com/hicancan/local-runtime-mcp."
 
 // Dependencies are owned by the Runtime Host, never by a client connection.
 type Dependencies struct {
@@ -46,7 +46,7 @@ func New(deps Dependencies) *mcp.Server {
 		schema.Properties["io_mode"].Enum = enum("pipe", "pty")
 	})
 	mcp.AddTool(server, processRunTool, processRun(deps.Process))
-	mcp.AddTool(server, tool("process_continue", "Continue process", "Read incremental output, write or close pipe stdin, resize a PTY, wait for, or terminate a process session.", false, true, false, true), processContinue(deps.Process))
+	mcp.AddTool(server, tool("process_continue", "Continue process", "Read retained output from output_cursor, write or close pipe stdin, resize a PTY, wait for, or terminate a process session. Pure reads with the same cursor can be retried; advance the cursor only after receiving a result.", false, true, false, true), processContinue(deps.Process))
 
 	registerBrowserTools(server, deps.Browser)
 	registerComputerTools(server, deps.Computer)
@@ -214,19 +214,20 @@ func processRun(manager *runtimeprocess.Manager) func(context.Context, *mcp.Call
 }
 
 type processContinueInput struct {
-	SessionID   string `json:"session_id" jsonschema:"process session ID returned by process_run"`
-	Stdin       string `json:"stdin,omitempty" jsonschema:"additional text written to the open process stdin"`
-	CloseStdin  bool   `json:"close_stdin,omitempty" jsonschema:"close the process stdin after writing"`
-	Terminate   bool   `json:"terminate,omitempty" jsonschema:"terminate the complete process tree"`
-	YieldTimeMS int    `json:"yield_time_ms,omitempty" jsonschema:"wait for output or exit from 1 to 60000 milliseconds; defaults to 1000"`
-	Columns     int    `json:"columns,omitempty" jsonschema:"new PTY width from 1 to 1000; requires rows"`
-	Rows        int    `json:"rows,omitempty" jsonschema:"new PTY height from 1 to 1000; requires columns"`
+	SessionID    string                      `json:"session_id" jsonschema:"process session ID returned by process_run"`
+	OutputCursor runtimeprocess.OutputCursor `json:"output_cursor,omitempty" jsonschema:"stdout and stderr byte offsets from the last successfully received result; omitted or zero rereads retained output; reuse the same cursor after a lost pure-read response"`
+	Stdin        string                      `json:"stdin,omitempty" jsonschema:"additional text written to the open process stdin; do not automatically replay after a lost response"`
+	CloseStdin   bool                        `json:"close_stdin,omitempty" jsonschema:"close the process stdin after writing"`
+	Terminate    bool                        `json:"terminate,omitempty" jsonschema:"terminate the complete process tree"`
+	YieldTimeMS  int                         `json:"yield_time_ms,omitempty" jsonschema:"wait for output or exit from 1 to 60000 milliseconds; defaults to 1000"`
+	Columns      int                         `json:"columns,omitempty" jsonschema:"new PTY width from 1 to 1000; requires rows"`
+	Rows         int                         `json:"rows,omitempty" jsonschema:"new PTY height from 1 to 1000; requires columns"`
 }
 
 func processContinue(manager *runtimeprocess.Manager) func(context.Context, *mcp.CallToolRequest, processContinueInput) (*mcp.CallToolResult, runtimeprocess.Result, error) {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in processContinueInput) (*mcp.CallToolResult, runtimeprocess.Result, error) {
 		result, err := manager.Continue(ctx, runtimeprocess.ContinueOptions{
-			SessionID: in.SessionID, Stdin: in.Stdin, CloseStdin: in.CloseStdin, Terminate: in.Terminate, YieldTimeMS: in.YieldTimeMS, Columns: in.Columns, Rows: in.Rows,
+			SessionID: in.SessionID, OutputCursor: in.OutputCursor, Stdin: in.Stdin, CloseStdin: in.CloseStdin, Terminate: in.Terminate, YieldTimeMS: in.YieldTimeMS, Columns: in.Columns, Rows: in.Rows,
 		})
 		if err != nil {
 			return nil, result, fmt.Errorf("continue process: %w", err)

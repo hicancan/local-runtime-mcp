@@ -99,7 +99,7 @@ func TestExecutableStdio(t *testing.T) {
 	waitForProcessHelperFile(t, ctx, filepath.Join(command.Dir, "release.done"), &helperTiming)
 	time.Sleep(2 * time.Second)
 	var collectedHelper runtimeprocess.Result
-	call("process_continue", map[string]any{"session_id": runningHelper.SessionID, "yield_time_ms": 1000}, &collectedHelper)
+	call("process_continue", map[string]any{"session_id": runningHelper.SessionID, "output_cursor": runningHelper.OutputCursor, "yield_time_ms": 1000}, &collectedHelper)
 	upperBound := time.Unix(0, helperTiming.FinishedNS).Sub(requested).Milliseconds() + 1000
 	if collectedHelper.Running || collectedHelper.ExitCode != 0 || collectedHelper.DurationMS > upperBound {
 		t.Fatalf("executable duration includes collection delay: result=%+v upper_bound=%dms", collectedHelper, upperBound)

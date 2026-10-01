@@ -11,10 +11,12 @@
 
 控制权申请会显示本地提示层；以下测试保持页面和文件只读，不产生桌面鼠标、键盘输入。控制 token 仅用于工具参数，报告中应隐去。
 
+v11 通过 `output_cursor` 读取进程增量输出。只在成功收到结果后推进游标；纯读取失败时使用同一游标重试，避免漏读或重复拼接。已完成的异步会话在保留期内也可以重读。首次启动、stdin 输入与其他有副作用请求的结果不确定时，先检查资源状态。
+
 ## 会话 A 提示词
 
 ```text
-你是会话 A。请实测 Local Runtime MCP 的双会话并发，另一个会话 B 同时测试。只使用这个 MCP，以当前公开工具 schema 为准。完整执行后报告证据。
+你是会话 A。请实测 Local Runtime MCP 的双会话并发，另一个会话 B 同时测试。只使用这个 MCP，以当前公开工具 schema 为准。各工具单独调用，以便明确异常对应的工具和时间。完整执行后报告证据。
 
 约束：不修改任何文件；不调用 browser_open、browser_close、browser_navigate、browser_action、browser_screenshot 或 computer_action；不用其他工具、MCP、调试窗口或 JavaScript 探针。只收集和清理自己创建的 process session、自己取得的 control_id。不要在回复中公开 control_id、配置凭据或私密页面内容。
 
@@ -25,9 +27,9 @@
 3. 用 process_run 启动自己的 120 秒进程：
    program="pwsh.exe", io_mode="pipe", yield_time_ms=1000, timeout_seconds=240,
    args=["-NoProfile","-Command","$ErrorActionPreference='Stop'; 1..120 | ForEach-Object { Write-Output ('GPT-A tick={0} time={1}' -f $_,(Get-Date -Format o)); Start-Sleep -Seconds 1 }"]。
-   保存自己的 session_id 与第一条 tick 时间；在后续调用中只能使用这个 session_id。
+   保存自己的 session_id、首次结果的 output_cursor 与第一条 tick 时间；在后续调用中只能使用这个 session_id。
 
-4. 前 90 秒是浏览器空闲观察阶段：只调用 browser_status，以及 process_continue(session_id=自己的ID, yield_time_ms=10000) 推进等待并收集 tick。先调用 browser_status，再交替执行一次 continue 和一次 status。以 tick 的机器时间和首条时间的差判断是否已过 90 秒，不能只按调用次数计时。不要调用 browser_tabs、browser_snapshot，也不要做任何会建立 debugger 会话的操作。
+4. 前 90 秒是浏览器空闲观察阶段：只调用 browser_status，以及 process_continue(session_id=自己的ID, output_cursor=最后成功结果的游标, yield_time_ms=10000) 推进等待并收集 tick。成功时才拼接本次输出并推进游标；纯读失败可用同一游标重试一次，记录原错误和单个工具名称，不重启或重发 process_run。先调用 browser_status，再交替执行一次 continue 和一次 status。以 tick 的机器时间和首条时间的差判断是否已过 90 秒，不能只按调用次数计时。不要调用 browser_tabs、browser_snapshot，也不要做任何会建立 debugger 会话的操作。
    每次记录选定实例的 connected、last_seen，以及本次最新 tick 时间。检查 last_seen 是否持续推进；若失联，保留前后证据并继续其他项目。status 本身只读取 Host 状态，不是扩展心跳来源。
 
 5. 空闲窗口达到至少 90 秒后：
@@ -38,7 +40,7 @@
    - 调用 computer_targets，再对已有目标调用 computer_state，省略 control_id，验证只读 actionable=false、state_id 为空。不要激活窗口或输入。
    - 再次调用 browser_status，记录选定实例连接状态及 last_seen。
 
-6. 继续采集自己 120 秒进程，直到 running=false。合并所有增量输出，检查 tick 1..120 是否完整、是否只有 GPT-A 标记。记录首尾机器时间、最终 duration_ms、exit_code、stderr、timed_out，以及实际采集时间。duration_ms 是进程运行时长，不是你完成全部工具调用的耗时；较晚采集完成结果时也应约为 120 秒，调度可能造成少量偏差。
+6. 继续按最后成功结果的 output_cursor 采集自己 120 秒进程，直到 running=false。合并所有成功读取的增量输出，检查 tick 1..120 是否完整、是否只有 GPT-A 标记。记录首尾机器时间、最终 duration_ms、exit_code、stderr、timed_out、截断标志与实际采集时间。随后用最终游标做一次纯读，确认退出状态仍可读取且没有新输出；该结果不再拼接。duration_ms 是进程运行时长，不是你完成全部工具调用的耗时；较晚采集完成结果时也应约为 120 秒，调度可能造成少量偏差。
 
 7. finally：成功取得控制权才用自己的 control_id release，并查询 status 确认清理结果；不释放任何其他 token。遇到异常时，对自己仍运行的测试进程使用 process_continue(terminate=true)，并记录清理结果。短进程若也返回 session_id，同样只清理自己的。
 
@@ -49,7 +51,7 @@
 ## 会话 B 提示词
 
 ```text
-你是会话 B。请实测 Local Runtime MCP 的双会话并发，另一个会话 A 同时测试。只使用这个 MCP，以当前公开工具 schema 为准。完整执行后报告证据。
+你是会话 B。请实测 Local Runtime MCP 的双会话并发，另一个会话 A 同时测试。只使用这个 MCP，以当前公开工具 schema 为准。各工具单独调用，以便明确异常对应的工具和时间。完整执行后报告证据。
 
 约束：不修改任何文件；不调用 browser_open、browser_close、browser_navigate、browser_action、browser_screenshot 或 computer_action；不用其他工具、MCP、调试窗口或 JavaScript 探针。只收集和清理自己创建的 process session、自己取得的 control_id。不要在回复中公开 control_id、配置凭据或私密页面内容。
 
@@ -60,9 +62,9 @@
 3. 用 process_run 启动自己的 120 秒进程：
    program="pwsh.exe", io_mode="pipe", yield_time_ms=1000, timeout_seconds=240,
    args=["-NoProfile","-Command","$ErrorActionPreference='Stop'; 1..120 | ForEach-Object { Write-Output ('GPT-B tick={0} time={1}' -f $_,(Get-Date -Format o)); Start-Sleep -Seconds 1 }"]。
-   保存自己的 session_id 与第一条 tick 时间；在后续调用中只能使用这个 session_id。
+   保存自己的 session_id、首次结果的 output_cursor 与第一条 tick 时间；在后续调用中只能使用这个 session_id。
 
-4. 前 90 秒是浏览器空闲观察阶段：只调用 browser_status，以及 process_continue(session_id=自己的ID, yield_time_ms=10000) 推进等待并收集 tick。先调用 browser_status，再交替执行一次 continue 和一次 status。以 tick 的机器时间和首条时间的差判断是否已过 90 秒，不能只按调用次数计时。不要调用 browser_tabs、browser_snapshot，也不要做任何会建立 debugger 会话的操作。
+4. 前 90 秒是浏览器空闲观察阶段：只调用 browser_status，以及 process_continue(session_id=自己的ID, output_cursor=最后成功结果的游标, yield_time_ms=10000) 推进等待并收集 tick。成功时才拼接本次输出并推进游标；纯读失败可用同一游标重试一次，记录原错误和单个工具名称，不重启或重发 process_run。先调用 browser_status，再交替执行一次 continue 和一次 status。以 tick 的机器时间和首条时间的差判断是否已过 90 秒，不能只按调用次数计时。不要调用 browser_tabs、browser_snapshot，也不要做任何会建立 debugger 会话的操作。
    每次记录选定实例的 connected、last_seen，以及本次最新 tick 时间。没有选定实例时也记录 status 中在线实例的数量，继续进程等待。检查 last_seen 是否持续推进；若失联，保留前后证据并继续其他项目。status 本身只读取 Host 状态，不是扩展心跳来源。
 
 5. 空闲窗口达到至少 90 秒后：
@@ -73,7 +75,7 @@
    - 调用 computer_targets，再对已有目标调用 computer_state，省略 control_id，验证只读 actionable=false、state_id 为空。不要激活窗口或输入。
    - 再次调用 browser_status，记录选定实例连接状态及 last_seen。
 
-6. 继续采集自己 120 秒进程，直到 running=false。合并所有增量输出，检查 tick 1..120 是否完整、是否只有 GPT-B 标记。记录首尾机器时间、最终 duration_ms、exit_code、stderr、timed_out，以及实际采集时间。duration_ms 是进程运行时长，不是你完成全部工具调用的耗时；较晚采集完成结果时也应约为 120 秒，调度可能造成少量偏差。
+6. 继续按最后成功结果的 output_cursor 采集自己 120 秒进程，直到 running=false。合并所有成功读取的增量输出，检查 tick 1..120 是否完整、是否只有 GPT-B 标记。记录首尾机器时间、最终 duration_ms、exit_code、stderr、timed_out、截断标志与实际采集时间。随后用最终游标做一次纯读，确认退出状态仍可读取且没有新输出；该结果不再拼接。duration_ms 是进程运行时长，不是你完成全部工具调用的耗时；较晚采集完成结果时也应约为 120 秒，调度可能造成少量偏差。
 
 7. finally：成功取得控制权才用自己的 control_id release，并查询 status 确认清理结果；不释放任何其他 token。遇到异常时，对自己仍运行的测试进程使用 process_continue(terminate=true)，并记录清理结果。短进程若也返回 session_id，同样只清理自己的。
 
