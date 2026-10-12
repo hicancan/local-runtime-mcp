@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/hicancan/local-runtime-mcp/internal/oauth"
 	"gopkg.in/yaml.v3"
 )
 
@@ -27,6 +28,8 @@ const (
 	EnvHTTPListen            = EnvironmentPrefix + "HTTP_LISTEN"
 	EnvHTTPPublicHost        = EnvironmentPrefix + "HTTP_PUBLIC_HOST"
 	EnvHTTPBearerToken       = EnvironmentPrefix + "HTTP_BEARER_TOKEN"
+	EnvHTTPAuth              = EnvironmentPrefix + "HTTP_AUTH"
+	EnvOAuthOwnerToken       = EnvironmentPrefix + "OAUTH_OWNER_TOKEN"
 	EnvCloudflareTunnelToken = EnvironmentPrefix + "CLOUDFLARE_TUNNEL_TOKEN"
 	EnvCloudflared           = EnvironmentPrefix + "CLOUDFLARED"
 )
@@ -51,9 +54,11 @@ type OpenAI struct {
 }
 
 type HTTP struct {
-	Listen      string `yaml:"listen,omitempty"`
-	PublicHost  string `yaml:"public_host,omitempty"`
-	BearerToken string `yaml:"bearer_token,omitempty"`
+	Listen      string       `yaml:"listen,omitempty"`
+	PublicHost  string       `yaml:"public_host,omitempty"`
+	Auth        string       `yaml:"auth,omitempty"`
+	BearerToken string       `yaml:"bearer_token,omitempty"`
+	OAuth       oauth.Config `yaml:"oauth,omitempty"`
 }
 
 type Cloudflare struct {
@@ -71,6 +76,8 @@ type Overrides struct {
 	HTTPListen            string
 	HTTPPublicHost        string
 	HTTPBearerToken       string
+	HTTPAuth              string
+	OAuthOwnerToken       string
 	CloudflareTunnelToken string
 	Cloudflared           string
 }
@@ -78,7 +85,7 @@ type Overrides struct {
 func Default() *Config {
 	return &Config{
 		Browser: Browser{Listen: DefaultBrowser},
-		HTTP:    HTTP{Listen: DefaultHTTP},
+		HTTP:    HTTP{Listen: DefaultHTTP, Auth: "bearer"},
 	}
 }
 
@@ -104,9 +111,6 @@ func PathForExecutable(executable string) (string, error) {
 func Load(path string) (*Config, error) {
 	cfg, err := read(path)
 	if err != nil {
-		return nil, err
-	}
-	if err := validate(cfg); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -141,9 +145,6 @@ func Resolve(path string, overrides Overrides) (*Config, error) {
 	applyEnvironment(cfg, os.LookupEnv)
 	applyOverrides(cfg, overrides)
 	applyDefaults(cfg)
-	if err := validate(cfg); err != nil {
-		return nil, err
-	}
 	return cfg, nil
 }
 
@@ -152,9 +153,6 @@ func Save(path string, cfg *Config) (string, error) {
 		return "", errors.New("configuration cannot be nil")
 	}
 	applyDefaults(cfg)
-	if err := validate(cfg); err != nil {
-		return "", err
-	}
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return "", fmt.Errorf("encode configuration: %w", err)
@@ -204,6 +202,8 @@ func applyEnvironment(cfg *Config, lookup func(string) (string, bool)) {
 	assign(EnvHTTPListen, &cfg.HTTP.Listen)
 	assign(EnvHTTPPublicHost, &cfg.HTTP.PublicHost)
 	assign(EnvHTTPBearerToken, &cfg.HTTP.BearerToken)
+	assign(EnvHTTPAuth, &cfg.HTTP.Auth)
+	assign(EnvOAuthOwnerToken, &cfg.HTTP.OAuth.OwnerToken)
 	assign(EnvCloudflareTunnelToken, &cfg.Cloudflare.TunnelToken)
 	assign(EnvCloudflared, &cfg.Cloudflare.Binary)
 }
@@ -221,6 +221,8 @@ func applyOverrides(cfg *Config, overrides Overrides) {
 	assign(overrides.HTTPListen, &cfg.HTTP.Listen)
 	assign(overrides.HTTPPublicHost, &cfg.HTTP.PublicHost)
 	assign(overrides.HTTPBearerToken, &cfg.HTTP.BearerToken)
+	assign(overrides.HTTPAuth, &cfg.HTTP.Auth)
+	assign(overrides.OAuthOwnerToken, &cfg.HTTP.OAuth.OwnerToken)
 	assign(overrides.CloudflareTunnelToken, &cfg.Cloudflare.TunnelToken)
 	assign(overrides.Cloudflared, &cfg.Cloudflare.Binary)
 }
@@ -232,20 +234,25 @@ func applyDefaults(cfg *Config) {
 	if cfg.HTTP.Listen == "" {
 		cfg.HTTP.Listen = DefaultHTTP
 	}
+	if cfg.HTTP.Auth == "" {
+		cfg.HTTP.Auth = "bearer"
+	}
 }
 
-func validate(cfg *Config) error {
-	if err := validateLoopback("browser", cfg.Browser.Listen); err != nil {
+// ValidateBrowser validates the machine component when it is started. Optional
+// connection settings are validated by the selected connection, not by parsing.
+func ValidateBrowser(cfg Browser) error {
+	if cfg.Token == "" {
+		return nil
+	}
+	if cfg.Listen == "" {
+		cfg.Listen = DefaultBrowser
+	}
+	if err := validateLoopback("browser", cfg.Listen); err != nil {
 		return err
 	}
-	if err := validateLoopback("HTTP", cfg.HTTP.Listen); err != nil {
-		return err
-	}
-	if cfg.Browser.Token != "" && len(cfg.Browser.Token) < 32 {
+	if cfg.Token != "" && len(cfg.Token) < 32 {
 		return errors.New("browser token must contain at least 32 characters")
-	}
-	if cfg.HTTP.BearerToken != "" && len(cfg.HTTP.BearerToken) < 32 {
-		return errors.New("HTTP bearer token must contain at least 32 characters")
 	}
 	return nil
 }

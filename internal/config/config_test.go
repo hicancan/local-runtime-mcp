@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -75,11 +76,9 @@ func TestResolveValidatesFinalValues(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsUnknownAndUnsafeConfiguration(t *testing.T) {
+func TestLoadRejectsUnknownConfiguration(t *testing.T) {
 	for name, content := range map[string]string{
 		"unknown": "workspace: .\n",
-		"browser": "browser:\n  listen: 0.0.0.0:9315\n",
-		"http":    "http:\n  listen: 0.0.0.0:9316\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), FileName)
@@ -115,7 +114,7 @@ func TestSaveRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if *got != *want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("round trip = %+v, want %+v", got, want)
 	}
 }

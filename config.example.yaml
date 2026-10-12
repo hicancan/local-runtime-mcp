@@ -1,3 +1,7 @@
+## Copy this file to local-runtime-mcp.yaml beside lrmcp.
+## Choose entry points explicitly, for example:
+## lrmcp serve --transport http --tunnel openai --tunnel cloudflare
+
 browser:
   listen: 127.0.0.1:9315
   token: "replace-with-a-random-token-of-at-least-32-characters"
@@ -9,7 +13,18 @@ openai:
 http:
   listen: 127.0.0.1:9316
   public_host: mcp.example.com
+  auth: bearer
   bearer_token: "replace-with-a-random-token-of-at-least-32-characters"
+  # For an OAuth client, run:
+  # lrmcp setup oauth --client-name gemini --redirect-uri "https://client.example.com/callback"
+  # Setup selects auth: oauth and creates owner_token plus registered clients.
+  # oauth:
+  #   owner_token: "generated-owner-approval-key"
+  #   clients:
+  #     - client_id: gemini
+  #       client_secret: "generated-client-secret"
+  #       redirect_uris:
+  #         - "https://client.example.com/callback"
 
 cloudflare:
   tunnel_token: "replace-with-your-cloudflare-managed-tunnel-token"

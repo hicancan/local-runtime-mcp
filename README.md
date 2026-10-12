@@ -9,30 +9,33 @@
 
 Give AI clients the programs, files, images, browser profiles, and desktop of the machine running `lrmcp`. Local Runtime MCP is a portable host-access runtime with **21 MCP tools across five capability domains**.
 
-Use it locally over stdio or Streamable HTTP, or connect a remote client through OpenAI Secure MCP Tunnel or Cloudflare Tunnel. Independent process sessions and browser tabs run concurrently; shared files and desktop input have explicit coordination rules.
+Connect locally over stdio or Streamable HTTP, or remotely through OpenAI Secure MCP Tunnel and Cloudflare Tunnel. One running instance can expose both tunnels at once, with one set of process sessions, browser instances, and desktop control. Independent process sessions and browser tabs run concurrently; shared files and desktop input have explicit coordination rules.
 
 - **Native multimodal results.** Files, browser pages, and desktop observations return text and MCP image content directly.
 - **Explicit browser targets.** Connect several Chromium profiles, select a named browser instance, and operate its opaque tab handles.
 - **Visible desktop control.** Acquire desktop control, observe a window, act on that observation, and release control. A blue overlay and Stop affordance make interaction visible locally.
 - **Portable configuration.** Keep `local-runtime-mcp.yaml`, the executable, and browser integration together on a fixed or removable drive.
+- **Independent connection providers.** Enable OpenAI, Cloudflare, or both for the same Runtime Host. Public HTTP supports static Bearer credentials or OAuth authorization with owner approval.
 - **Platform-specific engines.** Go hosts the runtime and MCP adapters; Rust implements Windows capture, UI Automation, and input; TypeScript implements Chromium integration.
 
 ## Architecture
 
-The connection layer delivers MCP requests. The capability layer defines machine operations. One Runtime Host owns the resources shared by all clients of a running instance.
+The connection layer delivers MCP requests. The capability layer defines machine operations. One Runtime Host owns the resources shared by every enabled entry point and client of a running instance.
 
 ```mermaid
 flowchart TB
     Operator[Operator] --> CLI[CLI + configuration]
-    CLI --> Host[Runtime Host]
+    CLI --> Supervisor[Entry-point supervisor]
+    Supervisor --> Host[One Runtime Host]
     Local[Local MCP client] --> Stdio[MCP stdio]
-    Local --> HTTP[MCP Streamable HTTP]
+    Local --> Public[Public-facing HTTP origin · Bearer or OAuth]
     Remote[Remote AI clients] --> OpenAI[OpenAI Tunnel adapter]
     Remote --> Cloudflare[Cloudflare adapter + cloudflared]
-    OpenAI --> HTTP
-    Cloudflare --> HTTP
+    OpenAI --> Private[Private HTTP origin · runtime credential]
+    Cloudflare --> Public
     Stdio --> MCP[MCP adapter · 21 tools]
-    HTTP --> MCP
+    Private --> MCP
+    Public --> MCP
     MCP --> Process[Process]
     MCP --> Files[Filesystem]
     MCP --> Image[Image]
@@ -51,49 +54,53 @@ flowchart TB
     Host -. owns .-> Files
     Host -. owns .-> Computer
     Host -. owns .-> Bridge
+    Supervisor -. owns provider lifetime .-> OpenAI
+    Supervisor -. owns provider lifetime .-> Cloudflare
 ```
 
-Solid arrows show request flow; dotted arrows show lifetime ownership. Images and text are MCP content types carried by the selected transport.
+Solid arrows show request flow; dotted arrows show lifetime ownership. Text and images travel as MCP content. OpenAI's private origin and the public-facing HTTP origin publish the same MCP Server while retaining their respective authentication boundaries. Cloudflare reaches the public origin over loopback; its external URL uses HTTPS.
 
 | Layer | Responsibility |
 | --- | --- |
-| CLI and configuration | Choose a connection mode and resolve configuration once. |
-| Connection adapters | Deliver requests through stdio, HTTP, or a tunnel provider. |
+| CLI and configuration | Select entry points explicitly and resolve configuration once. |
+| Entry-point supervisor | Own provider lifetimes, report exits, and keep surviving entry points available. |
+| Connection adapters | Deliver requests through stdio, HTTP, or a tunnel provider to the shared Server. |
 | MCP adapter | Publish tool schemas, validate inputs, and encode results. |
 | Capability services | Define resource identities, observations, actions, and concurrency. |
 | Platform backends | Execute OS operations, Windows native interaction, and Chromium CDP commands. |
 
-The Host creates the Process Manager, Filesystem Service, Browser Bridge, and Computer Controller. Shutdown stops admission, cancels pending work, cleans up managed processes and input, and closes listeners and helpers. Individual request failures retain the running Host and its other resources.
+The Host creates one Process Manager, Filesystem Service, Browser Bridge, and Computer Controller. A provider failure affects that entry point; the Host and other live entry points continue. When all entry points finish, or the operator interrupts the runtime, shutdown stops admission, cancels pending work, cleans up managed processes and input, and closes listeners and helpers. Individual request failures retain the running Host and its other resources. Recovery restores connectivity without replaying machine actions.
 
 ### Commands and transports
 
 ```text
 lrmcp
 ├── serve
-│   ├── stdio
-│   └── http
-├── tunnel
-│   ├── openai
-│   └── cloudflare
+│   ├── --transport stdio|http
+│   └── --tunnel openai|cloudflare   (repeatable with HTTP)
 ├── setup
-│   └── browser
+│   ├── browser
+│   └── oauth
 ├── version
 └── help
 ```
 
-Each runtime invocation selects one connection mode. The seven command paths cover connection startup, browser setup, and executable information.
+`serve` starts one Host. Select `--transport stdio` for local process pipes or `--transport http` for HTTP connectivity. With HTTP, repeat `--tunnel` to enable both providers. Saved credentials configure a provider; the command selects whether it runs.
 
 | Command | Connection and credentials |
 | --- | --- |
-| `lrmcp serve stdio` | Standard MCP process pipes; the parent process supplies access. |
-| `lrmcp serve http` | Loopback Streamable HTTP with a configured Bearer token. |
-| `lrmcp tunnel openai` | Official OpenAI HTTP forwarding to a private loopback MCP endpoint; configure the tunnel ID and API key. |
-| `lrmcp tunnel cloudflare` | Official `cloudflared` companion forwards to loopback HTTP; configure a Cloudflare tunnel token and an MCP Bearer token. |
+| `lrmcp serve --transport stdio` | Standard MCP process pipes; the parent process supplies access. |
+| `lrmcp serve --transport http` | Direct loopback Streamable HTTP using the configured public-client authentication mode. |
+| `lrmcp serve --transport http --tunnel openai` | Official OpenAI forwarding to a private loopback MCP endpoint; configure the tunnel ID and API key. |
+| `lrmcp serve --transport http --tunnel cloudflare` | Official `cloudflared` companion forwards to authenticated loopback HTTP. |
+| `lrmcp serve --transport http --tunnel openai --tunnel cloudflare` | Both providers reach the same Host and resources. |
 | `lrmcp setup browser` | Generate bridge credentials and extract/configure the extension. |
+| `lrmcp setup oauth --client-name NAME --redirect-uri URI` | Register an OAuth client with its exact callback URI and generate credentials. |
+| `lrmcp setup oauth --show` | Display existing OAuth credentials deliberately in the local terminal. |
 | `lrmcp version` | Print the executable version. |
 | `lrmcp help` | Show commands and flags. |
 
-OpenAI starts its private endpoint on a dynamically assigned loopback port and uses a fresh, in-memory private-hop credential. Provider forwarding uses standard HTTP connections to the shared MCP server. Cloudflare uses the configured loopback origin and its maintained companion executable. Domain services remain independent of either provider.
+OpenAI starts its private endpoint on a dynamically assigned loopback port and uses a fresh, in-memory private-hop credential. Cloudflare uses the configured public-facing loopback origin and its maintained companion executable. Domain services remain independent of either provider. A second machine runs its own Host and uses a distinct connection address; independent machines have independent resources and handles.
 
 ### Configuration
 
@@ -107,7 +114,7 @@ flowchart LR
     Config --> Host[Runtime Host]
 ```
 
-Precedence is **command line > environment > YAML > defaults**. The file path is always `<lrmcp directory>/local-runtime-mcp.yaml`. Browser instance identity belongs to each browser profile's extension storage; process, tab, and desktop observation handles belong to the current runtime lifecycle.
+Precedence is **command line > environment > YAML > defaults**. The file path is always `<lrmcp directory>/local-runtime-mcp.yaml`. Configuration validation covers the components selected for this invocation. Browser instance identity belongs to each browser profile's extension storage; process, tab, and desktop observation handles belong to the current runtime lifecycle.
 
 ## Capability domains
 
@@ -229,8 +236,8 @@ computer_control(kind="release", control_id=...)
 ```
 
 - `computer_control` acquires control, reports occupancy, or releases a matching token. Status exposes the label and occupancy, while the owner retains its token.
-- `computer_targets` lists validated top-level windows.
-- `computer_state` returns pixels and bounded UI Automation information. Without a control token it is a read-only observation with `actionable=false`, an empty state ID, and descriptive elements; a valid token binds actionable references and a state ID to the current control generation and foreground target.
+- `computer_targets` returns a `windows` array of validated top-level windows.
+- `computer_state` returns native PNG pixels in MCP image content and bounded UI Automation information in structured content. Image metadata describes that separate image block. Without a control token it is a read-only observation with `actionable=false`, an empty state ID, and descriptive elements; a valid token binds actionable references and a state ID to the current control generation and foreground target.
 - `computer_action` supports `activate`, `move`, `click`, `double_click`, `drag`, `type_text`, `set_value`, `press_key`, and `scroll`. Every action requires `control_id`; observation-based actions require the exact actionable `state_id`.
 
 Control has a five-minute idle expiry refreshed by controlled operations. Release, expiry, local Stop, and shutdown cancel pending work, clear injected input state, and invalidate prior actionable observations. A competing acquire reports that the desktop is busy.
@@ -298,7 +305,7 @@ Request cancellation is distinct from process execution timeout and Host shutdow
 
 Transport recovery tests cover failed requests before response headers, incomplete response bodies, protocol-specific cancellation, and transient tunnel poll and response-delivery errors. A surviving peer client and a newly connected client must remain usable after an individual failure. A cloud connection error alone identifies neither the failing hop nor whether the tool executed; diagnosis uses the individual tool name, machine time, and provider logs. Keep credentials and tool payloads private when sharing those logs.
 
-The [two-conversation acceptance prompts](docs/concurrency-acceptance.zh-CN.md) exercise idle browser connectivity, independent process output, explicit profile routing, and desktop ownership through a configured ChatGPT connection.
+The [two-conversation acceptance prompts](docs/concurrency-acceptance.zh-CN.md) exercise idle browser connectivity, independent process output, explicit profile routing, and desktop ownership through configured clients. The [connection guide](docs/connections.md) covers Gemini OAuth setup and cross-provider acceptance against one Host.
 
 ## Installation
 
@@ -324,11 +331,12 @@ local-runtime-mcp/
 ├── PRIVACY.md
 ├── LICENSE
 ├── THIRD_PARTY_NOTICES.md
+├── docs/
 ├── licenses/
 └── cloudflared-LICENSE
 ```
 
-Copy `config.example.yaml` to `local-runtime-mcp.yaml` and fill the sections used by your selected connection mode:
+Copy `config.example.yaml` to `local-runtime-mcp.yaml` and fill the sections used by your selected transport and providers:
 
 ```yaml
 browser:
@@ -342,6 +350,7 @@ openai:
 http:
   listen: 127.0.0.1:9316
   public_host: mcp.example.com
+  auth: bearer
   bearer_token: "replace-with-a-random-token-of-at-least-32-characters"
 
 cloudflare:
@@ -365,7 +374,7 @@ The command saves bridge credentials to the adjacent YAML and extracts `browser-
   "mcpServers": {
     "local-runtime-mcp": {
       "command": "C:\\Tools\\local-runtime-mcp\\lrmcp.exe",
-      "args": ["serve", "stdio"]
+      "args": ["serve", "--transport", "stdio"]
     }
   }
 }
@@ -376,30 +385,55 @@ The command saves bridge credentials to the adjacent YAML and extracts `browser-
 Fill the `openai` section and run:
 
 ```powershell
-./lrmcp.exe tunnel openai
+./lrmcp.exe serve --transport http --tunnel openai
 ```
 
 See the [OpenAI Secure MCP Tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) for provider setup and supported clients. The private HTTP origin is created automatically; its port and private-hop credential remain runtime-only.
 
 ### Streamable HTTP
 
-Fill `http.bearer_token` and run:
+For direct HTTP access, choose `http.auth: bearer`, fill `http.bearer_token`, and run:
 
 ```powershell
-./lrmcp.exe serve http
+./lrmcp.exe serve --transport http
 ```
 
-The default MCP endpoint is `http://127.0.0.1:9316/mcp`. The loopback listener accepts the configured Bearer token and can serve as a reverse-proxy origin.
+The default MCP endpoint is `http://127.0.0.1:9316/mcp`. The loopback listener accepts the configured Bearer token and can serve as a reverse-proxy origin. An OAuth-enabled origin additionally serves discovery, authorization, and token endpoints under its public HTTPS address.
 
 ### Cloudflare Tunnel
 
-Create a remotely managed Cloudflare Tunnel, route its hostname to `http://127.0.0.1:9316`, fill `http.public_host`, `http.bearer_token`, and `cloudflare.tunnel_token`, then run:
+Create a remotely managed Cloudflare Tunnel, route its hostname to `http://127.0.0.1:9316`, fill `http.public_host` and `cloudflare.tunnel_token`, configure HTTP authentication, then run:
 
 ```powershell
-./lrmcp.exe tunnel cloudflare
+./lrmcp.exe serve --transport http --tunnel cloudflare
 ```
 
-The release includes the pinned `cloudflared` companion. Configure the remote MCP client to use `https://<public_host>/mcp` with the MCP Bearer token. The Cloudflare tunnel token authenticates the tunnel process; the MCP token authenticates tool clients.
+The release includes the pinned `cloudflared` companion. Configure the remote MCP client to use `https://<public_host>/mcp`. With Bearer authentication, enter the MCP Bearer token in the client's token setting. With OAuth, register that client's redirect URI and use its client credentials. The Cloudflare tunnel token authenticates the tunnel process; HTTP credentials authorize MCP clients.
+
+### Both tunnels
+
+Fill both provider sections and run one process:
+
+```powershell
+./lrmcp.exe serve --transport http --tunnel openai --tunnel cloudflare
+```
+
+Both connections use one browser bridge, process-session registry, filesystem coordination service, and desktop controller. Provider exits are reported locally while the other live entry point continues. Keep the terminal open; `Ctrl+C` shuts down the complete runtime. Logs distinguish a degraded provider from an available peer.
+
+### OAuth for Gemini and other clients
+
+Set `http.public_host` to the externally reachable hostname. In the MCP client's connection dialog, copy its exact redirect URI and register it locally:
+
+```powershell
+./lrmcp.exe setup oauth --client-name gemini --redirect-uri "https://<client-callback-host>/<callback-path>"
+./lrmcp.exe setup oauth --client-name gemini --show
+```
+
+The setup command saves the OAuth client and an owner approval key in the adjacent YAML, and selects `http.auth: oauth`. The show command displays that client's credentials locally. Enter the generated **client ID** and **client secret** in Gemini's additional settings, and use `https://<public_host>/mcp` as its server URL. During authorization, approve access on Local Runtime's consent page using the owner approval key. Keep that approval key with the machine's operator.
+
+OAuth authorization grants access to the runtime's complete machine-control tool surface. Register each client with exact redirect URIs; repeat `--redirect-uri` when one client needs several callbacks. Access and refresh tokens are held in memory. Restarting `lrmcp` requires clients to authorize again. OpenAI's private-hop authentication remains independent of this public HTTP mode.
+
+See [the connection guide](docs/connections.md) for the complete setup sequence, credential roles, and acceptance checks. Real client behavior is verified after connecting that client's account and callback.
 
 ### Environment overrides
 
@@ -411,7 +445,9 @@ The release includes the pinned `cloudflared` companion. Configure the remote MC
 | `LOCAL_RUNTIME_MCP_OPENAI_API_KEY` | `openai.api_key` |
 | `LOCAL_RUNTIME_MCP_HTTP_LISTEN` | `http.listen` |
 | `LOCAL_RUNTIME_MCP_HTTP_PUBLIC_HOST` | `http.public_host` |
+| `LOCAL_RUNTIME_MCP_HTTP_AUTH` | `http.auth` |
 | `LOCAL_RUNTIME_MCP_HTTP_BEARER_TOKEN` | `http.bearer_token` |
+| `LOCAL_RUNTIME_MCP_OAUTH_OWNER_TOKEN` | `http.oauth.owner_token` |
 | `LOCAL_RUNTIME_MCP_CLOUDFLARE_TUNNEL_TOKEN` | `cloudflare.tunnel_token` |
 | `LOCAL_RUNTIME_MCP_CLOUDFLARED` | `cloudflare.binary` |
 
@@ -436,7 +472,7 @@ go vet ./...
 go build ./cmd/lrmcp
 ```
 
-Go tests cover resource lifetimes, response correlation, cancellation, competing file commits, process I/O, and browser identity routing. Extension scheduler tests cover ordering, fairness, cancellation, and queue limits. The opt-in Windows Chromium suite loads the real extension in disposable browser profiles and includes an idle-only connection test:
+Go tests cover shared resource lifetimes, provider supervision, HTTP authentication and OAuth flows, response correlation, cancellation, competing file commits, process I/O, and browser identity routing. Extension scheduler tests cover ordering, fairness, cancellation, and queue limits. The opt-in Windows Chromium suite loads the real extension in disposable browser profiles and includes an idle-only connection test:
 
 ```powershell
 $env:LOCAL_RUNTIME_MCP_BROWSER_E2E = '1'
@@ -447,7 +483,7 @@ CI exercises Windows, Linux, and macOS. Local protocol and browser tests validat
 
 ## Security, privacy, and license
 
-Authenticated clients operate with the authority of the account running `lrmcp`. Resource handles coordinate targets and workflows within that shared host. Use dedicated OS accounts and browser profiles where workload separation is appropriate.
+Authenticated clients operate with the authority of the account running `lrmcp`. Resource handles coordinate targets and workflows within that shared host. Separate tenant permissions require dedicated OS accounts or machines; browser profiles separate browser data.
 
 See [SECURITY.md](SECURITY.md) for deployment guidance and private vulnerability reporting, and [PRIVACY.md](PRIVACY.md) for local storage and provider data flows.
 

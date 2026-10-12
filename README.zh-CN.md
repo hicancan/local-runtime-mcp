@@ -9,30 +9,33 @@
 
 让 AI 客户端使用运行 `lrmcp` 的机器上的程序、文件、图像、浏览器配置文件和桌面。Local Runtime MCP 是一个便携的机器访问运行时，以 **21 个 MCP 工具覆盖五个能力域**。
 
-本地客户端可以使用 stdio 或 Streamable HTTP；远端客户端可以通过 OpenAI Secure MCP Tunnel 或 Cloudflare Tunnel 接入。不同进程会话和浏览器标签页可以并发执行，共享文件和桌面输入则按照明确的资源规则协调。
+本地客户端可以使用 stdio 或 Streamable HTTP；远端客户端可以通过 OpenAI Secure MCP Tunnel 和 Cloudflare Tunnel 接入。同一个运行实例可以同时开启两条隧道，共享一套进程会话、浏览器实例和桌面控制。不同进程会话和浏览器标签页可以并发执行，共享文件和桌面输入则按照明确的资源规则协调。
 
 - **原生多模态结果**：文件、网页和桌面观察直接返回文本与 MCP 图像内容。
 - **明确的浏览器目标**：连接多个 Chromium Profile，选择有名称的浏览器实例，通过不透明标签页句柄操作。
 - **可见的桌面控制**：获取控制权，观察窗口，根据观察操作，最后释放控制权；蓝色提示层和本地 Stop 入口让操作清晰可见。
 - **便携配置**：将 `local-runtime-mcp.yaml`、程序和浏览器集成保存在同一目录，支持固定磁盘与移动存储。
+- **独立连接入口**：为同一个 Runtime Host 启用 OpenAI、Cloudflare 或两者；公开 HTTP 支持静态 Bearer 凭据和经所有者批准的 OAuth 授权。
 - **按平台职责实现**：Go 承载运行时和 MCP 适配器，Rust 实现 Windows 捕获、UI Automation 和输入，TypeScript 实现 Chromium 集成。
 
 ## 整体架构
 
-连接层负责请求怎样到达，能力层负责机器上执行什么。一个 Runtime Host 管理当前运行实例中所有客户端共享的资源。
+连接层负责请求怎样到达，能力层负责机器上执行什么。一个 Runtime Host 管理当前实例中所有已启用入口和客户端共享的资源。
 
 ```mermaid
 flowchart TB
     Operator[操作者] --> CLI[CLI + 配置]
-    CLI --> Host[Runtime Host]
+    CLI --> Supervisor[入口生命周期管理]
+    Supervisor --> Host[唯一 Runtime Host]
     Local[本地 MCP 客户端] --> Stdio[MCP stdio]
-    Local --> HTTP[MCP Streamable HTTP]
+    Local --> Public[公开访问的 HTTP 源站 · Bearer 或 OAuth]
     Remote[远端 AI 客户端] --> OpenAI[OpenAI Tunnel 适配器]
     Remote --> Cloudflare[Cloudflare 适配器 + cloudflared]
-    OpenAI --> HTTP
-    Cloudflare --> HTTP
+    OpenAI --> Private[私有 HTTP 源站 · 运行时凭据]
+    Cloudflare --> Public
     Stdio --> MCP[MCP 适配器 · 21 个工具]
-    HTTP --> MCP
+    Private --> MCP
+    Public --> MCP
     MCP --> Process[Process]
     MCP --> Files[Filesystem]
     MCP --> Image[Image]
@@ -51,49 +54,53 @@ flowchart TB
     Host -. 管理 .-> Files
     Host -. 管理 .-> Computer
     Host -. 管理 .-> Bridge
+    Supervisor -. 管理 Provider 生命周期 .-> OpenAI
+    Supervisor -. 管理 Provider 生命周期 .-> Cloudflare
 ```
 
-实线表示请求链路，虚线表示资源生命周期归属。文本和图像是 MCP 内容类型，由选定的传输方式一起承载。
+实线表示请求链路，虚线表示资源生命周期归属。文本与图像作为 MCP 内容传输。OpenAI 私有源站和公开访问的 HTTP 源站提供同一个 MCP Server，各自保留对应认证边界。Cloudflare 通过 loopback 访问源站，对外地址使用 HTTPS。
 
 | 层 | 职责 |
 | --- | --- |
-| CLI 与配置 | 选择连接模式，一次性解析配置。 |
-| 连接适配器 | 通过 stdio、HTTP 或 Tunnel Provider 递送请求。 |
+| CLI 与配置 | 明确选择入口，一次性解析配置。 |
+| 入口生命周期管理 | 管理 Provider、报告退出状态，保持其他入口可用。 |
+| 连接适配器 | 通过 stdio、HTTP 或 Tunnel Provider 递送请求到共享 Server。 |
 | MCP 适配器 | 发布工具 schema、验证参数、编码结果。 |
 | 能力服务 | 定义资源身份、观察、操作与并发规则。 |
 | 平台后端 | 执行操作系统调用、Windows 原生交互和 Chromium CDP 命令。 |
 
-Host 创建 Process Manager、Filesystem Service、Browser Bridge 和 Computer Controller。退出时停止接收工作，取消待执行请求，清理受管进程与注入输入，关闭连接及配套程序。单次请求失败后，Host 和其他资源继续运行。
+Host 只创建一套 Process Manager、Filesystem Service、Browser Bridge 和 Computer Controller。Provider 失败只影响对应入口，Host 和其他在线入口继续运行。所有入口结束或操作者中断运行时，停止接收工作，取消待执行请求，清理受管进程与注入输入，关闭连接及配套程序。单次请求失败后，Host 和其他资源继续运行。连接恢复只恢复通信，机器操作由客户端明确发起。
 
 ### 命令与传输
 
 ```text
 lrmcp
 ├── serve
-│   ├── stdio
-│   └── http
-├── tunnel
-│   ├── openai
-│   └── cloudflare
+│   ├── --transport stdio|http
+│   └── --tunnel openai|cloudflare   （HTTP 下可重复）
 ├── setup
-│   └── browser
+│   ├── browser
+│   └── oauth
 ├── version
 └── help
 ```
 
-每次运行选择一种连接模式。七条命令路径分别负责连接启动、浏览器准备和程序信息。
+`serve` 启动一个 Host。用 `--transport stdio` 选择本地进程管道，用 `--transport http` 选择 HTTP；HTTP 下重复传入 `--tunnel` 即可启用两种 Provider。保存的凭据用于配置 Provider，命令行决定本次是否启动它。
 
 | 命令 | 链路与凭据 |
 | --- | --- |
-| `lrmcp serve stdio` | 标准 MCP 进程管道，由父进程提供访问权限。 |
-| `lrmcp serve http` | loopback Streamable HTTP，使用配置的 Bearer token。 |
-| `lrmcp tunnel openai` | 官方 HTTP forwarding 连接私有 loopback MCP 端点，配置 Tunnel ID 与 API key。 |
-| `lrmcp tunnel cloudflare` | 官方 `cloudflared` 连接 loopback HTTP，配置 Cloudflare Tunnel token 与 MCP Bearer token。 |
+| `lrmcp serve --transport stdio` | 标准 MCP 进程管道，由父进程提供访问权限。 |
+| `lrmcp serve --transport http` | 直接访问 loopback Streamable HTTP，使用配置的公开客户端认证模式。 |
+| `lrmcp serve --transport http --tunnel openai` | 官方 OpenAI 转发连接私有 loopback MCP 端点，配置 Tunnel ID 与 API key。 |
+| `lrmcp serve --transport http --tunnel cloudflare` | 官方 `cloudflared` 转发到经过认证的 loopback HTTP。 |
+| `lrmcp serve --transport http --tunnel openai --tunnel cloudflare` | 两种 Provider 访问同一个 Host 和资源。 |
 | `lrmcp setup browser` | 生成 Bridge 凭据，释放和配置扩展。 |
+| `lrmcp setup oauth --client-name NAME --redirect-uri URI` | 用准确回调地址注册 OAuth 客户端并生成凭据。 |
+| `lrmcp setup oauth --show` | 在本地终端明确查看已有 OAuth 凭据。 |
 | `lrmcp version` | 输出可执行文件版本。 |
 | `lrmcp help` | 显示命令与参数。 |
 
-OpenAI 适配器使用动态分配的本机端口和运行时生成、保存在内存中的私有链路凭据。官方转发客户端通过标准 HTTP 连接共享 MCP Server。Cloudflare 使用配置中的 loopback 源站及官方维护的配套程序。两种 Provider 共享能力实现。
+OpenAI 适配器使用动态分配的本机端口和运行时生成、保存在内存中的私有链路凭据。Cloudflare 使用配置中的公开访问 loopback 源站及官方维护的配套程序。能力服务独立于 Provider。另一台机器运行自己的 Host 并使用独立连接地址，资源和句柄也属于各自机器。
 
 ### 配置
 
@@ -107,7 +114,7 @@ flowchart LR
     Config --> Host[Runtime Host]
 ```
 
-优先级为 **命令行 > 环境变量 > YAML > 默认值**。配置固定读取 `<lrmcp 所在目录>/local-runtime-mcp.yaml`。浏览器实例身份保存在各 Profile 的扩展存储中；进程、标签页和桌面观察句柄由当前资源生命周期管理。
+优先级为 **命令行 > 环境变量 > YAML > 默认值**。配置固定读取 `<lrmcp 所在目录>/local-runtime-mcp.yaml`，按本次启用的组件验证配置。浏览器实例身份保存在各 Profile 的扩展存储中；进程、标签页和桌面观察句柄由当前资源生命周期管理。
 
 ## 五个能力域
 
@@ -229,8 +236,8 @@ computer_control(kind="release", control_id=...)
 ```
 
 - `computer_control` 获取控制权、查询占用状态或使用匹配 token 释放。状态显示任务名称与占用情况，控制 token 由获取者保管。
-- `computer_targets` 列出经过验证的顶层窗口。
-- `computer_state` 返回像素和有界 UI Automation 信息。不传控制 token 时是 `actionable=false` 的只读观察，state ID 为空，元素只提供描述；有效 token 将可行动引用与 state ID 绑定到当前控制代次和前台目标。
+- `computer_targets` 返回包含已验证顶层窗口的 `windows` 数组。
+- `computer_state` 在 MCP image content 中返回原生 PNG 像素，在 structured content 中返回有界 UI Automation 信息；图像元数据描述独立的图像块。不传控制 token 时是 `actionable=false` 的只读观察，state ID 为空，元素只提供描述；有效 token 将可行动引用与 state ID 绑定到当前控制代次和前台目标。
 - `computer_action` 支持 `activate`、`move`、`click`、`double_click`、`drag`、`type_text`、`set_value`、`press_key`、`scroll`。全部动作需要 `control_id`；基于观察的动作需要准确匹配的可行动 `state_id`。
 
 控制权默认五分钟空闲到期，受控操作自动刷新期限。释放、到期、本地 Stop 与退出会取消待执行工作，清理注入输入，失效旧的可行动观察。其他工作流尝试获取时收到 desktop busy。
@@ -298,7 +305,7 @@ flowchart TB
 
 传输恢复测试覆盖响应头返回前的请求失败、不完整的响应体、协议相关的取消传播，以及 Tunnel 轮询和结果交付的短暂错误。单次故障之后，另一个客户端与新连接的客户端应继续可用。云端连接错误本身不能确定失败的链路，也不能确定工具是否执行；诊断需要单个工具名称、机器时间和 Provider 日志。分享日志时应隐去凭据与工具载荷。
 
-[双会话验收提示词](docs/concurrency-acceptance.zh-CN.md)可以通过已配置的 ChatGPT 连接验证空闲浏览器连接、独立进程输出、明确的 Profile 路由与桌面控制权。
+[双会话验收提示词](docs/concurrency-acceptance.zh-CN.md)可以通过已配置的客户端验证空闲浏览器连接、独立进程输出、明确的 Profile 路由与桌面控制权。[连接指南](docs/connections.zh-CN.md)说明 Gemini OAuth 配置和同一 Host 的跨 Provider 验收。
 
 ## 安装
 
@@ -324,11 +331,12 @@ local-runtime-mcp/
 ├── PRIVACY.md
 ├── LICENSE
 ├── THIRD_PARTY_NOTICES.md
+├── docs/
 ├── licenses/
 └── cloudflared-LICENSE
 ```
 
-将 `config.example.yaml` 复制为 `local-runtime-mcp.yaml`，填写当前连接方式所需配置：
+将 `config.example.yaml` 复制为 `local-runtime-mcp.yaml`，填写本次传输和 Provider 所需配置：
 
 ```yaml
 browser:
@@ -342,6 +350,7 @@ openai:
 http:
   listen: 127.0.0.1:9316
   public_host: mcp.example.com
+  auth: bearer
   bearer_token: "replace-with-a-random-token-of-at-least-32-characters"
 
 cloudflare:
@@ -365,7 +374,7 @@ cloudflare:
   "mcpServers": {
     "local-runtime-mcp": {
       "command": "C:\\Tools\\local-runtime-mcp\\lrmcp.exe",
-      "args": ["serve", "stdio"]
+      "args": ["serve", "--transport", "stdio"]
     }
   }
 }
@@ -376,30 +385,55 @@ cloudflare:
 填写 `openai` 段后运行：
 
 ```powershell
-./lrmcp.exe tunnel openai
+./lrmcp.exe serve --transport http --tunnel openai
 ```
 
 Provider 设置和受支持的客户端见 [OpenAI Secure MCP Tunnel 指南](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)。私有 HTTP 源站自动创建，端口与私有链路凭据只在本次运行中保留。
 
 ### Streamable HTTP
 
-填写 `http.bearer_token` 后运行：
+直接通过 HTTP 访问时，设置 `http.auth: bearer`，填写 `http.bearer_token` 后运行：
 
 ```powershell
-./lrmcp.exe serve http
+./lrmcp.exe serve --transport http
 ```
 
-默认端点为 `http://127.0.0.1:9316/mcp`。loopback 监听器使用配置的 Bearer token，也可以作为反向代理源站。
+默认端点为 `http://127.0.0.1:9316/mcp`。loopback 监听器使用配置的 Bearer token，也可以作为反向代理源站。启用 OAuth 后，还会在公开 HTTPS 地址下提供发现、授权和 token 端点。
 
 ### Cloudflare Tunnel
 
-创建远程管理的 Cloudflare Tunnel，将域名路由到 `http://127.0.0.1:9316`，填写 `http.public_host`、`http.bearer_token` 和 `cloudflare.tunnel_token` 后运行：
+创建远程管理的 Cloudflare Tunnel，将域名路由到 `http://127.0.0.1:9316`，填写 `http.public_host`、`cloudflare.tunnel_token` 并配置 HTTP 认证后运行：
 
 ```powershell
-./lrmcp.exe tunnel cloudflare
+./lrmcp.exe serve --transport http --tunnel cloudflare
 ```
 
-发布包附带固定版本的 `cloudflared`。远端 MCP 客户端使用 `https://<public_host>/mcp` 与 MCP Bearer token。Cloudflare token 验证隧道程序，MCP token 验证工具客户端。
+发布包附带固定版本的 `cloudflared`。远端 MCP 客户端使用 `https://<public_host>/mcp`。Bearer 模式在客户端 token 设置中填写 MCP Bearer token；OAuth 模式则注册该客户端的回调地址并使用对应客户端凭据。Cloudflare token 验证隧道程序，HTTP 凭据授权 MCP 客户端。
+
+### 同时开启两条隧道
+
+填写两种 Provider 的配置，在一个进程中运行：
+
+```powershell
+./lrmcp.exe serve --transport http --tunnel openai --tunnel cloudflare
+```
+
+两个连接共享一个 Browser Bridge、进程会话注册表、文件提交协调服务和桌面控制器。Provider 退出会在本地报告，其他在线入口继续服务。保持终端运行，按 `Ctrl+C` 关闭整个运行时。日志区分入口降级和其他入口仍然可用的状态。
+
+### Gemini 与其他客户端的 OAuth
+
+将 `http.public_host` 设为可以公网访问的域名。在 MCP 客户端连接窗口复制准确的 redirect URI，然后在本地注册：
+
+```powershell
+./lrmcp.exe setup oauth --client-name gemini --redirect-uri "https://<client-callback-host>/<callback-path>"
+./lrmcp.exe setup oauth --client-name gemini --show
+```
+
+准备命令在同目录 YAML 中保存 OAuth 客户端和所有者批准密钥，并选择 `http.auth: oauth`。查看命令在本地显示该客户端的凭据。将生成的 **client ID** 和 **client secret** 填入 Gemini 的附加设置，服务 URL 使用 `https://<public_host>/mcp`。授权时，在 Local Runtime 的授权页面使用所有者批准密钥确认访问；该密钥由机器操作者保管。
+
+OAuth 授权开放此运行时的完整机器控制工具。每个客户端使用准确回调地址，需要多个回调时重复传入 `--redirect-uri`。访问 token 和刷新 token 保存在内存中，重启 `lrmcp` 后客户端需要重新授权。OpenAI 私有链路认证独立于公开 HTTP 的认证模式。
+
+[连接指南](docs/connections.zh-CN.md)给出完整步骤、凭据职责和验收方法。实际客户端行为在连接对应账户和回调之后验证。
 
 ### 环境变量覆盖
 
@@ -411,7 +445,9 @@ Provider 设置和受支持的客户端见 [OpenAI Secure MCP Tunnel 指南](htt
 | `LOCAL_RUNTIME_MCP_OPENAI_API_KEY` | `openai.api_key` |
 | `LOCAL_RUNTIME_MCP_HTTP_LISTEN` | `http.listen` |
 | `LOCAL_RUNTIME_MCP_HTTP_PUBLIC_HOST` | `http.public_host` |
+| `LOCAL_RUNTIME_MCP_HTTP_AUTH` | `http.auth` |
 | `LOCAL_RUNTIME_MCP_HTTP_BEARER_TOKEN` | `http.bearer_token` |
+| `LOCAL_RUNTIME_MCP_OAUTH_OWNER_TOKEN` | `http.oauth.owner_token` |
 | `LOCAL_RUNTIME_MCP_CLOUDFLARE_TUNNEL_TOKEN` | `cloudflare.tunnel_token` |
 | `LOCAL_RUNTIME_MCP_CLOUDFLARED` | `cloudflare.binary` |
 
@@ -436,7 +472,7 @@ go vet ./...
 go build ./cmd/lrmcp
 ```
 
-Go 测试覆盖资源生命周期、响应归属、取消、文件竞争提交、进程 I/O 和浏览器身份路由。扩展调度测试覆盖顺序、公平性、取消和队列上限。Windows 可选 Chromium 验收会在临时 Profile 中加载真实扩展，覆盖空闲连接与页面操作：
+Go 测试覆盖共享资源生命周期、Provider 管理、HTTP 认证与 OAuth 流程、响应归属、取消、文件竞争提交、进程 I/O 和浏览器身份路由。扩展调度测试覆盖顺序、公平性、取消和队列上限。Windows 可选 Chromium 验收会在临时 Profile 中加载真实扩展，覆盖空闲连接与页面操作：
 
 ```powershell
 $env:LOCAL_RUNTIME_MCP_BROWSER_E2E = '1'
@@ -447,7 +483,7 @@ CI 覆盖 Windows、Linux 和 macOS。本地协议与浏览器测试验证对应
 
 ## 安全、隐私与协议
 
-通过认证的客户端使用运行 `lrmcp` 的账户权限。资源句柄在共享机器内部协调目标与工作流。需要工作负载分离时，使用专用操作系统账户与浏览器 Profile。
+通过认证的客户端使用运行 `lrmcp` 的账户权限。资源句柄在共享机器内部协调目标与工作流，并发协调与独立租户权限属于不同边界。需要工作负载分离时，使用专用操作系统账户与浏览器 Profile。
 
 [SECURITY.md](SECURITY.md) 说明部署与私密漏洞报告；[PRIVACY.md](PRIVACY.md) 说明本地保留和外部 Provider 数据流。
 

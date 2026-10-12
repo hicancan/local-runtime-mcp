@@ -24,7 +24,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-const computerWorkerVersion = "11.0.0"
+const computerWorkerVersion = "12.0.0"
 
 //go:embed worker_windows_amd64.exe
 var workerExecutable embed.FS

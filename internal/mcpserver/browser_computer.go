@@ -33,8 +33,8 @@ func registerComputerTools(server *mcp.Server, controller computer.Controller) {
 		schema.Properties["kind"].Enum = enum("acquire", "status", "release")
 	})
 	mcp.AddTool(server, controlTool, computerControl(controller))
-	mcp.AddTool(server, tool("computer_targets", "List desktop targets", "List open top-level windows with opaque, validated target IDs. This does not list installed applications.", true, false, true, false), computerTargets(controller))
-	mcp.AddTool(server, tool("computer_state", "Read desktop state", "Return WGC native PNG and bounded UI Automation state for the desktop or selected target. Supply control_id to retain actionable state and element IDs; tokenless observation is read-only.", true, false, true, false), computerState(controller))
+	mcp.AddTool(server, tool("computer_targets", "List desktop targets", "Return an object with a windows array of open top-level windows and opaque validated target IDs.", true, false, true, false), computerTargets(controller))
+	mcp.AddTool(server, tool("computer_state", "Read desktop state", "Return WGC PNG pixels in native MCP image content, with bounded UI Automation elements, dimensions and state_id in structuredContent. Observe the desktop or one target. Supply control_id to retain actionable state and element IDs; tokenless observation is read-only.", true, false, true, false), computerState(controller))
 	computerActionTool := inputTool[computer.Action](tool("computer_action", "Control desktop", "Activate a target, or use coordinates or a UI Automation ref from the exact foreground computer_state. Every action invalidates every prior state.", false, true, false, false), func(schema *jsonschema.Schema) {
 		schema.Properties["kind"].Enum = enum("activate", "move", "click", "double_click", "drag", "type_text", "set_value", "press_key", "scroll")
 		schema.Properties["button"].Enum = enum("left", "middle", "right")

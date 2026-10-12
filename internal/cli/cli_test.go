@@ -18,7 +18,7 @@ func TestVersion(t *testing.T) {
 	if err := run(context.Background(), []string{"version"}, strings.NewReader(""), &output, &errors, executable); err != nil {
 		t.Fatal(err)
 	}
-	if output.String() != "lrmcp 11.0.0\n" {
+	if output.String() != "lrmcp 12.0.0\n" {
 		t.Fatalf("version output = %q", output.String())
 	}
 }
@@ -30,7 +30,7 @@ func TestHelpDescribesConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, value := range []string{
-		"serve stdio", "serve http", "tunnel openai", "tunnel cloudflare", "setup browser", config.FileName,
+		"serve --transport stdio", "serve --transport http", "--tunnel openai", "--tunnel cloudflare", "setup browser", "setup oauth", config.FileName,
 		"command line > LOCAL_RUNTIME_MCP_* environment > YAML > defaults",
 		"https://github.com/hicancan/local-runtime-mcp", "GNU AGPL v3.0 only",
 	} {
@@ -56,6 +56,12 @@ func TestRemovedCommandsAreUnknown(t *testing.T) {
 		{"-v"},
 		{"--help"},
 		{"-h"},
+		{"tunnel", "openai"},
+		{"tunnel", "cloudflare"},
+		{"serve", "stdio"},
+		{"serve", "http"},
+		{"serve", "--stdio"},
+		{"serve", "--http"},
 	} {
 		var output, errors bytes.Buffer
 		err := run(context.Background(), args, strings.NewReader(""), &output, &errors, executable)

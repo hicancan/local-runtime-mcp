@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
+	"github.com/hicancan/local-runtime-mcp/internal/oauth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -24,6 +26,7 @@ type HTTPConfig struct {
 	BearerToken   string
 	PublicHost    string
 	InternalToken bool
+	OAuth         *oauth.Config
 }
 
 type HTTPServer struct {
@@ -38,16 +41,25 @@ func NewHTTP(server *mcp.Server, cfg HTTPConfig) (*HTTPServer, error) {
 	if err := validateLoopbackAddress(cfg.Listen); err != nil {
 		return nil, err
 	}
-	if len(cfg.BearerToken) < 32 {
-		return nil, errors.New("HTTP bearer token must contain at least 32 characters")
-	}
 	publicHost, err := normalizeHost(cfg.PublicHost)
 	if err != nil {
 		return nil, err
 	}
-	listener, err := net.Listen("tcp", cfg.Listen)
-	if err != nil {
-		return nil, fmt.Errorf("listen for Streamable HTTP: %w", err)
+	var authorization *oauth.Server
+	if cfg.OAuth != nil {
+		if cfg.InternalToken {
+			return nil, errors.New("private provider HTTP cannot use OAuth")
+		}
+		issuer, err := url.Parse(cfg.OAuth.Issuer)
+		if err != nil || publicHost == "" || !strings.EqualFold(issuer.Hostname(), publicHost) {
+			return nil, errors.New("OAuth issuer must match the configured public host")
+		}
+		authorization, err = oauth.New(*cfg.OAuth)
+		if err != nil {
+			return nil, fmt.Errorf("configure HTTP OAuth: %w", err)
+		}
+	} else if len(cfg.BearerToken) < 32 {
+		return nil, errors.New("HTTP bearer token must contain at least 32 characters")
 	}
 
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{
@@ -58,12 +70,16 @@ func NewHTTP(server *mcp.Server, cfg HTTPConfig) (*HTTPServer, error) {
 		MaxRequestBodyBytes:          32 << 20,
 	})
 	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.URL.Path != "/mcp" {
-			http.NotFound(writer, request)
-			return
-		}
 		if !allowedHost(request.Host, publicHost) {
 			http.Error(writer, "forbidden host", http.StatusForbidden)
+			return
+		}
+		if request.URL.Path != "/mcp" {
+			if authorization != nil {
+				authorization.ServeHTTP(writer, request)
+			} else {
+				http.NotFound(writer, request)
+			}
 			return
 		}
 		if !cfg.InternalToken && request.Header.Get("Origin") != "" {
@@ -74,15 +90,27 @@ func NewHTTP(server *mcp.Server, cfg HTTPConfig) (*HTTPServer, error) {
 		if cfg.InternalToken {
 			provided, bearer = request.Header.Get(InternalTokenHeader), true
 		}
-		if !bearer || len(provided) != len(cfg.BearerToken) || subtle.ConstantTimeCompare([]byte(provided), []byte(cfg.BearerToken)) != 1 {
+		valid := bearer && len(provided) == len(cfg.BearerToken) && subtle.ConstantTimeCompare([]byte(provided), []byte(cfg.BearerToken)) == 1
+		if authorization != nil {
+			valid = bearer && authorization.ValidateBearer(provided)
+		}
+		if !valid {
 			if !cfg.InternalToken {
-				writer.Header().Set("WWW-Authenticate", `Bearer realm="local-runtime-mcp"`)
+				challenge := `Bearer realm="local-runtime-mcp"`
+				if authorization != nil {
+					challenge = authorization.Challenge()
+				}
+				writer.Header().Set("WWW-Authenticate", challenge)
 			}
 			http.Error(writer, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		mcpHandler.ServeHTTP(writer, request)
 	})
+	listener, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		return nil, fmt.Errorf("listen for Streamable HTTP: %w", err)
+	}
 	return &HTTPServer{
 		server: &http.Server{
 			Handler:           handler,

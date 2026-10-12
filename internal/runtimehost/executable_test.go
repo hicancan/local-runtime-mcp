@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -31,7 +32,7 @@ func TestExecutableStdio(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	command := exec.Command(executable, "serve", "stdio", "--browser-listen", "127.0.0.1:0", "--browser-token", "release-smoke-test-credential-0001")
+	command := exec.Command(executable, "serve", "--transport", "stdio", "--browser-listen", "127.0.0.1:0", "--browser-token", "release-smoke-test-credential-0001")
 	command.Dir = t.TempDir()
 	for _, entry := range os.Environ() {
 		if !strings.HasPrefix(strings.ToUpper(entry), config.EnvironmentPrefix) {
@@ -62,7 +63,15 @@ func TestExecutableStdio(t *testing.T) {
 		t.Helper()
 		result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: arguments})
 		if err != nil || result == nil || result.IsError {
-			t.Fatalf("%s: %v; result=%+v", name, err, result)
+			var message string
+			if result != nil {
+				for _, content := range result.Content {
+					if text, ok := content.(*mcp.TextContent); ok {
+						message += text.Text
+					}
+				}
+			}
+			t.Fatalf("%s: %v; tool error: %s", name, err, message)
 		}
 		if output != nil {
 			data, err := json.Marshal(result.StructuredContent)
@@ -142,6 +151,22 @@ func TestExecutableStdio(t *testing.T) {
 		t.Fatal("incorrect native image content")
 	}
 	call("browser_status", map[string]any{}, nil)
+	if runtime.GOOS == "windows" && os.Getenv("LOCAL_RUNTIME_MCP_DESKTOP_SMOKE") == "1" {
+		var state computer.State
+		result := call("computer_state", map[string]any{}, &state)
+		if len(result.Content) != 1 {
+			t.Fatal("desktop state did not return exactly one image block")
+		}
+		content, ok := result.Content[0].(*mcp.ImageContent)
+		if !ok || content.MIMEType != "image/png" || len(content.Data) == 0 {
+			t.Fatal("desktop state is missing native PNG pixels")
+		}
+		pixels, err := png.DecodeConfig(bytes.NewReader(content.Data))
+		if err != nil || pixels.Width != state.Width || pixels.Height != state.Height || state.Actionable || state.StateID != "" {
+			t.Fatal("desktop PNG and read-only structured state are inconsistent")
+		}
+		t.Logf("raw computer_state: native PNG %d bytes, %dx%d, structured UIA=%s", len(content.Data), pixels.Width, pixels.Height, state.UIAStatus)
+	}
 	var control computer.ControlStatus
 	call("computer_control", map[string]any{"kind": "status"}, &control)
 	if control.ControlID != "" || control.Status == "owned" {

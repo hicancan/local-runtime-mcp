@@ -27,6 +27,12 @@ type Host struct {
 }
 
 func Start(ctx context.Context, cfg *config.Config) (*Host, error) {
+	if cfg == nil {
+		return nil, errors.New("runtime configuration is required")
+	}
+	if err := config.ValidateBrowser(cfg.Browser); err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	bridge, err := browser.Start(ctx, cfg.Browser)
 	if err != nil {
