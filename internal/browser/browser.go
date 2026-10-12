@@ -23,7 +23,7 @@ import (
 	"golang.org/x/net/websocket"
 )
 
-const ExtensionVersion = "12.0.0"
+const ExtensionVersion = "12.0.1"
 
 // DesktopGate reserves the shared interactive desktop for a browser operation.
 // A successful reservation is released only once execution has acknowledged completion.

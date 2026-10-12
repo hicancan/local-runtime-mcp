@@ -122,6 +122,23 @@ func (f *fixture) code() string {
 	return f.approve(ticket, cookies)
 }
 
+func TestConsentPolicyAllowsBrowserCallbackChain(t *testing.T) {
+	f := newFixture(t)
+	w := f.request(http.MethodGet, "/oauth/authorize?"+authorizeParams().Encode(), nil, nil, false)
+	policy := w.Header().Get("Content-Security-Policy")
+	if w.Code != http.StatusOK || strings.Contains(policy, "form-action") {
+		t.Fatal("consent policy would restrict cross-origin callback redirects")
+	}
+	for _, directive := range []string{"default-src 'none'", "frame-ancestors 'none'", "base-uri 'none'"} {
+		if !strings.Contains(policy, directive) {
+			t.Fatalf("consent policy omitted %s", directive)
+		}
+	}
+	if !strings.Contains(w.Body.String(), `method="post" action="/oauth/authorize"`) || w.Header().Get("Referrer-Policy") != "same-origin" || w.Header().Get("Cache-Control") != "no-store" || w.Header().Get("X-Frame-Options") != "DENY" {
+		t.Fatal("consent form lost its same-origin action or confidentiality headers")
+	}
+}
+
 func exchangeParams(code string) url.Values {
 	return url.Values{
 		"grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {testRedirect},

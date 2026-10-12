@@ -477,9 +477,10 @@ Go tests cover shared resource lifetimes, provider supervision, HTTP authenticat
 ```powershell
 $env:LOCAL_RUNTIME_MCP_BROWSER_E2E = '1'
 go test ./internal/browser -run 'TestEdgeExtension(IdleLifecycle|EndToEnd)' -count=3 -v
+go test ./internal/browser -run TestEdgeOAuthAuthorizationRedirect -count=3 -v
 ```
 
-CI exercises Windows, Linux, and macOS. Local protocol and browser tests validate those execution paths; live ChatGPT multi-conversation acceptance is performed separately against the configured client and tunnel.
+The OAuth browser regression exercises consent, cancellation, incorrect-key retry, cross-origin callback chains, client authentication, and refresh rotation with fixture credentials. CI exercises Windows, Linux, and macOS. Local protocol and browser tests validate those execution paths; live client acceptance is performed separately against the configured account and tunnel.
 
 ## Security, privacy, and license
 

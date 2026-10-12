@@ -210,7 +210,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+	// Chromium applies form-action to the entire POST redirect chain, including
+	// a registered callback's subsequent redirect to its client application.
+	// The form has a fixed same-origin action; approval still requires its bound
+	// cookie, ticket, Origin and owner key, with an exact registered callback.
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'")
 	switch r.URL.Path {
 	case "/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp":
 		if !method(w, r, http.MethodGet) {
@@ -327,6 +331,10 @@ var approvalPage = template.Must(template.New("approval").Parse(`<!doctype html>
 </form></main></body></html>`))
 
 func (s *Server) renderApproval(w http.ResponseWriter, status int, ticket string, request authorization, message string) {
+	// no-referrer makes Chromium send Origin: null for a non-CORS form POST.
+	// same-origin preserves the consent form's Origin while suppressing Referer
+	// on the cross-origin callback; protocol and error responses stay no-referrer.
+	w.Header().Set("Referrer-Policy", "same-origin")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	_ = approvalPage.Execute(w, struct{ Ticket, ClientID, Resource, Error string }{ticket, request.clientID, request.resource, message})

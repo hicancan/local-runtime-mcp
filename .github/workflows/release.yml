@@ -68,6 +68,12 @@ jobs:
       - run: go test ./...
       - run: go vet ./...
       - if: runner.os == 'Windows'
+        name: Verify OAuth consent and cross-origin callback chain in Edge
+        shell: pwsh
+        env:
+          LOCAL_RUNTIME_MCP_BROWSER_E2E: '1'
+        run: go test ./internal/browser -run TestEdgeOAuthAuthorizationRedirect -count=3 -timeout=5m -v
+      - if: runner.os == 'Windows'
         shell: pwsh
         env:
           LOCAL_RUNTIME_MCP_BROWSER_E2E: '1'

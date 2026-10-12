@@ -477,9 +477,10 @@ Go 测试覆盖共享资源生命周期、Provider 管理、HTTP 认证与 OAuth
 ```powershell
 $env:LOCAL_RUNTIME_MCP_BROWSER_E2E = '1'
 go test ./internal/browser -run 'TestEdgeExtension(IdleLifecycle|EndToEnd)' -count=3 -v
+go test ./internal/browser -run TestEdgeOAuthAuthorizationRedirect -count=3 -v
 ```
 
-CI 覆盖 Windows、Linux 和 macOS。本地协议与浏览器测试验证对应执行链路；真实 ChatGPT 多会话验收针对已配置的客户端和 Tunnel 单独进行。
+OAuth 浏览器回归使用测试凭据验证批准、取消、错误密钥重试、跨站回调链、客户端认证和刷新令牌轮换。CI 覆盖 Windows、Linux 和 macOS。本地协议与浏览器测试验证对应执行链路；真实客户端验收针对已配置的账户和 Tunnel 单独进行。
 
 ## 安全、隐私与协议
 

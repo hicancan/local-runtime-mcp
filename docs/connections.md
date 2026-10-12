@@ -58,7 +58,7 @@ These values are stored beside the executable where persistent storage is needed
    ./lrmcp.exe serve --transport http --tunnel openai --tunnel cloudflare
    ```
 
-7. Continue the client's connection flow. On Local Runtime's consent page, verify the public hostname, registered client, and requested access, then approve using the owner approval key.
+7. Continue the client's connection flow. On Local Runtime's consent page, verify the public hostname, registered client, and requested access, then approve using the owner approval key. The browser returns through the registered callback to the client application; token exchange and tool discovery complete the connection.
 8. Confirm the client discovers 21 tools. Start with read-only version, browser status, and file metadata checks before testing side effects.
 
 The callback URI must match exactly, including its path and any query component. Repeat `--redirect-uri` to register multiple permitted callbacks for one named client. Running setup again for the same name adds its callbacks while keeping existing credentials. The client name is its client ID; the default is `gemini`. Registration and `--show` display that client's credentials locally.
