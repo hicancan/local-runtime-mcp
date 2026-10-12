@@ -15,18 +15,35 @@ import (
 )
 
 func TestManagedProcessLifecycle(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	manager := NewManager(ctx)
-	result, err := manager.Run(context.Background(), Options{
-		Program: os.Args[0], Args: []string{"-test.run=TestProcessHelper", "--", "delayed"},
-		Environment: map[string]string{"LOCAL_RUNTIME_MCP_PROCESS_HELPER": "1"}, YieldTimeMS: 30,
+	t.Cleanup(func() { _ = manager.Close() })
+	result, err := manager.Run(ctx, Options{
+		Program: os.Args[0], Args: []string{"-test.run=TestProcessHelper", "--", "controlled_lifecycle"},
+		Environment: map[string]string{"LOCAL_RUNTIME_MCP_PROCESS_HELPER": "1", "GORACE": "atexit_sleep_ms=0"}, KeepStdinOpen: true, YieldTimeMS: 1,
 	})
-	if err != nil || !result.Running || result.SessionID == "" || !strings.Contains(result.Stdout, "first") {
+	if err != nil || !result.Running || result.SessionID == "" {
 		t.Fatalf("initial result = %+v, %v", result, err)
 	}
-	completed, err := manager.Continue(context.Background(), ContinueOptions{SessionID: result.SessionID, OutputCursor: result.OutputCursor, YieldTimeMS: 2000})
-	if err != nil || completed.Running || completed.ExitCode != 0 || !strings.Contains(completed.Stdout, "second") {
+	output, cursor := result.Stdout, result.OutputCursor
+	for !strings.Contains(strings.ReplaceAll(output, "\r\n", "\n"), "first\n") {
+		observed, err := manager.Continue(ctx, ContinueOptions{SessionID: result.SessionID, OutputCursor: cursor, YieldTimeMS: 50})
+		if err != nil || !observed.Running {
+			t.Fatalf("first output not observed while stdin remained open: %+v, %v", observed, err)
+		}
+		output += observed.Stdout
+		cursor = observed.OutputCursor
+	}
+	// The helper cannot exit until this explicit signal. OS startup speed does
+	// not determine which collection call contains its first line.
+	completed, err := manager.Continue(ctx, ContinueOptions{SessionID: result.SessionID, OutputCursor: cursor, CloseStdin: true, YieldTimeMS: 2000})
+	for err == nil && completed.Running {
+		output += completed.Stdout
+		cursor = completed.OutputCursor
+		completed, err = manager.Continue(ctx, ContinueOptions{SessionID: result.SessionID, OutputCursor: cursor, YieldTimeMS: 50})
+	}
+	if err != nil || completed.Running || completed.ExitCode != 0 || completed.Stderr != "" || strings.ReplaceAll(output+completed.Stdout, "\r\n", "\n") != "first\nsecond\n" {
 		t.Fatalf("completed result = %+v, %v", completed, err)
 	}
 }
@@ -212,6 +229,12 @@ func TestProcessHelper(t *testing.T) {
 	}
 	mode := os.Args[len(os.Args)-1]
 	switch mode {
+	case "controlled_lifecycle":
+		// Deliberately exceed the former 30ms assertion even on a fast runner.
+		time.Sleep(80 * time.Millisecond)
+		fmt.Print("first\n")
+		_, _ = io.ReadAll(os.Stdin)
+		fmt.Print("second\n")
 	case "delayed":
 		fmt.Print("first\n")
 		time.Sleep(150 * time.Millisecond)
