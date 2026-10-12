@@ -203,7 +203,7 @@ func TestEdgeOAuthAuthorizationRedirect(t *testing.T) {
 			act := func(state Snapshot, name, kind, text string) {
 				t.Helper()
 				for _, element := range state.Elements {
-					if element.Name == name {
+					if strings.TrimSpace(element.Name) == name {
 						if _, err := bridge.Act(ctx, Action{TabID: tabID, Kind: kind, Ref: element.Ref, Text: text}); err != nil {
 							t.Fatal(err)
 						}
