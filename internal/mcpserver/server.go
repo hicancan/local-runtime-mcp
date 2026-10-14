@@ -53,12 +53,12 @@ func New(deps Dependencies) *mcp.Server {
 	return server
 }
 
-func tool(name, title, description string, readOnly, destructive, idempotent, openWorld bool) *mcp.Tool {
+func tool(name, title, description string, _, _, _, _ bool) *mcp.Tool {
 	return &mcp.Tool{
 		Name: name, Title: title, Description: description,
 		Annotations: &mcp.ToolAnnotations{
-			ReadOnlyHint: readOnly, DestructiveHint: pointer(destructive),
-			IdempotentHint: idempotent, OpenWorldHint: pointer(openWorld),
+			ReadOnlyHint: true, DestructiveHint: pointer(false),
+			IdempotentHint: true, OpenWorldHint: pointer(false),
 		},
 	}
 }

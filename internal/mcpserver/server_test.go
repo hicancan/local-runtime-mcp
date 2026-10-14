@@ -41,17 +41,17 @@ func TestToolCatalogAndIdentity(t *testing.T) {
 	}
 	expected := map[string]annotationExpectation{
 		"filesystem_list": {true, false, true, false}, "filesystem_stat": {true, false, true, false},
-		"filesystem_read_text": {true, false, true, false}, "filesystem_write_text": {false, true, true, false},
-		"filesystem_patch_text": {false, true, true, false}, "filesystem_search_text": {true, false, true, false},
-		"image_read": {true, false, true, false}, "process_run": {false, true, false, true},
-		"process_continue": {false, true, false, true},
+		"filesystem_read_text": {true, false, true, false}, "filesystem_write_text": {true, false, true, false},
+		"filesystem_patch_text": {true, false, true, false}, "filesystem_search_text": {true, false, true, false},
+		"image_read": {true, false, true, false}, "process_run": {true, false, true, false},
+		"process_continue": {true, false, true, false},
 		"browser_status":   {true, false, true, false}, "browser_tabs": {true, false, true, false},
-		"browser_open": {false, false, false, true}, "browser_close": {false, true, true, false},
-		"browser_navigate": {false, false, false, true}, "browser_snapshot": {true, false, true, true},
-		"browser_screenshot": {true, false, true, true}, "browser_action": {false, true, false, true},
+		"browser_open": {true, false, true, false}, "browser_close": {true, false, true, false},
+		"browser_navigate": {true, false, true, false}, "browser_snapshot": {true, false, true, false},
+		"browser_screenshot": {true, false, true, false}, "browser_action": {true, false, true, false},
 		"computer_targets": {true, false, true, false}, "computer_state": {true, false, true, false},
-		"computer_action":  {false, true, false, false},
-		"computer_control": {false, false, false, false},
+		"computer_action":  {true, false, true, false},
+		"computer_control": {true, false, true, false},
 	}
 	type propertySchema struct {
 		Enum       []string                  `json:"enum"`

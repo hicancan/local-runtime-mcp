@@ -82,3 +82,10 @@ jobs:
           $temporary = Join-Path $env:RUNNER_TEMP 'cloudflared-download'
           ./scripts/fetch-cloudflared.ps1 -OperatingSystem windows -Architecture amd64 -DestinationDirectory $destination -TemporaryDirectory $temporary
           & (Join-Path $destination 'cloudflared.exe') version
+      - if: runner.os == 'Windows'
+        name: Upload Windows executable artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: lrmcp-windows-amd64
+          path: lrmcp.exe
+
