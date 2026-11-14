@@ -92,6 +92,33 @@ func TestLoadRejectsUnknownConfiguration(t *testing.T) {
 	}
 }
 
+func TestSaveKeepsLinkedConfiguration(t *testing.T) {
+	private := filepath.Join(t.TempDir(), "private", FileName)
+	if _, err := Save(private, &Config{OpenAI: OpenAI{TunnelID: "before"}}); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "portable", FileName)
+	if err := os.MkdirAll(filepath.Dir(link), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(private, link); err != nil {
+		t.Skipf("symbolic links unavailable here: %v", err)
+	}
+	if _, err := Save(link, &Config{OpenAI: OpenAI{TunnelID: "after"}}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(link)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("link replaced by a file: %v %v", info, err)
+	}
+	for _, path := range []string{private, link} {
+		got, err := Load(path)
+		if err != nil || got.OpenAI.TunnelID != "after" {
+			t.Fatalf("configuration at %s = %+v, %v", path, got, err)
+		}
+	}
+}
+
 func TestSaveRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "portable", FileName)
 	want := &Config{

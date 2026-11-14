@@ -157,10 +157,19 @@ func Save(path string, cfg *Config) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("encode configuration: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	// A configuration kept in a private store and linked beside the executable is
+	// replaced at its real location, so the link survives and secrets stay out of the
+	// portable directory.
+	destination := path
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		if destination, err = filepath.EvalSymlinks(path); err != nil {
+			return "", fmt.Errorf("resolve linked configuration: %w", err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
 		return "", err
 	}
-	temporary, err := os.CreateTemp(filepath.Dir(path), ".local-runtime-mcp-*")
+	temporary, err := os.CreateTemp(filepath.Dir(destination), ".local-runtime-mcp-*")
 	if err != nil {
 		return "", err
 	}
@@ -182,7 +191,7 @@ func Save(path string, cfg *Config) (string, error) {
 	if err := temporary.Close(); err != nil {
 		return "", err
 	}
-	if err := replaceFile(temporaryName, path); err != nil {
+	if err := replaceFile(temporaryName, destination); err != nil {
 		return "", err
 	}
 	committed = true
