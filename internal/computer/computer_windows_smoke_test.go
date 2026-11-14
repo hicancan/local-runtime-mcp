@@ -19,7 +19,7 @@ func TestWindowsDesktopSmoke(t *testing.T) {
 	defer cancel()
 	controller := New(ctx)
 	defer controller.Close()
-	targets, err := controller.Targets(ctx)
+	targets, err := controller.Targets(ctx, TargetsOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

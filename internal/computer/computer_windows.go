@@ -24,7 +24,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-const computerWorkerVersion = "12.0.1"
+const computerWorkerVersion = "13.0.0"
 
 //go:embed worker_windows_amd64.exe
 var workerExecutable embed.FS
@@ -86,16 +86,19 @@ func New(ctx context.Context) Controller {
 	}()
 	return c
 }
-func (c *workerController) Targets(ctx context.Context) (TargetsResult, error) {
-	var result []Window
-	_, err := c.call(ctx, "targets", struct{}{}, &result)
-	return TargetsResult{Windows: result}, err
+func (c *workerController) Targets(ctx context.Context, options TargetsOptions) (TargetsResult, error) {
+	var result TargetsResult
+	_, err := c.call(ctx, "targets", options, &result)
+	return result, err
 }
 func (c *workerController) State(ctx context.Context, options StateOptions) ([]byte, State, error) {
 	var state State
 	response, err := c.call(ctx, "state", options, &state)
 	if err != nil {
 		return nil, State{}, err
+	}
+	if response.ImageBase64 == "" {
+		return nil, state, nil
 	}
 	data, err := base64.StdEncoding.DecodeString(response.ImageBase64)
 	return data, state, err

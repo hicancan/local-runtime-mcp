@@ -50,7 +50,7 @@ func TestToolCatalogAndIdentity(t *testing.T) {
 		"browser_navigate": {true, false, true, false}, "browser_snapshot": {true, false, true, false},
 		"browser_screenshot": {true, false, true, false}, "browser_action": {true, false, true, false},
 		"computer_targets": {true, false, true, false}, "computer_state": {true, false, true, false},
-		"computer_action":  {true, false, true, false},
+		"computer_action": {true, false, true, false}, "computer_wait": {true, false, true, false},
 		"computer_control": {true, false, true, false},
 	}
 	type propertySchema struct {
@@ -95,14 +95,14 @@ func TestToolCatalogAndIdentity(t *testing.T) {
 	}
 	assertEnum(t, schemas["browser_navigate"]["kind"].Enum, []string{"url", "back", "forward", "reload"})
 	assertEnum(t, schemas["browser_action"]["kind"].Enum, []string{"click", "double_click", "hover", "drag", "type_text", "set_value", "press_key", "scroll", "select", "check", "upload_files", "handle_dialog", "evaluate"})
-	assertEnum(t, schemas["computer_action"]["kind"].Enum, []string{"activate", "move", "click", "double_click", "drag", "type_text", "set_value", "press_key", "scroll"})
+	assertEnum(t, schemas["computer_action"]["kind"].Enum, []string{"invoke", "toggle", "select", "expand", "collapse", "set_value", "scroll_into_view", "scroll_by", "place", "activate", "move", "click", "double_click", "drag", "type_text", "press_key", "scroll"})
 	assertEnum(t, schemas["computer_control"]["kind"].Enum, []string{"acquire", "status", "release"})
 	assertEnum(t, schemas["filesystem_write_text"]["mode"].Enum, []string{"create", "replace"})
 	for name, fields := range map[string][]string{
 		"browser_tabs": {"browser_id"}, "browser_open": {"browser_id", "url"},
 		"browser_close": {"tab_id"}, "browser_navigate": {"tab_id", "kind"},
 		"browser_snapshot": {"tab_id"}, "browser_screenshot": {"tab_id"}, "browser_action": {"tab_id", "kind"},
-		"computer_control": {"kind"}, "computer_action": {"control_id", "kind"},
+		"computer_control": {"kind"}, "computer_action": {"kind"}, "computer_wait": {"target_id"},
 		"filesystem_write_text": {"mode", "path", "content"},
 	} {
 		for _, field := range fields {

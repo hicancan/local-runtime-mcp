@@ -10,7 +10,7 @@ import (
 type unsupportedController struct{}
 
 func New(ctx context.Context) Controller { return newCoordinator(ctx, &unsupportedController{}) }
-func (*unsupportedController) Targets(context.Context) (TargetsResult, error) {
+func (*unsupportedController) Targets(context.Context, TargetsOptions) (TargetsResult, error) {
 	return TargetsResult{}, errors.New("the Rust computer backend is currently distributed for Windows amd64 only")
 }
 func (*unsupportedController) State(context.Context, StateOptions) ([]byte, State, error) {

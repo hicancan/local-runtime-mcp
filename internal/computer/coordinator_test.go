@@ -20,7 +20,9 @@ type fakeBackend struct {
 	resetFail    atomic.Bool
 }
 
-func (*fakeBackend) Targets(context.Context) (TargetsResult, error) { return TargetsResult{}, nil }
+func (*fakeBackend) Targets(context.Context, TargetsOptions) (TargetsResult, error) {
+	return TargetsResult{}, nil
+}
 func (b *fakeBackend) State(ctx context.Context, options StateOptions) ([]byte, State, error) {
 	return []byte{1}, State{StateID: time.Unix(b.sequence.Add(1), 0).String(), Elements: []Element{{RefID: "element"}}}, nil
 }
@@ -88,7 +90,8 @@ func TestControlOwnershipAndReadOnly(t *testing.T) {
 		t.Fatal("status leaked owner token")
 	}
 	_, readOnly, err := c.State(context.Background(), StateOptions{})
-	if err != nil || readOnly.Actionable || readOnly.StateID != "" || readOnly.Elements[0].RefID != "" {
+	// Tokenless observations keep their refs for semantic actions but cannot drive physical input.
+	if err != nil || readOnly.Actionable || readOnly.Elements[0].RefID == "" {
 		t.Fatalf("read-only: %+v %v", readOnly, err)
 	}
 	controlled := observation(t, c, id)

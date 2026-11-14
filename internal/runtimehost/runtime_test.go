@@ -58,7 +58,7 @@ func TestConcurrentClientsShareHostButNotResponseIdentity(t *testing.T) {
 	}
 	_ = a.Close()
 	tools, err := b.ListTools(ctx, nil)
-	if err != nil || len(tools.Tools) != 21 {
+	if err != nil || len(tools.Tools) != 22 {
 		t.Fatalf("remaining client: count=%v err=%v", tools, err)
 	}
 }

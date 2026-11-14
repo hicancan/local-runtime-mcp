@@ -56,7 +56,7 @@ func TestExecutableStdio(t *testing.T) {
 		t.Fatalf("unexpected executable identity: %+v", identity)
 	}
 	catalog, err := session.ListTools(ctx, nil)
-	if err != nil || len(catalog.Tools) != 21 {
+	if err != nil || len(catalog.Tools) != 22 {
 		t.Fatalf("executable tool catalog: %v; %v", catalog, err)
 	}
 	call := func(name string, arguments any, output any) *mcp.CallToolResult {

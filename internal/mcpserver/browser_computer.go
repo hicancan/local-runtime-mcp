@@ -29,15 +29,23 @@ func registerBrowserTools(server *mcp.Server, bridge *browser.Bridge) {
 }
 
 func registerComputerTools(server *mcp.Server, controller computer.Controller) {
-	controlTool := inputTool[computer.ControlOptions](tool("computer_control", "Manage desktop control", "Acquire the shared desktop control token, inspect ownership without revealing its token, or release control. Background browser work remains parallel.", false, false, false, false), func(schema *jsonschema.Schema) {
+	controlTool := inputTool[computer.ControlOptions](tool("computer_control", "Manage desktop control", "Acquire, inspect or release the shared pointer and keyboard. Only physical input needs it; observing, waiting, semantic actions and place work without it. While held, a small pill at the bottom of the display shows that AI is operating and stops it when clicked.", false, false, false, false), func(schema *jsonschema.Schema) {
 		schema.Properties["kind"].Enum = enum("acquire", "status", "release")
 	})
 	mcp.AddTool(server, controlTool, computerControl(controller))
-	mcp.AddTool(server, tool("computer_targets", "List desktop targets", "Return an object with a windows array of open top-level windows and opaque validated target IDs.", true, false, true, false), computerTargets(controller))
-	mcp.AddTool(server, tool("computer_state", "Read desktop state", "Return WGC PNG pixels in native MCP image content, with bounded UI Automation elements, dimensions and state_id in structuredContent. Observe the desktop or one target. Supply control_id to retain actionable state and element IDs; tokenless observation is read-only.", true, false, true, false), computerState(controller))
-	computerActionTool := inputTool[computer.Action](tool("computer_action", "Control desktop", "Activate a target, or use coordinates or a UI Automation ref from the exact foreground computer_state. Every action invalidates every prior state.", false, true, false, false), func(schema *jsonschema.Schema) {
-		schema.Properties["kind"].Enum = enum("activate", "move", "click", "double_click", "drag", "type_text", "set_value", "press_key", "scroll")
+	mcp.AddTool(server, tool("computer_targets", "List displays and windows", "Return every display (ID, bounds, work area, scale, primary) and the visible top-level windows (opaque target ID, process, title, class, visible frame, normal/minimized/maximized, display). Filter by pid, title or process.", true, false, true, false), computerTargets(controller))
+	stateTool := inputTool[computer.StateOptions](tool("computer_state", "Observe desktop", "Observe one window, one display or every display: PNG pixels (windows are captured even when covered) and, for a window, its UI Automation tree with text, names, AutomationIds, values, states and supported patterns. Filter and page elements, crop a region, or skip pixels. Element ref_ids drive semantic actions; physical input needs a state observed with control_id.", true, false, true, false), func(schema *jsonschema.Schema) {
+		schema.Properties["elements"].Enum = enum("all", "interactive", "none")
+	})
+	mcp.AddTool(server, stateTool, computerState(controller))
+	waitTool := inputTool[computer.WaitOptions](tool("computer_wait", "Wait for desktop element", "Poll a window's UI Automation tree until an element matching name, automation_id or role is present or absent, then return that observation with its ref_ids and whether the condition was met.", true, false, true, false), func(schema *jsonschema.Schema) {
+		schema.Properties["until"].Enum = enum("present", "absent")
+	})
+	mcp.AddTool(server, waitTool, computerWait(controller))
+	computerActionTool := inputTool[computer.Action](tool("computer_action", "Act on desktop", "Semantic actions (invoke, toggle, select, expand, collapse, set_value, scroll_into_view, scroll_by) operate an element through UI Automation by its ref_id, and place moves, restores or minimizes a window; none of them touches the pointer, keyboard or foreground, so the person at the computer is undisturbed. Physical input (activate, move, click, double_click, drag, type_text, press_key, scroll) needs control_id and a state observed with it; it invalidates prior states.", false, true, false, false), func(schema *jsonschema.Schema) {
+		schema.Properties["kind"].Enum = enum("invoke", "toggle", "select", "expand", "collapse", "set_value", "scroll_into_view", "scroll_by", "place", "activate", "move", "click", "double_click", "drag", "type_text", "press_key", "scroll")
 		schema.Properties["button"].Enum = enum("left", "middle", "right")
+		schema.Properties["show"].Enum = enum("restore", "minimize", "maximize")
 	})
 	mcp.AddTool(server, computerActionTool, computerAction(controller))
 }
@@ -183,12 +191,12 @@ func computerControl(controller computer.Controller) func(context.Context, *mcp.
 	}
 }
 
-func computerTargets(controller computer.Controller) func(context.Context, *mcp.CallToolRequest, emptyInput) (*mcp.CallToolResult, computer.TargetsResult, error) {
-	return func(ctx context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, computer.TargetsResult, error) {
+func computerTargets(controller computer.Controller) func(context.Context, *mcp.CallToolRequest, computer.TargetsOptions) (*mcp.CallToolResult, computer.TargetsResult, error) {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in computer.TargetsOptions) (*mcp.CallToolResult, computer.TargetsResult, error) {
 		if controller == nil {
 			return nil, computer.TargetsResult{}, errors.New("computer control is unavailable on this platform")
 		}
-		result, err := controller.Targets(ctx)
+		result, err := controller.Targets(ctx, in)
 		return nil, result, err
 	}
 }
@@ -199,11 +207,30 @@ func computerState(controller computer.Controller) func(context.Context, *mcp.Ca
 			return nil, computer.State{}, errors.New("computer control is unavailable on this platform")
 		}
 		data, state, err := controller.State(ctx, in)
-		if err != nil {
-			return nil, computer.State{}, err
-		}
-		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.ImageContent{Data: data, MIMEType: state.MIMEType}}}, state, nil
+		return observation(data, state, err)
 	}
+}
+
+func computerWait(controller computer.Controller) func(context.Context, *mcp.CallToolRequest, computer.WaitOptions) (*mcp.CallToolResult, computer.State, error) {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in computer.WaitOptions) (*mcp.CallToolResult, computer.State, error) {
+		if controller == nil {
+			return nil, computer.State{}, errors.New("computer control is unavailable on this platform")
+		}
+		data, state, err := controller.Wait(ctx, in)
+		return observation(data, state, err)
+	}
+}
+
+// observation returns the pixels as native image content when there are any; the state is
+// always the structured content.
+func observation(data []byte, state computer.State, err error) (*mcp.CallToolResult, computer.State, error) {
+	if err != nil {
+		return nil, computer.State{}, err
+	}
+	if len(data) == 0 {
+		return nil, state, nil
+	}
+	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.ImageContent{Data: data, MIMEType: state.MIMEType}}}, state, nil
 }
 
 func computerAction(controller computer.Controller) func(context.Context, *mcp.CallToolRequest, computer.Action) (*mcp.CallToolResult, computer.ActionResult, error) {

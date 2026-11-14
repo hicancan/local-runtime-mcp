@@ -11,7 +11,7 @@ type unsupportedController struct{}
 
 func New(ctx context.Context) Controller { return newCoordinator(ctx, &unsupportedController{}) }
 
-func (*unsupportedController) Targets(context.Context) (TargetsResult, error) {
+func (*unsupportedController) Targets(context.Context, TargetsOptions) (TargetsResult, error) {
 	return TargetsResult{}, errors.New("computer control is currently implemented only on Windows")
 }
 

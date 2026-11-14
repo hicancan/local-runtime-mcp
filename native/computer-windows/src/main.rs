@@ -11,26 +11,30 @@ use base64::Engine as _;
 use image::{GenericImage, ImageEncoder, RgbaImage, codecs::png::PngEncoder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use windows::Win32::Foundation::{CloseHandle, FILETIME, HWND, POINT, RECT};
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO};
-use windows::Win32::System::Threading::{
-    AttachThreadInput, GetCurrentThreadId, GetProcessTimes, OpenProcess,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+use windows::Win32::Foundation::{CloseHandle, FILETIME, HWND, LPARAM, POINT, RECT};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
 };
-use windows::Win32::UI::Accessibility::{
-    UIA_ButtonControlTypeId, UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId,
-    UIA_EditControlTypeId, UIA_HyperlinkControlTypeId, UIA_ListItemControlTypeId,
-    UIA_MenuItemControlTypeId, UIA_RadioButtonControlTypeId, UIA_SliderControlTypeId,
-    UIA_TabItemControlTypeId, UIA_TreeItemControlTypeId,
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MONITORINFOEXW, MonitorFromWindow,
+};
+use windows::Win32::System::Threading::{
+    AttachThreadInput, GetCurrentThreadId, GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, MDT_EFFECTIVE_DPI,
+    SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId, IsIconic,
-    IsWindow, IsWindowVisible, SW_RESTORE, SetForegroundWindow, ShowWindow, SwitchToThisWindow,
+    BringWindowToTop, GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowRect,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SW_RESTORE,
+    SW_SHOWMAXIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER,
+    SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, SwitchToThisWindow,
 };
+use windows::core::BOOL;
 use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame;
 use windows_capture::graphics_capture_api::InternalCaptureControl;
@@ -46,9 +50,10 @@ mod overlay;
 mod uia;
 use input::{check_cancel, mouse_button, move_to, press_key, send_mouse, type_text};
 
-const VERSION: &str = "12.0.1";
-const MAX_STATES: usize = 64;
-const MAX_ELEMENTS: usize = 500;
+const VERSION: &str = "13.0.0";
+const MAX_STATES: usize = 256;
+const DEFAULT_ELEMENTS: usize = 300;
+const MAX_ELEMENTS: usize = 5000;
 
 #[derive(Deserialize)]
 struct Request {
@@ -69,6 +74,7 @@ struct Response {
     image_base64: Option<String>,
 }
 
+/// Physical pixels in the virtual desktop, or relative to an observation origin where stated.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
 struct Rectangle {
     x: i32,
@@ -77,22 +83,77 @@ struct Rectangle {
     height: i32,
 }
 
+impl Rectangle {
+    fn contains(&self, x: i32, y: i32) -> bool {
+        x >= self.x && y >= self.y && x < self.x + self.width && y < self.y + self.height
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct Display {
+    display_id: String,
+    bounds: Rectangle,
+    work_area: Rectangle,
+    scale: f32,
+    primary: bool,
+    #[serde(skip)]
+    handle: isize,
+}
+
 #[derive(Serialize)]
 struct Target {
     target_id: String,
     pid: u32,
+    process: String,
     title: String,
+    class_name: String,
     bounds: Rectangle,
+    state: &'static str,
+    display_id: String,
     active: bool,
+}
+
+#[derive(Serialize)]
+struct Targets {
+    displays: Vec<Display>,
+    windows: Vec<Target>,
+}
+
+#[derive(Deserialize, Default)]
+struct TargetsParams {
+    #[serde(default)]
+    pid: u32,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    process: String,
 }
 
 #[derive(Clone, Serialize)]
 struct Element {
     ref_id: String,
     role: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     name: String,
-    bounds: Rectangle,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    automation_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    class_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bounds: Option<Rectangle>,
+    depth: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent: Option<u32>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     disabled: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    offscreen: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    focused: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    patterns: Vec<&'static str>,
     #[serde(skip)]
     native_ref: u64,
 }
@@ -103,18 +164,27 @@ struct StateOutput {
     #[serde(skip_serializing_if = "String::is_empty")]
     target_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
+    display_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     title: String,
     origin_x: i32,
     origin_y: i32,
     width: i32,
     height: i32,
+    scale: f32,
     cursor_x: i32,
     cursor_y: i32,
+    has_image: bool,
     mime_type: &'static str,
     elements: Vec<Element>,
+    elements_total: usize,
     elements_truncated: bool,
     actionable: bool,
     uia_status: String,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -123,6 +193,25 @@ struct StateParams {
     control_id: String,
     #[serde(default)]
     target_id: String,
+    #[serde(default)]
+    display_id: String,
+    region: Option<Rectangle>,
+    #[serde(default = "yes")]
+    image: bool,
+    #[serde(default)]
+    cursor: bool,
+    #[serde(default)]
+    elements: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    automation_id: String,
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    max_elements: usize,
+    #[serde(default)]
+    offset: usize,
 }
 
 #[derive(Deserialize)]
@@ -148,6 +237,9 @@ struct ActionParams {
     scroll_x: i32,
     #[serde(default)]
     scroll_y: i32,
+    bounds: Option<Rectangle>,
+    #[serde(default)]
+    show: String,
 }
 
 #[derive(Clone)]
@@ -157,6 +249,8 @@ struct StateRecord {
     target_id: String,
     foreground: isize,
     bounds: Rectangle,
+    frame: Option<Rectangle>,
+    actionable: bool,
     elements: HashMap<String, u64>,
 }
 
@@ -168,6 +262,17 @@ struct Engine {
     uia: uia::Worker,
     overlay: overlay::Overlay,
 }
+
+const SEMANTIC: [&str; 8] = [
+    "invoke",
+    "toggle",
+    "select",
+    "expand",
+    "collapse",
+    "set_value",
+    "scroll_into_view",
+    "scroll_by",
+];
 
 impl Engine {
     fn new() -> Self {
@@ -190,18 +295,22 @@ impl Engine {
                 json!({"version": VERSION, "backend": "windows-rust-wgc-uia"}),
                 None,
             )),
-            "targets" => Ok((
-                serde_json::to_value(self.targets()?).map_err(error_string)?,
-                None,
-            )),
+            "targets" => {
+                let params: TargetsParams = if request.params.is_null() {
+                    TargetsParams::default()
+                } else {
+                    serde_json::from_value(request.params.clone()).map_err(error_string)?
+                };
+                Ok((
+                    serde_json::to_value(targets(&params)?).map_err(error_string)?,
+                    None,
+                ))
+            }
             "state" => {
                 let params: StateParams =
                     serde_json::from_value(request.params.clone()).map_err(error_string)?;
                 let (state, image) = self.state(params)?;
-                Ok((
-                    serde_json::to_value(state).map_err(error_string)?,
-                    Some(image),
-                ))
+                Ok((serde_json::to_value(state).map_err(error_string)?, image))
             }
             "act" => {
                 let params: ActionParams =
@@ -211,10 +320,7 @@ impl Engine {
             }
             "show_control" => {
                 self.invalidate();
-                self.overlay.show(
-                    request.params["label"].as_str().unwrap_or("AI control"),
-                    desktop_bounds()?,
-                )?;
+                self.overlay.show()?;
                 Ok((json!({"success":true}), None))
             }
             "invalidate" => {
@@ -228,144 +334,200 @@ impl Engine {
         }
     }
 
-    fn targets(&self) -> Result<Vec<Target>, String> {
-        let foreground = unsafe { GetForegroundWindow() }.0 as isize;
-        let mut output = Vec::new();
-        for window in CaptureWindow::enumerate().map_err(error_string)? {
-            let title = window.title().map_err(error_string)?;
-            let pid = window.process_id().map_err(error_string)?;
-            if pid == std::process::id() {
-                continue;
-            }
-            let rect = window.rect().map_err(error_string)?;
-            let bounds = rectangle(rect);
-            if title.trim().is_empty() || bounds.width <= 0 || bounds.height <= 0 {
-                continue;
-            }
-            let raw = window.as_raw_hwnd() as isize;
-            let started = match process_start(pid) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            output.push(Target {
-                target_id: target_id(raw, pid, started),
-                pid,
-                title,
-                bounds,
-                active: raw == foreground,
-            });
-        }
-        output.sort_by_key(|target| (!target.active, target.title.to_lowercase()));
-        Ok(output)
-    }
-
-    fn state(&mut self, params: StateParams) -> Result<(StateOutput, Vec<u8>), String> {
+    fn state(&mut self, params: StateParams) -> Result<(StateOutput, Option<Vec<u8>>), String> {
         check_cancel()?;
-        let (target, title, bounds) = if params.target_id.is_empty() {
-            (None, String::new(), desktop_bounds()?)
-        } else {
+        let actionable = !params.control_id.is_empty();
+        if !params.target_id.is_empty() && !params.display_id.is_empty() {
+            return Err("observe a target_id or a display_id, not both".into());
+        }
+        let scope = match params.elements.as_str() {
+            "" | "all" => "all",
+            "interactive" => "interactive",
+            "none" => "none",
+            other => {
+                return Err(format!(
+                    "elements must be all, interactive or none, not {other:?}"
+                ));
+            }
+        };
+        let limit = match params.max_elements {
+            0 => DEFAULT_ELEMENTS,
+            value if value <= MAX_ELEMENTS => value,
+            _ => return Err(format!("max_elements must be at most {MAX_ELEMENTS}")),
+        };
+        let displays = displays()?;
+        let (window, display, title, area) = if !params.target_id.is_empty() {
             let window = resolve_target(&params.target_id)?;
-            if !params.control_id.is_empty() {
+            if actionable {
                 require_foreground(window)?;
             }
-            let capture = CaptureWindow::from_raw_hwnd(window.0);
-            (
-                Some(window),
-                capture.title().map_err(error_string)?,
-                rectangle(capture.rect().map_err(error_string)?),
-            )
+            let bounds = frame_bounds(window);
+            let display = display_of(&displays, window);
+            (Some(window), display, window_title(window), bounds)
+        } else if !params.display_id.is_empty() {
+            let display = displays
+                .iter()
+                .find(|display| display.display_id == params.display_id)
+                .ok_or("display_id is unknown; call computer_targets again")?;
+            (None, Some(display.clone()), String::new(), display.bounds)
+        } else {
+            (None, None, String::new(), virtual_bounds(&displays)?)
         };
         let foreground_before = unsafe { GetForegroundWindow() }.0 as isize;
-        let (image, width, height) = match target {
-            Some(window) => capture_item(CaptureWindow::from_raw_hwnd(window.0))?,
-            None => capture_desktop(bounds)?,
+        let image = if params.image {
+            let frame = match (window, &display) {
+                (Some(window), _) => {
+                    if unsafe { IsIconic(window) }.as_bool() {
+                        return Err(
+                            "target is minimized; computer_action place with show=restore brings it back without activating it"
+                                .into(),
+                        );
+                    }
+                    capture_frame(CaptureWindow::from_raw_hwnd(window.0), params.cursor)?
+                }
+                (None, Some(display)) => capture_display(display, params.cursor)?,
+                (None, None) => capture_desktop(&displays, area, params.cursor)?,
+            };
+            Some(frame)
+        } else {
+            None
         };
-        let foreground_after = unsafe { GetForegroundWindow() }.0 as isize;
-        if foreground_before != foreground_after {
-            return Err(
-                "foreground window changed during capture; call computer_state again".into(),
-            );
+        // Window captures are of the visible frame; trust the captured size over the queried one.
+        let mut origin = area;
+        if let Some(frame) = &image {
+            origin.width = frame.width() as i32;
+            origin.height = frame.height() as i32;
         }
-        let uia_window = target.unwrap_or(HWND(foreground_after as *mut _));
-        let (mut elements, elements_truncated, uia_status) = self.uia.collect(
-            uia_window,
-            bounds,
-            MAX_ELEMENTS,
-            !params.control_id.is_empty(),
-        );
-        check_cancel()?;
-        if unsafe { GetForegroundWindow() }.0 as isize != foreground_after {
-            return Err(
-                "foreground changed during accessibility observation; observe again".into(),
-            );
-        }
-        if let Some(window) = target {
-            if rectangle(
-                CaptureWindow::from_raw_hwnd(window.0)
-                    .rect()
-                    .map_err(error_string)?,
-            ) != bounds
-            {
-                return Err("target bounds changed during observation; observe again".into());
+        let (image, origin) = match params.region {
+            Some(region) => {
+                if region.width <= 0
+                    || region.height <= 0
+                    || region.x < 0
+                    || region.y < 0
+                    || region.x + region.width > origin.width
+                    || region.y + region.height > origin.height
+                {
+                    return Err(format!(
+                        "region must lie within the {}x{} observed area",
+                        origin.width, origin.height
+                    ));
+                }
+                let cropped = image.map(|frame| {
+                    image::imageops::crop_imm(
+                        &frame,
+                        region.x as u32,
+                        region.y as u32,
+                        region.width as u32,
+                        region.height as u32,
+                    )
+                    .to_image()
+                });
+                (
+                    cropped,
+                    Rectangle {
+                        x: origin.x + region.x,
+                        y: origin.y + region.y,
+                        width: region.width,
+                        height: region.height,
+                    },
+                )
             }
-        } else if desktop_bounds()? != bounds {
-            return Err("desktop bounds changed during observation; observe again".into());
+            None => (image, origin),
+        };
+        let (mut elements, total, uia_status) = match (window, scope) {
+            (_, "none") => (Vec::new(), 0, "not_requested".to_string()),
+            (None, _) => (Vec::new(), 0, "window_target_required".to_string()),
+            (Some(window), scope) => match self.uia.collect(
+                window,
+                origin,
+                uia::Query {
+                    scope: scope.into(),
+                    name: params.name.clone(),
+                    automation_id: params.automation_id.clone(),
+                    role: params.role.clone(),
+                    limit,
+                    offset: params.offset,
+                },
+            ) {
+                Ok(collected) => (collected.elements, collected.total, "available".to_string()),
+                Err(error) => (Vec::new(), 0, error),
+            },
+        };
+        check_cancel()?;
+        let foreground_after = unsafe { GetForegroundWindow() }.0 as isize;
+        if actionable && foreground_before != foreground_after {
+            return Err("foreground changed during observation; observe again".into());
         }
         self.sequence += 1;
         let state_id = format!("c{:x}-{}-{}", self.nonce, self.epoch, self.sequence);
         let mut element_map = HashMap::new();
         for (index, element) in elements.iter_mut().enumerate() {
-            if !params.control_id.is_empty() {
-                element.ref_id = format!("{}:u{}", state_id, index + 1);
-                element_map.insert(element.ref_id.clone(), element.native_ref);
-            }
+            element.ref_id = format!("{}:e{}", state_id, params.offset + index + 1);
+            element_map.insert(element.ref_id.clone(), element.native_ref);
         }
         let mut cursor = POINT::default();
         unsafe {
             let _ = GetCursorPos(&mut cursor);
         }
+        let truncated = params.offset + elements.len() < total;
+        let encoded = match &image {
+            Some(frame) => Some(encode_png(frame)?),
+            None => None,
+        };
         let state = StateOutput {
-            state_id: if params.control_id.is_empty() {
-                String::new()
-            } else {
-                state_id.clone()
-            },
+            state_id: state_id.clone(),
             target_id: params.target_id.clone(),
+            display_id: display
+                .as_ref()
+                .map(|display| display.display_id.clone())
+                .unwrap_or_default(),
             title,
-            origin_x: bounds.x,
-            origin_y: bounds.y,
-            width,
-            height,
-            cursor_x: cursor.x - bounds.x,
-            cursor_y: cursor.y - bounds.y,
+            origin_x: origin.x,
+            origin_y: origin.y,
+            width: origin.width,
+            height: origin.height,
+            scale: display.as_ref().map(|display| display.scale).unwrap_or(1.0),
+            cursor_x: cursor.x - origin.x,
+            cursor_y: cursor.y - origin.y,
+            has_image: encoded.is_some(),
             mime_type: "image/png",
             elements,
-            elements_truncated,
-            actionable: !params.control_id.is_empty(),
+            elements_total: total,
+            elements_truncated: truncated,
+            actionable,
             uia_status,
         };
         if self.states.len() >= MAX_STATES {
             self.states.clear();
         }
-        if !params.control_id.is_empty() {
-            self.states.insert(
-                state_id,
-                StateRecord {
-                    stop_generation: STOP_GENERATION.load(Ordering::SeqCst),
-                    epoch: self.epoch,
-                    target_id: params.target_id,
-                    foreground: foreground_after,
-                    bounds,
-                    elements: element_map,
-                },
-            );
-            self.overlay.target(bounds);
+        self.states.insert(
+            state_id,
+            StateRecord {
+                stop_generation: STOP_GENERATION.load(Ordering::SeqCst),
+                epoch: self.epoch,
+                target_id: params.target_id,
+                foreground: foreground_after,
+                bounds: origin,
+                frame: window.map(frame_bounds),
+                actionable,
+                elements: element_map,
+            },
+        );
+        if actionable {
+            self.overlay.near(origin);
         }
-        Ok((state, image))
+        Ok((state, encoded))
     }
 
     fn act(&mut self, params: ActionParams) -> Result<(), String> {
         check_cancel()?;
+        if params.kind == "place" {
+            let window = resolve_target(&params.target_id)?;
+            return place_window(window, params.bounds, &params.show);
+        }
+        if SEMANTIC.contains(&params.kind.as_str()) {
+            return self.semantic(&params);
+        }
         if params.kind == "activate" {
             if params.target_id.is_empty() || !params.state_id.is_empty() {
                 return Err("activate requires target_id and does not accept state_id".into());
@@ -373,11 +535,7 @@ impl Engine {
             let window = resolve_target(&params.target_id)?;
             self.invalidate();
             activate(window)?;
-            self.overlay.target(rectangle(
-                CaptureWindow::from_raw_hwnd(window.0)
-                    .rect()
-                    .map_err(error_string)?,
-            ));
+            self.overlay.near(frame_bounds(window));
             return Ok(());
         }
         if params.state_id.is_empty() {
@@ -390,6 +548,12 @@ impl Engine {
             .get(&params.state_id)
             .cloned()
             .ok_or("state_id is unknown or stale; call computer_state again")?;
+        if !record.actionable {
+            return Err(
+                "physical input needs a state observed with control_id; semantic actions do not"
+                    .into(),
+            );
+        }
         if record.epoch != self.epoch
             || record.target_id != params.target_id
             || record.stop_generation != STOP_GENERATION.load(Ordering::SeqCst)
@@ -400,15 +564,10 @@ impl Engine {
         if foreground != record.foreground {
             return Err("foreground window changed; call computer_state again".into());
         }
-        if !params.target_id.is_empty() {
-            let current = rectangle(
-                CaptureWindow::from_raw_hwnd(resolve_target(&params.target_id)?.0)
-                    .rect()
-                    .map_err(error_string)?,
-            );
-            if current != record.bounds {
-                return Err("target bounds changed; call computer_state again".into());
-            }
+        if !params.target_id.is_empty()
+            && Some(frame_bounds(resolve_target(&params.target_id)?)) != record.frame
+        {
+            return Err("target bounds changed; call computer_state again".into());
         }
         self.invalidate();
         let live = if params.element_ref.is_empty() {
@@ -418,35 +577,57 @@ impl Engine {
                 .elements
                 .get(&params.element_ref)
                 .ok_or("element_ref unknown or stale")?;
-            if params.kind == "set_value" {
-                self.uia
-                    .set_value(key, params.text.clone(), record.foreground)?;
-                return Ok(());
-            }
-            Some(self.uia.resolve(key)?)
+            Some(self.uia.bounds(key)?)
         };
-        if params.kind == "set_value" {
-            return Err("set_value requires a UIA element_ref".into());
-        }
         check_cancel()?;
         if unsafe { GetForegroundWindow() }.0 as isize != record.foreground {
             return Err("foreground changed during element resolution; observe again".into());
         }
-        if !params.target_id.is_empty()
-            && rectangle(
-                CaptureWindow::from_raw_hwnd(resolve_target(&params.target_id)?.0)
-                    .rect()
-                    .map_err(error_string)?,
-            ) != record.bounds
-        {
-            return Err("target bounds changed during element resolution; observe again".into());
-        }
-        let result = perform_action(&params, &record, live, &self.overlay);
+        let result = perform_action(&params, &record, live);
         if !input::release_all() {
             return Err("injected input cleanup incomplete; release desktop control".into());
         }
-        result?;
-        Ok(())
+        result
+    }
+
+    /// Operates a control through its automation pattern: no foreground, pointer or keyboard.
+    fn semantic(&mut self, params: &ActionParams) -> Result<(), String> {
+        if params.element_ref.is_empty() {
+            return Err(format!("{} requires element_ref", params.kind));
+        }
+        let state_id = params
+            .element_ref
+            .rsplit_once(':')
+            .map(|(state, _)| state)
+            .ok_or("element_ref is invalid")?;
+        let record = self
+            .states
+            .get(state_id)
+            .ok_or("element_ref belongs to an expired observation; observe again")?;
+        if record.stop_generation != STOP_GENERATION.load(Ordering::SeqCst) {
+            return Err("desktop control was stopped locally; observe again".into());
+        }
+        let key = *record
+            .elements
+            .get(&params.element_ref)
+            .ok_or("element_ref unknown or stale")?;
+        let action = match params.kind.as_str() {
+            "invoke" => uia::Semantic::Invoke,
+            "toggle" => uia::Semantic::Toggle,
+            "select" => uia::Semantic::Select,
+            "expand" => uia::Semantic::Expand,
+            "collapse" => uia::Semantic::Collapse,
+            "set_value" => uia::Semantic::SetValue(params.text.clone()),
+            "scroll_into_view" => uia::Semantic::ScrollIntoView,
+            "scroll_by" => {
+                if params.scroll_x == 0 && params.scroll_y == 0 {
+                    return Err("scroll_by needs scroll_x or scroll_y pages".into());
+                }
+                uia::Semantic::ScrollBy(params.scroll_x, params.scroll_y)
+            }
+            _ => unreachable!(),
+        };
+        self.uia.semantic(key, action)
     }
 
     fn invalidate(&mut self) {
@@ -455,19 +636,12 @@ impl Engine {
     }
 }
 
-#[derive(Clone)]
-struct Captured {
-    data: Vec<u8>,
-    width: i32,
-    height: i32,
-}
-
 struct OneFrame {
-    output: Arc<Mutex<Option<Result<Captured, String>>>>,
+    output: Arc<Mutex<Option<Result<RgbaImage, String>>>>,
 }
 
 impl GraphicsCaptureApiHandler for OneFrame {
-    type Flags = Arc<Mutex<Option<Result<Captured, String>>>>;
+    type Flags = Arc<Mutex<Option<Result<RgbaImage, String>>>>;
     type Error = String;
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
         Ok(Self { output: ctx.flags })
@@ -488,20 +662,8 @@ impl GraphicsCaptureApiHandler for OneFrame {
                 .map_err(|error| format!("map WGC {width}x{height} frame: {error}"))?;
             let mut packed = Vec::new();
             let raw = buffer.as_nopadding_buffer(&mut packed);
-            let mut encoded = Vec::new();
-            PngEncoder::new(&mut encoded)
-                .write_image(raw, width, height, image::ExtendedColorType::Rgba8)
-                .map_err(|error| {
-                    format!(
-                        "encode WGC {width}x{height} frame with {} bytes: {error}",
-                        raw.len()
-                    )
-                })?;
-            Ok(Captured {
-                data: encoded,
-                width: width as i32,
-                height: height as i32,
-            })
+            RgbaImage::from_raw(width, height, raw.to_vec())
+                .ok_or_else(|| format!("WGC {width}x{height} frame has an unexpected size"))
         })();
         *self.output.lock().map_err(error_string)? = Some(result);
         control.stop();
@@ -509,14 +671,18 @@ impl GraphicsCaptureApiHandler for OneFrame {
     }
 }
 
-fn capture_item<T>(item: T) -> Result<(Vec<u8>, i32, i32), String>
+fn capture_frame<T>(item: T, cursor: bool) -> Result<RgbaImage, String>
 where
     T: TryInto<windows_capture::settings::GraphicsCaptureItemType>,
 {
     let output = Arc::new(Mutex::new(None));
     let settings = Settings::new(
         item,
-        CursorCaptureSettings::WithCursor,
+        if cursor {
+            CursorCaptureSettings::WithCursor
+        } else {
+            CursorCaptureSettings::WithoutCursor
+        },
         DrawBorderSettings::WithoutBorder,
         SecondaryWindowSettings::Include,
         MinimumUpdateIntervalSettings::Default,
@@ -525,100 +691,66 @@ where
         output.clone(),
     );
     OneFrame::start(settings).map_err(|error| format!("start WGC one-frame capture: {error}"))?;
-    let captured = output
+    output
         .lock()
         .map_err(error_string)?
         .take()
-        .ok_or("capture ended without a frame")??;
-    Ok((captured.data, captured.width, captured.height))
+        .ok_or("capture ended without a frame")?
 }
 
-fn capture_desktop(bounds: Rectangle) -> Result<(Vec<u8>, i32, i32), String> {
-    let mut desktop = RgbaImage::new(bounds.width as u32, bounds.height as u32);
-    for monitor in Monitor::enumerate().map_err(error_string)? {
-        let rect = monitor_rect(monitor.as_raw_hmonitor())?;
-        let (encoded, width, height) = capture_item(monitor).map_err(|error| {
-            format!(
-                "capture monitor {}x{} at {},{}: {error}",
-                rect.width, rect.height, rect.x, rect.y
-            )
-        })?;
-        let frame = image::load_from_memory(&encoded)
-            .map_err(error_string)?
-            .into_rgba8();
-        desktop.copy_from(&frame, (rect.x - bounds.x) as u32, (rect.y - bounds.y) as u32).map_err(|error| format!("compose captured {width}x{height} monitor into {}x{} desktop at {},{}: {error}", bounds.width, bounds.height, rect.x-bounds.x, rect.y-bounds.y))?;
-        if width != rect.width || height != rect.height {
-            return Err("monitor capture dimensions changed during capture".into());
+fn capture_display(display: &Display, cursor: bool) -> Result<RgbaImage, String> {
+    let monitor = Monitor::enumerate()
+        .map_err(error_string)?
+        .into_iter()
+        .find(|monitor| monitor.as_raw_hmonitor() as isize == display.handle)
+        .ok_or("display disappeared; call computer_targets again")?;
+    capture_frame(monitor, cursor)
+}
+
+fn capture_desktop(
+    displays: &[Display],
+    area: Rectangle,
+    cursor: bool,
+) -> Result<RgbaImage, String> {
+    let mut desktop = RgbaImage::new(area.width as u32, area.height as u32);
+    for display in displays {
+        let frame = capture_display(display, cursor)?;
+        let rect = display.bounds;
+        if frame.width() as i32 != rect.width || frame.height() as i32 != rect.height {
+            return Err("display size changed during capture; observe again".into());
         }
+        desktop
+            .copy_from(&frame, (rect.x - area.x) as u32, (rect.y - area.y) as u32)
+            .map_err(error_string)?;
     }
+    Ok(desktop)
+}
+
+fn encode_png(frame: &RgbaImage) -> Result<Vec<u8>, String> {
     let mut encoded = Vec::new();
     PngEncoder::new(&mut encoded)
         .write_image(
-            desktop.as_raw(),
-            desktop.width(),
-            desktop.height(),
+            frame.as_raw(),
+            frame.width(),
+            frame.height(),
             image::ExtendedColorType::Rgba8,
         )
-        .map_err(|error| {
-            format!(
-                "encode composed {}x{} desktop: {error}",
-                bounds.width, bounds.height
-            )
-        })?;
-    Ok((encoded, bounds.width, bounds.height))
-}
-
-fn interactive_control(value: i32) -> bool {
-    matches!(
-        value,
-        50000 | 50002 | 50003 | 50004 | 50005 | 50007 | 50011 | 50013 | 50015 | 50019 | 50024
-    )
-}
-fn role_name(value: i32) -> &'static str {
-    if value == UIA_ButtonControlTypeId.0 {
-        "button"
-    } else if value == UIA_CheckBoxControlTypeId.0 {
-        "checkbox"
-    } else if value == UIA_ComboBoxControlTypeId.0 {
-        "combobox"
-    } else if value == UIA_EditControlTypeId.0 {
-        "textbox"
-    } else if value == UIA_HyperlinkControlTypeId.0 {
-        "link"
-    } else if value == UIA_ListItemControlTypeId.0 {
-        "listitem"
-    } else if value == UIA_MenuItemControlTypeId.0 {
-        "menuitem"
-    } else if value == UIA_RadioButtonControlTypeId.0 {
-        "radio"
-    } else if value == UIA_SliderControlTypeId.0 {
-        "slider"
-    } else if value == UIA_TabItemControlTypeId.0 {
-        "tab"
-    } else if value == UIA_TreeItemControlTypeId.0 {
-        "treeitem"
-    } else {
-        "control"
-    }
+        .map_err(|error| format!("encode {}x{} PNG: {error}", frame.width(), frame.height()))?;
+    Ok(encoded)
 }
 
 fn perform_action(
     params: &ActionParams,
     record: &StateRecord,
     live: Option<Rectangle>,
-    overlay: &overlay::Overlay,
 ) -> Result<(), String> {
     let point = if !params.element_ref.is_empty() {
         let rect = live.ok_or("element_ref is unknown or stale")?;
         let center = (rect.x + rect.width / 2, rect.y + rect.height / 2);
-        if center.0 < record.bounds.x
-            || center.1 < record.bounds.y
-            || center.0 >= record.bounds.x + record.bounds.width
-            || center.1 >= record.bounds.y + record.bounds.height
-        {
-            return Err("UIA element moved outside the observed target; observe again".into());
+        if !record.bounds.contains(center.0, center.1) {
+            return Err("UIA element is outside the observed area; observe again".into());
         }
-        Some((rect.x + rect.width / 2, rect.y + rect.height / 2))
+        Some(center)
     } else if let (Some(x), Some(y)) = (params.x, params.y) {
         if x < 0 || y < 0 || x >= record.bounds.width || y >= record.bounds.height {
             return Err("coordinates are outside the referenced state".into());
@@ -627,9 +759,6 @@ fn perform_action(
     } else {
         None
     };
-    if let Some(point) = point {
-        overlay.marker(point);
-    }
     check_cancel()?;
     match params.kind.as_str() {
         "move" => move_to(point.ok_or("move requires coordinates or element_ref")?),
@@ -693,6 +822,64 @@ fn perform_action(
         }
         _ => Err(format!("unsupported computer action {:?}", params.kind)),
     }
+}
+
+/// Shows, restores, minimizes or moves a window without making it the foreground window.
+/// Bounds are the visible frame, as computer_targets reports them.
+fn place_window(window: HWND, bounds: Option<Rectangle>, show: &str) -> Result<(), String> {
+    if bounds.is_none() && show.is_empty() {
+        return Err("place needs bounds, show, or both".into());
+    }
+    unsafe {
+        match show {
+            "" => {}
+            "restore" => {
+                let _ = ShowWindow(window, SW_SHOWNOACTIVATE);
+            }
+            "minimize" => {
+                let _ = ShowWindow(window, SW_SHOWMINNOACTIVE);
+            }
+            "maximize" => {
+                let _ = ShowWindow(window, SW_SHOWMAXIMIZED);
+            }
+            other => {
+                return Err(format!(
+                    "show must be restore, minimize or maximize, not {other:?}"
+                ));
+            }
+        }
+        if let Some(target) = bounds {
+            if target.width < 80 || target.height < 60 {
+                return Err("bounds must be at least 80x60".into());
+            }
+            if IsIconic(window).as_bool() || IsZoomed(window).as_bool() {
+                let _ = ShowWindow(window, SW_SHOWNOACTIVATE);
+            }
+            // A move across displays of different scale resizes the window once Windows
+            // delivers WM_DPICHANGED; the second pass lands it on the requested frame.
+            for _ in 0..2 {
+                let mut outer = RECT::default();
+                GetWindowRect(window, &mut outer).map_err(error_string)?;
+                let frame = frame_bounds(window);
+                let left = frame.x - outer.left;
+                let top = frame.y - outer.top;
+                let right = outer.right - (frame.x + frame.width);
+                let bottom = outer.bottom - (frame.y + frame.height);
+                SetWindowPos(
+                    window,
+                    None,
+                    target.x - left,
+                    target.y - top,
+                    target.width + left + right,
+                    target.height + top + bottom,
+                    SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
+                )
+                .map_err(error_string)?;
+                std::thread::sleep(Duration::from_millis(60));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn activate(window: HWND) -> Result<(), String> {
@@ -761,11 +948,224 @@ unsafe fn wait_for_foreground(window: HWND, attempts: usize) -> bool {
 }
 fn require_foreground(window: HWND) -> Result<(), String> {
     if unsafe { GetForegroundWindow() } != window {
-        Err("selected target is not foreground; activate it, then call computer_state again".into())
+        Err("physical control needs the target in the foreground; activate it, or use semantic actions which do not".into())
     } else {
         Ok(())
     }
 }
+
+fn targets(params: &TargetsParams) -> Result<Targets, String> {
+    let displays = displays()?;
+    let foreground = unsafe { GetForegroundWindow() }.0 as isize;
+    let title_filter = params.title.to_lowercase();
+    let process_filter = params.process.to_lowercase();
+    let mut windows = Vec::new();
+    for window in CaptureWindow::enumerate().map_err(error_string)? {
+        let raw = window.as_raw_hwnd() as isize;
+        let hwnd = HWND(raw as *mut _);
+        let pid = window.process_id().map_err(error_string)?;
+        if pid == std::process::id() || (params.pid != 0 && pid != params.pid) {
+            continue;
+        }
+        let title = window_title(hwnd);
+        if title.trim().is_empty() || cloaked(hwnd) {
+            continue;
+        }
+        if !title_filter.is_empty() && !title.to_lowercase().contains(&title_filter) {
+            continue;
+        }
+        let process = process_name(pid);
+        if !process_filter.is_empty() && !process.to_lowercase().contains(&process_filter) {
+            continue;
+        }
+        let started = match process_start(pid) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let state = unsafe {
+            if IsIconic(hwnd).as_bool() {
+                "minimized"
+            } else if IsZoomed(hwnd).as_bool() {
+                "maximized"
+            } else {
+                "normal"
+            }
+        };
+        windows.push(Target {
+            target_id: target_id(raw, pid, started),
+            pid,
+            process,
+            title,
+            class_name: class_name(hwnd),
+            bounds: frame_bounds(hwnd),
+            state,
+            display_id: display_of(&displays, hwnd)
+                .map(|display| display.display_id)
+                .unwrap_or_default(),
+            active: raw == foreground,
+        });
+    }
+    windows.sort_by_key(|target| {
+        (
+            !target.active,
+            target.state == "minimized",
+            target.title.to_lowercase(),
+        )
+    });
+    Ok(Targets { displays, windows })
+}
+
+fn displays() -> Result<Vec<Display>, String> {
+    unsafe extern "system" fn collect(
+        monitor: HMONITOR,
+        _: HDC,
+        _: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
+        unsafe { (*(data.0 as *mut Vec<isize>)).push(monitor.0 as isize) };
+        BOOL(1)
+    }
+    let mut handles: Vec<isize> = Vec::new();
+    unsafe {
+        EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect),
+            LPARAM(&mut handles as *mut Vec<isize> as isize),
+        )
+        .ok()
+        .map_err(error_string)?;
+    }
+    let mut output = Vec::new();
+    for handle in handles {
+        let monitor = HMONITOR(handle as *mut _);
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+        if !unsafe { GetMonitorInfoW(monitor, &mut info.monitorInfo as *mut MONITORINFO) }.as_bool()
+        {
+            continue;
+        }
+        let device = String::from_utf16_lossy(&info.szDevice);
+        let device = device.trim_end_matches('\0');
+        let (mut dpi, mut unused) = (96u32, 96u32);
+        let _ = unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut unused) };
+        output.push(Display {
+            display_id: device.trim_start_matches(r"\\.\").to_string(),
+            bounds: rectangle(info.monitorInfo.rcMonitor),
+            work_area: rectangle(info.monitorInfo.rcWork),
+            scale: dpi as f32 / 96.0,
+            primary: info.monitorInfo.dwFlags & 1 != 0,
+            handle,
+        });
+    }
+    if output.is_empty() {
+        return Err("no active display; the session may be locked or headless".into());
+    }
+    output.sort_by_key(|display| (!display.primary, display.bounds.x));
+    Ok(output)
+}
+
+fn display_of(displays: &[Display], window: HWND) -> Option<Display> {
+    let monitor = unsafe { MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) }.0 as isize;
+    displays
+        .iter()
+        .find(|display| display.handle == monitor)
+        .cloned()
+}
+
+fn virtual_bounds(displays: &[Display]) -> Result<Rectangle, String> {
+    let mut bounds: Option<Rectangle> = None;
+    for display in displays {
+        let rect = display.bounds;
+        bounds = Some(match bounds {
+            None => rect,
+            Some(old) => {
+                let left = old.x.min(rect.x);
+                let top = old.y.min(rect.y);
+                let right = (old.x + old.width).max(rect.x + rect.width);
+                let bottom = (old.y + old.height).max(rect.y + rect.height);
+                Rectangle {
+                    x: left,
+                    y: top,
+                    width: right - left,
+                    height: bottom - top,
+                }
+            }
+        });
+    }
+    bounds.ok_or("no active display".into())
+}
+
+/// The visible frame, without the invisible resize borders Windows adds around top-level windows.
+fn frame_bounds(window: HWND) -> Rectangle {
+    let mut frame = RECT::default();
+    let ok = unsafe {
+        DwmGetWindowAttribute(
+            window,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut frame as *mut RECT as *mut _,
+            size_of::<RECT>() as u32,
+        )
+    }
+    .is_ok();
+    if !ok {
+        let _ = unsafe { GetWindowRect(window, &mut frame) };
+    }
+    rectangle(frame)
+}
+
+fn cloaked(window: HWND) -> bool {
+    let mut value = 0u32;
+    unsafe {
+        DwmGetWindowAttribute(
+            window,
+            DWMWA_CLOAKED,
+            &mut value as *mut u32 as *mut _,
+            size_of::<u32>() as u32,
+        )
+    }
+    .is_ok()
+        && value != 0
+}
+
+fn window_title(window: HWND) -> String {
+    CaptureWindow::from_raw_hwnd(window.0)
+        .title()
+        .unwrap_or_default()
+}
+
+fn class_name(window: HWND) -> String {
+    let mut buffer = [0u16; 256];
+    let length = unsafe { GetClassNameW(window, &mut buffer) };
+    String::from_utf16_lossy(&buffer[..length.max(0) as usize])
+}
+
+fn process_name(pid: u32) -> String {
+    let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
+    else {
+        return String::new();
+    };
+    let mut buffer = [0u16; 1024];
+    let mut size = buffer.len() as u32;
+    let ok = unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buffer.as_mut_ptr()),
+            &mut size,
+        )
+    }
+    .is_ok();
+    unsafe {
+        let _ = CloseHandle(process);
+    }
+    if !ok {
+        return String::new();
+    }
+    let path = String::from_utf16_lossy(&buffer[..size as usize]);
+    path.rsplit('\\').next().unwrap_or_default().to_string()
+}
+
 fn target_id(hwnd: isize, pid: u32, started: u64) -> String {
     format!("win-{hwnd:x}-{pid:x}-{started:x}")
 }
@@ -813,40 +1213,6 @@ fn rectangle(value: RECT) -> Rectangle {
         width: value.right - value.left,
         height: value.bottom - value.top,
     }
-}
-fn monitor_rect(raw: *mut std::ffi::c_void) -> Result<Rectangle, String> {
-    let mut info = MONITORINFO {
-        cbSize: size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    unsafe {
-        GetMonitorInfoW(HMONITOR(raw), &mut info)
-            .ok()
-            .map_err(error_string)?;
-    }
-    Ok(rectangle(info.rcMonitor))
-}
-fn desktop_bounds() -> Result<Rectangle, String> {
-    let mut bounds: Option<Rectangle> = None;
-    for monitor in Monitor::enumerate().map_err(error_string)? {
-        let rect = monitor_rect(monitor.as_raw_hmonitor())?;
-        bounds = Some(match bounds {
-            None => rect,
-            Some(old) => {
-                let left = old.x.min(rect.x);
-                let top = old.y.min(rect.y);
-                let right = (old.x + old.width).max(rect.x + rect.width);
-                let bottom = (old.y + old.height).max(rect.y + rect.height);
-                Rectangle {
-                    x: left,
-                    y: top,
-                    width: right - left,
-                    height: bottom - top,
-                }
-            }
-        });
-    }
-    bounds.ok_or("no active monitor was found".into())
 }
 fn error_string(error: impl std::fmt::Display) -> String {
     error.to_string()

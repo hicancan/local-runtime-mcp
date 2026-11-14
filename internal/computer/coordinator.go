@@ -27,7 +27,7 @@ type ControlStatus struct {
 
 // backend owns native state; coordinator owns desktop workflow control.
 type backend interface {
-	Targets(context.Context) (TargetsResult, error)
+	Targets(context.Context, TargetsOptions) (TargetsResult, error)
 	State(context.Context, StateOptions) ([]byte, State, error)
 	Act(context.Context, Action) (ActionResult, error)
 	Reset(context.Context) error
@@ -312,17 +312,14 @@ func (c *coordinator) BeginDesktopOperation(ctx context.Context, id string) (con
 	return operation, end, nil
 }
 
-func (c *coordinator) Targets(ctx context.Context) (TargetsResult, error) {
-	return c.native.Targets(ctx)
+func (c *coordinator) Targets(ctx context.Context, options TargetsOptions) (TargetsResult, error) {
+	return c.native.Targets(ctx, options)
 }
 func (c *coordinator) State(ctx context.Context, options StateOptions) ([]byte, State, error) {
 	if options.ControlID == "" {
+		// Element refs from a tokenless observation drive semantic actions only.
 		image, state, err := c.native.State(ctx, options)
 		state.Actionable = false
-		state.StateID = ""
-		for i := range state.Elements {
-			state.Elements[i].RefID = ""
-		}
 		return image, state, err
 	}
 	operation, end, err := c.begin(ctx, options.ControlID, false)
@@ -346,9 +343,73 @@ func (c *coordinator) State(ctx context.Context, options StateOptions) ([]byte, 
 	c.states[state.StateID] = options.ControlID
 	return image, state, nil
 }
+
+// Wait polls the window's automation tree, without pixels, until an element matching the
+// query is present or absent, then returns that observation.
+func (c *coordinator) Wait(ctx context.Context, options WaitOptions) ([]byte, State, error) {
+	if options.TargetID == "" {
+		return nil, State{}, errors.New("wait requires target_id")
+	}
+	if options.Name == "" && options.AutomationID == "" && options.Role == "" {
+		return nil, State{}, errors.New("wait needs name, automation_id or role")
+	}
+	until := options.Until
+	if until == "" {
+		until = "present"
+	}
+	if until != "present" && until != "absent" {
+		return nil, State{}, errors.New("until must be present or absent")
+	}
+	timeout := options.TimeoutMS
+	if timeout == 0 {
+		timeout = 5000
+	}
+	if timeout < 100 || timeout > 60000 {
+		return nil, State{}, errors.New("timeout_ms must be between 100 and 60000")
+	}
+	deadline := time.Now().Add(time.Duration(timeout) * time.Millisecond)
+	noImage := false
+	query := StateOptions{TargetID: options.TargetID, Image: &noImage, Name: options.Name, AutomationID: options.AutomationID, Role: options.Role, MaxElements: 50}
+	for {
+		_, state, err := c.native.State(ctx, query)
+		if err != nil {
+			return nil, State{}, err
+		}
+		if state.UIAStatus != "available" {
+			return nil, State{}, fmt.Errorf("UI Automation unavailable for the target: %s", state.UIAStatus)
+		}
+		satisfied := (state.ElementsTotal > 0) == (until == "present")
+		if satisfied || time.Now().After(deadline) {
+			if options.Image {
+				withImage := query
+				withImage.Image = nil
+				image, final, err := c.native.State(ctx, withImage)
+				if err != nil {
+					return nil, State{}, err
+				}
+				final.Satisfied = &satisfied
+				return image, final, nil
+			}
+			state.Satisfied = &satisfied
+			return nil, state, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, State{}, ctx.Err()
+		case <-c.ctx.Done():
+			return nil, State{}, errors.New("computer controller closed")
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+}
+
 func (c *coordinator) Act(ctx context.Context, action Action) (ActionResult, error) {
 	if err := Validate(action); err != nil {
 		return ActionResult{}, err
+	}
+	if Semantic(action.Kind) {
+		// No shared pointer, keyboard or foreground is involved, so no desktop control either.
+		return c.native.Act(ctx, action)
 	}
 	operation, end, err := c.begin(ctx, action.ControlID, false)
 	if err != nil {

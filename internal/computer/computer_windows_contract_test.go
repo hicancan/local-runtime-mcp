@@ -40,7 +40,7 @@ func TestWindowsComputerContractSmoke(t *testing.T) {
 	var target Window
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		targets, err := controller.Targets(ctx)
+		targets, err := controller.Targets(ctx, TargetsOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}

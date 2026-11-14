@@ -1,26 +1,34 @@
+//! The only visible trace of physical control: a small translucent pill at the bottom of the
+//! display being worked on, shown while a workflow holds the pointer and keyboard. Clicking it
+//! stops that workflow. It never outlines windows, never takes focus and is excluded from capture.
 use super::Rectangle;
 use std::sync::{OnceLock, mpsc};
 use std::time::Duration;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetStockObject, NULL_BRUSH,
-    PAINTSTRUCT, SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{
+    DWM_WINDOW_CORNER_PREFERENCE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DwmSetWindowAttribute,
 };
+use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{PCWSTR, w};
+use windows::core::w;
+
+const LABEL: &str = "AI 正在操作 · 点此停止";
 
 enum Command {
-    Show(String, Rectangle, u64),
-    Target(Rectangle),
-    Marker(i32, i32),
+    Show(u64),
+    Near(Rectangle),
     Hide,
 }
 static CHANNEL: OnceLock<mpsc::Sender<Command>> = OnceLock::new();
+
 pub struct Overlay {
     sender: mpsc::Sender<Command>,
     ready: bool,
 }
+
 impl Overlay {
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::channel();
@@ -32,87 +40,64 @@ impl Overlay {
                 lpfnWndProc: Some(window_proc),
                 hInstance: instance.into(),
                 lpszClassName: w!("LocalRuntimeMCPControl"),
-                hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH(GetStockObject(NULL_BRUSH).0),
+                hCursor: LoadCursorW(None, IDC_HAND).unwrap_or_default(),
                 ..Default::default()
             };
             RegisterClassW(&class);
-            let mut windows = Vec::new();
-            for index in 0..6 {
-                let mut ex = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
-                if index != 4 {
-                    ex |= WS_EX_TRANSPARENT;
-                }
-                let result = CreateWindowExW(
-                    ex,
-                    w!("LocalRuntimeMCPControl"),
-                    w!("AI control"),
-                    WS_POPUP,
-                    0,
-                    0,
-                    1,
-                    1,
-                    None,
-                    None,
-                    Some(instance.into()),
-                    Some(index as *const _),
-                );
-                if let Ok(window) = result {
-                    if SetWindowDisplayAffinity(window, WDA_EXCLUDEFROMCAPTURE).is_err() {
-                        let _ = DestroyWindow(window);
-                        let _ = ready_sender.send(false);
-                        return;
-                    }
-                    windows.push(window)
-                }
-            }
-            if windows.len() != 6 {
+            let Ok(pill) = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+                w!("LocalRuntimeMCPControl"),
+                w!("AI control"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                None,
+                None,
+                Some(instance.into()),
+                None,
+            ) else {
+                let _ = ready_sender.send(false);
+                return;
+            };
+            if SetWindowDisplayAffinity(pill, WDA_EXCLUDEFROMCAPTURE).is_err() {
+                let _ = DestroyWindow(pill);
                 let _ = ready_sender.send(false);
                 return;
             }
+            let _ = SetLayeredWindowAttributes(pill, COLORREF(0), 232, LWA_ALPHA);
+            let corner: DWM_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND;
+            let _ = DwmSetWindowAttribute(
+                pill,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &corner as *const _ as *const _,
+                size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+            );
             let _ = ready_sender.send(true);
             let mut active = false;
+            let mut near: Option<Rectangle> = None;
             loop {
                 while let Ok(command) = receiver.try_recv() {
                     match command {
-                        Command::Show(label, target, generation) => {
+                        Command::Show(generation) => {
                             if generation
-                                != super::STOP_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+                                == super::STOP_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
                             {
-                                continue;
-                            }
-                            active = true;
-                            let text = format!(
-                                "AI · {}   |   STOP",
-                                if label.is_empty() { "Desktop" } else { &label }
-                            );
-                            let wide: Vec<u16> =
-                                text.encode_utf16().chain(std::iter::once(0)).collect();
-                            let _ = SetWindowTextW(windows[4], PCWSTR(wide.as_ptr()));
-                            place(&windows, target);
-                        }
-                        Command::Target(target) => {
-                            if active {
-                                place(&windows, target);
+                                active = true;
+                                place(pill, near);
                             }
                         }
-                        Command::Marker(x, y) => {
+                        Command::Near(bounds) => {
+                            near = Some(bounds);
                             if active {
-                                let _ = SetWindowPos(
-                                    windows[5],
-                                    Some(HWND_TOPMOST),
-                                    x - 6,
-                                    y - 6,
-                                    13,
-                                    13,
-                                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                                );
+                                place(pill, near);
                             }
                         }
                         Command::Hide => {
                             active = false;
-                            for window in &windows {
-                                let _ = ShowWindow(*window, SW_HIDE);
-                            }
+                            near = None;
+                            let _ = ShowWindow(pill, SW_HIDE);
                         }
                     }
                 }
@@ -122,9 +107,7 @@ impl Overlay {
                     DispatchMessageW(&message);
                 }
                 if super::SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
-                    for window in &windows {
-                        let _ = DestroyWindow(*window);
-                    }
+                    let _ = DestroyWindow(pill);
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(8));
@@ -137,7 +120,8 @@ impl Overlay {
                 .unwrap_or(false),
         }
     }
-    pub fn show(&self, label: &str, bounds: Rectangle) -> Result<(), String> {
+
+    pub fn show(&self) -> Result<(), String> {
         let generation = super::STOP_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
         super::input::check_cancel()?;
         if !self.ready {
@@ -145,47 +129,58 @@ impl Overlay {
                 "desktop control indicator could not initialize with capture exclusion".into(),
             );
         }
-        let _ = self.sender.send(Command::Show(
-            label.chars().take(60).collect(),
-            bounds,
-            generation,
-        ));
+        let _ = self.sender.send(Command::Show(generation));
         Ok(())
     }
-    pub fn target(&self, bounds: Rectangle) {
-        let _ = self.sender.send(Command::Target(bounds));
-    }
-    pub fn marker(&self, point: (i32, i32)) {
-        let _ = self.sender.send(Command::Marker(point.0, point.1));
+
+    /// Moves the pill to the display holding the given bounds.
+    pub fn near(&self, bounds: Rectangle) {
+        let _ = self.sender.send(Command::Near(bounds));
     }
 }
+
 pub fn hide_global() {
     if let Some(sender) = CHANNEL.get() {
         let _ = sender.send(Command::Hide);
     }
 }
-unsafe fn place(windows: &[HWND], bounds: Rectangle) {
-    let positions = [
-        (bounds.x, bounds.y, bounds.width, 3),
-        (bounds.x, bounds.y + bounds.height - 3, bounds.width, 3),
-        (bounds.x, bounds.y, 3, bounds.height),
-        (bounds.x + bounds.width - 3, bounds.y, 3, bounds.height),
-        (bounds.x + bounds.width - 320, bounds.y + 5, 315, 26),
-    ];
-    for (window, (x, y, width, height)) in windows.iter().zip(positions) {
-        let _ = unsafe {
-            SetWindowPos(
-                *window,
-                Some(HWND_TOPMOST),
-                x,
-                y,
-                width,
-                height,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            )
-        };
+
+unsafe fn place(pill: HWND, near: Option<Rectangle>) {
+    let point = near
+        .map(|bounds| POINT {
+            x: bounds.x + bounds.width / 2,
+            y: bounds.y + bounds.height / 2,
+        })
+        .unwrap_or_default();
+    let monitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTOPRIMARY) };
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return;
     }
+    let (mut dpi, mut unused) = (96u32, 96u32);
+    let _ = unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut unused) };
+    let scale = |value: i32| value * dpi as i32 / 96;
+    let (width, height) = (scale(208), scale(32));
+    let work = info.rcWork;
+    let x = (work.left + work.right - width) / 2;
+    let y = work.bottom - height - scale(20);
+    let _ = unsafe {
+        SetWindowPos(
+            pill,
+            Some(HWND_TOPMOST),
+            x,
+            y,
+            width,
+            height,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        )
+    };
+    let _ = unsafe { InvalidateRect(Some(pill), None, true) };
 }
+
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
@@ -193,44 +188,51 @@ unsafe extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
-        WM_NCCREATE => {
-            let create = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
-            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize) };
-            LRESULT(1)
-        }
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
-        WM_LBUTTONDOWN => {
-            if unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } == 4 {
-                super::local_stop();
-                hide_global();
-            }
+        WM_LBUTTONUP => {
+            super::local_stop();
+            hide_global();
             LRESULT(0)
         }
-        WM_NCHITTEST => {
-            if unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } != 4 {
-                LRESULT(HTTRANSPARENT as isize)
-            } else {
-                LRESULT(HTCLIENT as isize)
-            }
-        }
+        WM_ERASEBKGND => LRESULT(1),
         WM_PAINT => {
             let mut paint = PAINTSTRUCT::default();
             let dc = unsafe { BeginPaint(hwnd, &mut paint) };
-            let brush = unsafe { CreateSolidBrush(COLORREF(0x00e89c24)) };
             let mut rect = RECT::default();
             let _ = unsafe { GetClientRect(hwnd, &mut rect) };
+            let height = rect.bottom - rect.top;
             unsafe {
+                let brush = CreateSolidBrush(COLORREF(0x00282320));
                 FillRect(dc, &rect, brush);
                 let _ = DeleteObject(brush.into());
-            }
-            if unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } == 4 {
-                let mut text = [0u16; 180];
-                let length = unsafe { GetWindowTextW(hwnd, &mut text) };
-                unsafe {
-                    SetBkMode(dc, TRANSPARENT);
-                    SetTextColor(dc, COLORREF(0x00ffffff));
-                    let _ = TextOutW(dc, 5, 5, &text[..length.max(0) as usize]);
-                }
+                let font = CreateFontW(
+                    -(height * 13 / 32),
+                    0,
+                    0,
+                    0,
+                    FW_MEDIUM.0 as i32,
+                    0,
+                    0,
+                    0,
+                    DEFAULT_CHARSET,
+                    OUT_DEFAULT_PRECIS,
+                    CLIP_DEFAULT_PRECIS,
+                    CLEARTYPE_QUALITY,
+                    0,
+                    w!("Microsoft YaHei UI"),
+                );
+                let previous = SelectObject(dc, font.into());
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, COLORREF(0x00F2F2F2));
+                let mut wide: Vec<u16> = LABEL.encode_utf16().collect();
+                let _ = DrawTextW(
+                    dc,
+                    &mut wide,
+                    &mut rect,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                );
+                SelectObject(dc, previous);
+                let _ = DeleteObject(font.into());
             }
             let _ = unsafe { EndPaint(hwnd, &paint) };
             LRESULT(0)

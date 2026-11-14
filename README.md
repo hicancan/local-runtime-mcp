@@ -7,13 +7,13 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-Give AI clients the programs, files, images, browser profiles, and desktop of the machine running `lrmcp`. Local Runtime MCP is a portable host-access runtime with **21 MCP tools across five capability domains**.
+Give AI clients the programs, files, images, browser profiles, and desktop of the machine running `lrmcp`. Local Runtime MCP is a portable host-access runtime with **22 MCP tools across five capability domains**.
 
 Connect locally over stdio or Streamable HTTP, or remotely through OpenAI Secure MCP Tunnel and Cloudflare Tunnel. One running instance can expose both tunnels at once, with one set of process sessions, browser instances, and desktop control. Independent process sessions and browser tabs run concurrently; shared files and desktop input have explicit coordination rules.
 
 - **Native multimodal results.** Files, browser pages, and desktop observations return text and MCP image content directly.
 - **Explicit browser targets.** Connect several Chromium profiles, select a named browser instance, and operate its opaque tab handles.
-- **Visible desktop control.** Acquire desktop control, observe a window, act on that observation, and release control. A blue overlay and Stop affordance make interaction visible locally.
+- **Desktop control that leaves you working.** See every display and window, read UI Automation trees with their text, and operate controls through their patterns without the pointer, keyboard or focus. Physical input, when needed, borrows them under a token, shown by a small pill you can click to stop.
 - **Portable configuration.** Keep `local-runtime-mcp.yaml`, the executable, and browser integration together on a fixed or removable drive.
 - **Independent connection providers.** Enable OpenAI, Cloudflare, or both for the same Runtime Host. Public HTTP supports static Bearer credentials or OAuth authorization with owner approval.
 - **Platform-specific engines.** Go hosts the runtime and MCP adapters; Rust implements Windows capture, UI Automation, and input; TypeScript implements Chromium integration.
@@ -33,7 +33,7 @@ flowchart TB
     Remote --> Cloudflare[Cloudflare adapter + cloudflared]
     OpenAI --> Private[Private HTTP origin · runtime credential]
     Cloudflare --> Public
-    Stdio --> MCP[MCP adapter · 21 tools]
+    Stdio --> MCP[MCP adapter · 22 tools]
     Private --> MCP
     Public --> MCP
     MCP --> Process[Process]
@@ -123,9 +123,9 @@ Precedence is **command line > environment > YAML > defaults**. The file path is
 | Process | 2 |
 | Filesystem | 6 |
 | Image | 1 |
-| Computer | 4 |
+| Computer | 5 |
 | Browser | 8 |
-| **Total** | **21** |
+| **Total** | **22** |
 
 ### Process · 2 tools
 
@@ -206,47 +206,45 @@ flowchart LR
 
 Image reading is stateless. Browser and Computer captures carry their own observation identities and coordinate semantics.
 
-### Computer · 4 tools
+### Computer · 5 tools
 
 ```mermaid
 flowchart TB
-    Control[computer_control · acquire/status/release] --> Coordinator[Go Desktop Coordinator]
-    Targets[computer_targets] --> Coordinator
-    State[computer_state] --> Coordinator
-    Action[computer_action · control_id] --> Coordinator
-    Coordinator --> Worker[Rust native engine]
-    Worker --> Identity[Window identity + observation epoch]
-    Worker --> Capture[Windows Graphics Capture]
-    Worker --> UIA[UI Automation patterns + references]
+    Targets[computer_targets] --> Worker[Rust native engine]
+    State[computer_state] --> Worker
+    Wait[computer_wait · polls computer_state] --> Worker
+    Action[computer_action] --> Kind{kind}
+    Kind -->|semantic · place| Worker
+    Kind -->|physical input| Control[computer_control token + Go Desktop Coordinator]
+    Control --> Worker
+    Worker --> Displays[Displays · per-monitor scale]
+    Worker --> Capture[Windows Graphics Capture · covered windows too]
+    Worker --> UIA[UI Automation · one cached tree request · patterns]
     Worker --> Input[Physical input + release cleanup]
-    Worker --> Overlay[Blue target outline + AI marker + Stop]
-    Overlay -. revoke control .-> Coordinator
+    Worker --> Pill[Bottom-of-display pill · Stop]
+    Pill -. revoke control .-> Control
 ```
 
-The Windows desktop has one foreground, pointer, and keyboard input stream. `computer_control` allocates that shared input resource to one workflow:
+The person at the computer keeps working while an agent does. Observation, waiting, semantic actions and window placement never touch the pointer, the keyboard or the foreground window; only physical input borrows them.
 
 ```text
-computer_control(kind="acquire", label="Update a document") → control_id
-computer_targets() → target_id
-computer_action(kind="activate", control_id=..., target_id=...)
-computer_state(control_id=..., target_id=...) → actionable state_id
-computer_action(kind="click", control_id=..., state_id=..., element_ref=...)
-computer_state(control_id=..., target_id=...) → fresh state_id
-computer_control(kind="release", control_id=...)
+computer_targets(process="StuDev") → displays + windows (target_id)
+computer_state(target_id=..., image=false, automation_id="map") → ref_id
+computer_action(kind="invoke", element_ref=...)            # no control, no focus change
+computer_wait(target_id=..., name="搜地点", until="present") → fresh ref_ids
+computer_state(target_id=...) → pixels of the window even while it is covered
+computer_action(kind="place", target_id=..., bounds={...})  # resize without activating
 ```
 
-- `computer_control` acquires control, reports occupancy, or releases a matching token. Status exposes the label and occupancy, while the owner retains its token.
-- `computer_targets` returns a `windows` array of validated top-level windows.
-- `computer_state` returns native PNG pixels in MCP image content and bounded UI Automation information in structured content. Image metadata describes that separate image block. Without a control token it is a read-only observation with `actionable=false`, an empty state ID, and descriptive elements; a valid token binds actionable references and a state ID to the current control generation and foreground target.
-- `computer_action` supports `activate`, `move`, `click`, `double_click`, `drag`, `type_text`, `set_value`, `press_key`, and `scroll`. Every action requires `control_id`; observation-based actions require the exact actionable `state_id`.
+- `computer_targets` returns every display (ID, bounds, work area, scale, primary) and the visible top-level windows: opaque target ID, process, title, class, visible frame without the invisible resize borders, normal/minimized/maximized state and display. Cloaked windows are left out. Filter by `pid`, `title` or `process`.
+- `computer_state` observes one window, one display or every display. Windows are captured through Windows Graphics Capture, so a window covered by others, including GPU swap-chain content, is captured as it is drawn. For a window it also returns the UI Automation tree, fetched in one cached cross-process request: role, name (text included), AutomationId, class, value or toggle/selection/expansion state, bounds, depth and parent, disabled/offscreen/focused, and the supported patterns. `elements` chooses all, interactive or none; `name`, `automation_id` and `role` filter; `max_elements` and `offset` page. `region` crops, `image=false` skips pixels, `cursor=true` draws the pointer.
+- `computer_wait` polls a window's tree without pixels until an element matching `name`, `automation_id` or `role` is present or absent, then returns that observation and whether the condition was met.
+- `computer_action` semantic kinds operate an element by `element_ref` through its pattern: `invoke`, `toggle`, `select`, `expand`, `collapse`, `set_value`, `scroll_into_view`, `scroll_by` (pages). `place` moves or resizes a window to a visible frame and restores or minimizes it without activating it, across displays of different scale. Physical kinds, `activate`, `move`, `click`, `double_click`, `drag`, `type_text`, `press_key` and `scroll`, need `control_id` and a state observed with it.
+- `computer_control` allocates the single pointer and keyboard to one workflow. It has a five-minute idle expiry refreshed by controlled operations; release, expiry, local Stop and shutdown cancel pending work, clear injected input and invalidate actionable observations.
 
-Control has a five-minute idle expiry refreshed by controlled operations. Release, expiry, local Stop, and shutdown cancel pending work, clear injected input state, and invalidate prior actionable observations. A competing acquire reports that the desktop is busy.
+Refs are verified against the element's runtime identity at use, so a ref whose control was replaced fails instead of acting on something else. Physical actions invalidate prior states; semantic actions keep them. Coordinates are relative to an observation's origin, which is in physical virtual-desktop pixels; displays to the left of the primary have negative origins.
 
-Control remains in `stopping` while submitted work or input cleanup is settling. An already-submitted native or UIA operation may have an uncertain outcome after cancellation; inspect the target before repeating it.
-
-Windows capture, target validation, DPI coordinates, UIA references, input routing, and overlay rendering live in the Rust engine. Semantic `set_value` uses a supported UI Automation ValuePattern. The `uia_status` field reports availability, truncation, or provider errors. Pixel and UIA observations describe a changing interface; callers obtain a fresh state after each action, including partial failures.
-
-The blue target outline and AI position marker show the current interaction. Click the local Stop strip to revoke control. The overlay is excluded from feedback capture. Physical actions use the system input stream, so independent desktop tasks use separate interactive machines or environments.
+While physical control is held, a small translucent pill at the bottom of the display being worked on reads “AI 正在操作 · 点此停止”; clicking it revokes control. It never outlines windows, never takes focus, and is excluded from capture. Nothing is drawn for semantic actions.
 
 ### Browser · 8 tools
 

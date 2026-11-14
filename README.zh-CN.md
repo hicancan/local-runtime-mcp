@@ -7,13 +7,13 @@
 
 [English](README.md) · **简体中文**
 
-让 AI 客户端使用运行 `lrmcp` 的机器上的程序、文件、图像、浏览器配置文件和桌面。Local Runtime MCP 是一个便携的机器访问运行时，以 **21 个 MCP 工具覆盖五个能力域**。
+让 AI 客户端使用运行 `lrmcp` 的机器上的程序、文件、图像、浏览器配置文件和桌面。Local Runtime MCP 是一个便携的机器访问运行时，以 **22 个 MCP 工具覆盖五个能力域**。
 
 本地客户端可以使用 stdio 或 Streamable HTTP；远端客户端可以通过 OpenAI Secure MCP Tunnel 和 Cloudflare Tunnel 接入。同一个运行实例可以同时开启两条隧道，共享一套进程会话、浏览器实例和桌面控制。不同进程会话和浏览器标签页可以并发执行，共享文件和桌面输入则按照明确的资源规则协调。
 
 - **原生多模态结果**：文件、网页和桌面观察直接返回文本与 MCP 图像内容。
 - **明确的浏览器目标**：连接多个 Chromium Profile，选择有名称的浏览器实例，通过不透明标签页句柄操作。
-- **可见的桌面控制**：获取控制权，观察窗口，根据观察操作，最后释放控制权；蓝色提示层和本地 Stop 入口让操作清晰可见。
+- **不打扰人的桌面控制**：看到所有显示器和窗口，读出带文字的 UI Automation 树，通过控件模式操作控件，不碰鼠标、键盘和焦点。确需物理输入时凭令牌借用，屏幕底部的小提示条随时可点停。
 - **便携配置**：将 `local-runtime-mcp.yaml`、程序和浏览器集成保存在同一目录，支持固定磁盘与移动存储。
 - **独立连接入口**：为同一个 Runtime Host 启用 OpenAI、Cloudflare 或两者；公开 HTTP 支持静态 Bearer 凭据和经所有者批准的 OAuth 授权。
 - **按平台职责实现**：Go 承载运行时和 MCP 适配器，Rust 实现 Windows 捕获、UI Automation 和输入，TypeScript 实现 Chromium 集成。
@@ -33,7 +33,7 @@ flowchart TB
     Remote --> Cloudflare[Cloudflare 适配器 + cloudflared]
     OpenAI --> Private[私有 HTTP 源站 · 运行时凭据]
     Cloudflare --> Public
-    Stdio --> MCP[MCP 适配器 · 21 个工具]
+    Stdio --> MCP[MCP 适配器 · 22 个工具]
     Private --> MCP
     Public --> MCP
     MCP --> Process[Process]
@@ -123,9 +123,9 @@ flowchart LR
 | Process | 2 |
 | Filesystem | 6 |
 | Image | 1 |
-| Computer | 4 |
+| Computer | 5 |
 | Browser | 8 |
-| **总计** | **21** |
+| **总计** | **22** |
 
 ### Process · 2 个工具
 
@@ -206,47 +206,45 @@ flowchart LR
 
 Image 是无状态读取。Browser 与 Computer 截图各自保留对应的观察身份和坐标语义。
 
-### Computer · 4 个工具
+### Computer · 5 个工具
 
 ```mermaid
 flowchart TB
-    Control[computer_control · acquire/status/release] --> Coordinator[Go 桌面协调器]
-    Targets[computer_targets] --> Coordinator
-    State[computer_state] --> Coordinator
-    Action[computer_action · control_id] --> Coordinator
-    Coordinator --> Worker[Rust 原生引擎]
-    Worker --> Identity[窗口身份 + 观察纪元]
-    Worker --> Capture[Windows Graphics Capture]
-    Worker --> UIA[UI Automation Pattern + 引用]
+    Targets[computer_targets] --> Worker[Rust 原生引擎]
+    State[computer_state] --> Worker
+    Wait[computer_wait · 轮询 computer_state] --> Worker
+    Action[computer_action] --> Kind{kind}
+    Kind -->|语义操作 · place| Worker
+    Kind -->|物理输入| Control[computer_control 令牌 + Go 桌面协调器]
+    Control --> Worker
+    Worker --> Displays[显示器 · 各自缩放]
+    Worker --> Capture[Windows Graphics Capture · 被遮挡的窗口也能截]
+    Worker --> UIA[UI Automation · 一次缓存请求取整棵树 · 控件模式]
     Worker --> Input[物理输入 + 释放清理]
-    Worker --> Overlay[蓝色轮廓 + AI 操作标记 + Stop]
-    Overlay -. 撤销控制 .-> Coordinator
+    Worker --> Pill[屏幕底部小提示条 · 停止]
+    Pill -. 撤销控制 .-> Control
 ```
 
-Windows 当前交互桌面共享一个前台、鼠标和键盘输入流。`computer_control` 将这个输入资源分配给一个工作流：
+AI 工作时，坐在电脑前的人照常干活。观察、等待、语义操作和摆放窗口都不碰鼠标、键盘和前台窗口；只有物理输入才借用它们。
 
 ```text
-computer_control(kind="acquire", label="更新文档") → control_id
-computer_targets() → target_id
-computer_action(kind="activate", control_id=..., target_id=...)
-computer_state(control_id=..., target_id=...) → 可行动的 state_id
-computer_action(kind="click", control_id=..., state_id=..., element_ref=...)
-computer_state(control_id=..., target_id=...) → 新的 state_id
-computer_control(kind="release", control_id=...)
+computer_targets(process="StuDev") → 显示器 + 窗口（target_id）
+computer_state(target_id=..., image=false, automation_id="map") → ref_id
+computer_action(kind="invoke", element_ref=...)            # 不要控制权，不切换焦点
+computer_wait(target_id=..., name="搜地点", until="present") → 新的 ref_id
+computer_state(target_id=...) → 窗口被挡住时也能拿到它的像素
+computer_action(kind="place", target_id=..., bounds={...})  # 改大小但不激活
 ```
 
-- `computer_control` 获取控制权、查询占用状态或使用匹配 token 释放。状态显示任务名称与占用情况，控制 token 由获取者保管。
-- `computer_targets` 返回包含已验证顶层窗口的 `windows` 数组。
-- `computer_state` 在 MCP image content 中返回原生 PNG 像素，在 structured content 中返回有界 UI Automation 信息；图像元数据描述独立的图像块。不传控制 token 时是 `actionable=false` 的只读观察，state ID 为空，元素只提供描述；有效 token 将可行动引用与 state ID 绑定到当前控制代次和前台目标。
-- `computer_action` 支持 `activate`、`move`、`click`、`double_click`、`drag`、`type_text`、`set_value`、`press_key`、`scroll`。全部动作需要 `control_id`；基于观察的动作需要准确匹配的可行动 `state_id`。
+- `computer_targets` 返回所有显示器（ID、范围、工作区、缩放、是否主屏）和可见的顶层窗口：不透明的 target ID、进程、标题、类名、去掉不可见缩放边框后的可见外框、正常/最小化/最大化状态和所在显示器。被隐藏（cloaked）的窗口不列出。可按 `pid`、`title`、`process` 筛选。
+- `computer_state` 观察一个窗口、一块显示器或全部显示器。窗口通过 Windows Graphics Capture 截取，被其他窗口挡住、或是显卡交换链绘制的内容，都按实际画面截下。观察窗口时还返回 UI Automation 树，用一次跨进程缓存请求取得：角色、名称（含文字）、AutomationId、类名、值或勾选/选中/展开状态、位置、层级与父节点、禁用/屏外/焦点，以及支持的控件模式。`elements` 选 all、interactive 或 none；`name`、`automation_id`、`role` 筛选；`max_elements` 和 `offset` 分页。`region` 裁剪，`image=false` 不要像素，`cursor=true` 画出指针。
+- `computer_wait` 不截图地轮询窗口的控件树，直到符合 `name`、`automation_id` 或 `role` 的元素出现或消失，返回那次观察以及条件是否满足。
+- `computer_action` 的语义操作按 `element_ref` 通过控件模式操作元素：`invoke`、`toggle`、`select`、`expand`、`collapse`、`set_value`、`scroll_into_view`、`scroll_by`（按页）。`place` 把窗口移动或缩放到指定可见外框，或还原、最小化，都不激活窗口，跨不同缩放的显示器也准确。物理操作 `activate`、`move`、`click`、`double_click`、`drag`、`type_text`、`press_key`、`scroll` 需要 `control_id` 和用它观察得到的状态。
+- `computer_control` 把唯一的鼠标和键盘分配给一个工作流。空闲五分钟过期，受控操作会续期；释放、过期、本地停止和关闭都会取消未完成的工作、清理注入的输入，并使可操作的观察失效。
 
-控制权默认五分钟空闲到期，受控操作自动刷新期限。释放、到期、本地 Stop 与退出会取消待执行工作，清理注入输入，失效旧的可行动观察。其他工作流尝试获取时收到 desktop busy。
+ref 在使用时会核对元素的运行时身份，控件被替换后旧 ref 直接报错，不会误操作别的东西。物理操作使之前的状态失效；语义操作不会。坐标相对观察的原点，原点是虚拟桌面的物理像素；主屏左边的显示器原点为负。
 
-已提交操作或输入清理仍在完成时，控制状态保持 `stopping`。已经提交的原生或 UIA 操作在取消后可能结果不确定，应先检查目标再决定是否重复执行。
-
-Rust 引擎统一负责 Windows 捕获、窗口身份、DPI 坐标、UIA 引用、输入路由与提示层。语义 `set_value` 使用目标支持的 UI Automation ValuePattern。`uia_status` 返回可用、截断或提供程序错误。像素与 UIA 反映持续变化的界面，每次动作之后都应重新观察，包括已经产生部分副作用的失败。
-
-蓝色目标轮廓和 AI 位置标记显示当前交互。点击本地 Stop 条可以撤销控制。提示层从反馈截图中排除。物理动作使用系统输入流，真正独立的桌面任务可以使用不同交互机器或环境。
+持有物理控制权时，正在操作的那块屏幕底部会出现一个半透明小提示条，写着“AI 正在操作 · 点此停止”，点一下即撤销控制。它不描窗口边框，不抢焦点，也不会被截进图里。语义操作什么都不画。
 
 ### Browser · 8 个工具
 
