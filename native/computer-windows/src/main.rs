@@ -29,10 +29,11 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowRect,
-    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SW_RESTORE,
-    SW_SHOWMAXIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER,
-    SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, SwitchToThisWindow,
+    BringWindowToTop, EnumWindows, GWL_EXSTYLE, GetClassNameW, GetCursorPos, GetForegroundWindow,
+    GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
+    IsWindowVisible, IsZoomed, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow,
+    SwitchToThisWindow, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
 };
 use windows::core::BOOL;
 use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
@@ -111,6 +112,11 @@ struct Target {
     state: &'static str,
     display_id: String,
     active: bool,
+    /// Tool windows (widgets, palettes, floating cards) stay out of the taskbar and Alt+Tab.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    tool: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    topmost: bool,
 }
 
 #[derive(Serialize)]
@@ -960,15 +966,19 @@ fn targets(params: &TargetsParams) -> Result<Targets, String> {
     let title_filter = params.title.to_lowercase();
     let process_filter = params.process.to_lowercase();
     let mut windows = Vec::new();
-    for window in CaptureWindow::enumerate().map_err(error_string)? {
-        let raw = window.as_raw_hwnd() as isize;
+    for raw in top_level_windows() {
         let hwnd = HWND(raw as *mut _);
-        let pid = window.process_id().map_err(error_string)?;
+        if !unsafe { IsWindowVisible(hwnd) }.as_bool() || cloaked(hwnd) {
+            continue;
+        }
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
         if pid == std::process::id() || (params.pid != 0 && pid != params.pid) {
             continue;
         }
         let title = window_title(hwnd);
-        if title.trim().is_empty() || cloaked(hwnd) {
+        let bounds = frame_bounds(hwnd);
+        if title.trim().is_empty() || bounds.width <= 1 || bounds.height <= 1 {
             continue;
         }
         if !title_filter.is_empty() && !title.to_lowercase().contains(&title_filter) {
@@ -982,6 +992,7 @@ fn targets(params: &TargetsParams) -> Result<Targets, String> {
             Ok(value) => value,
             Err(_) => continue,
         };
+        let extended = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
         let state = unsafe {
             if IsIconic(hwnd).as_bool() {
                 "minimized"
@@ -997,12 +1008,14 @@ fn targets(params: &TargetsParams) -> Result<Targets, String> {
             process,
             title,
             class_name: class_name(hwnd),
-            bounds: frame_bounds(hwnd),
+            bounds,
             state,
             display_id: display_of(&displays, hwnd)
                 .map(|display| display.display_id)
                 .unwrap_or_default(),
             active: raw == foreground,
+            tool: extended & WS_EX_TOOLWINDOW.0 != 0,
+            topmost: extended & WS_EX_TOPMOST.0 != 0,
         });
     }
     windows.sort_by_key(|target| {
@@ -1013,6 +1026,23 @@ fn targets(params: &TargetsParams) -> Result<Targets, String> {
         )
     });
     Ok(Targets { displays, windows })
+}
+
+/// Every top-level window in z-order, tool windows included: widgets pinned to the desktop
+/// are tool windows owned by its icon view, and screen capture libraries skip them.
+fn top_level_windows() -> Vec<isize> {
+    unsafe extern "system" fn collect(window: HWND, data: LPARAM) -> BOOL {
+        unsafe { (*(data.0 as *mut Vec<isize>)).push(window.0 as isize) };
+        BOOL(1)
+    }
+    let mut windows: Vec<isize> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(
+            Some(collect),
+            LPARAM(&mut windows as *mut Vec<isize> as isize),
+        );
+    }
+    windows
 }
 
 fn displays() -> Result<Vec<Display>, String> {
@@ -1129,9 +1159,9 @@ fn cloaked(window: HWND) -> bool {
 }
 
 fn window_title(window: HWND) -> String {
-    CaptureWindow::from_raw_hwnd(window.0)
-        .title()
-        .unwrap_or_default()
+    let mut buffer = [0u16; 512];
+    let length = unsafe { GetWindowTextW(window, &mut buffer) };
+    String::from_utf16_lossy(&buffer[..length.max(0) as usize])
 }
 
 fn class_name(window: HWND) -> String {

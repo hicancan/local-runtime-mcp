@@ -45,6 +45,8 @@ type Window struct {
 	State     string    `json:"state"`
 	DisplayID string    `json:"display_id,omitempty"`
 	Active    bool      `json:"active"`
+	Tool      bool      `json:"tool,omitempty"`
+	Topmost   bool      `json:"topmost,omitempty"`
 }
 
 type TargetsOptions struct {

@@ -5,7 +5,10 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
-use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SetCursorPos,
+};
 
 #[derive(Clone, serde::Serialize)]
 pub struct Journal {
@@ -45,8 +48,36 @@ fn journal(value: Journal, inputs: &mut Vec<Journal>) {
     }
     super::emit_event(serde_json::json!({"event":"input","input":value}));
 }
+/// Moves the pointer as a real mouse would: a move through the input stream, which pointer-based UI (WinUI, browsers)
+/// sees as movement while a button is held. Placing the cursor alone produces no movement input for them.
 pub fn move_to(point: (i32, i32)) -> Result<(), String> {
     check_cancel()?;
+    let (left, top, width, height) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN).max(2),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN).max(2),
+        )
+    };
+    // Absolute coordinates run 0 to 65535 across the virtual desktop.
+    let x = ((point.0 - left) as i64 * 65535 / (width - 1) as i64) as i32;
+    let y = ((point.1 - top) as i64 * 65535 / (height - 1) as i64) as i32;
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: x,
+                dy: y,
+                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                ..Default::default()
+            },
+        },
+    };
+    if unsafe { SendInput(&[input], size_of::<INPUT>() as i32) } != 1 {
+        return Err("SendInput rejected pointer movement (possibly UIPI)".into());
+    }
+    // Rounding through the absolute scale can land a pixel off; the cursor ends exactly where asked.
     unsafe { SetCursorPos(point.0, point.1) }.map_err(super::error_string)
 }
 pub fn mouse_button(button: &str, down: bool) -> Result<(), String> {
