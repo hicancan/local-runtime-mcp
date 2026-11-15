@@ -78,7 +78,28 @@ pub fn move_to(point: (i32, i32)) -> Result<(), String> {
         return Err("SendInput rejected pointer movement (possibly UIPI)".into());
     }
     // Rounding through the absolute scale can land a pixel off; the cursor ends exactly where asked.
-    unsafe { SetCursorPos(point.0, point.1) }.map_err(super::error_string)
+    unsafe { SetCursorPos(point.0, point.1) }.map_err(super::error_string)?;
+    // Then a pixel there and back, twice, as relative motion, as a hand always makes: frameworks that follow the
+    // pointer stream (WinUI's hover and cursor among them) see a pointer arrive only through movement, not through
+    // placement, and pass over the first move after a jump. Two mickeys each way: with pointer acceleration one
+    // mickey can come to under a pixel and move nothing.
+    for dx in [2, -2, 2, -2] {
+        let nudge = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx,
+                    dy: 0,
+                    dwFlags: MOUSEEVENTF_MOVE,
+                    ..Default::default()
+                },
+            },
+        };
+        if unsafe { SendInput(&[nudge], size_of::<INPUT>() as i32) } != 1 {
+            return Err("SendInput rejected pointer movement (possibly UIPI)".into());
+        }
+    }
+    Ok(())
 }
 pub fn mouse_button(button: &str, down: bool) -> Result<(), String> {
     let button = if button.is_empty() { "left" } else { button };
