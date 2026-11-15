@@ -105,6 +105,7 @@ type State struct {
 	Scale             float64   `json:"scale"`
 	CursorX           int       `json:"cursor_x"`
 	CursorY           int       `json:"cursor_y"`
+	CursorShape       string    `json:"cursor_shape,omitempty" jsonschema:"the system cursor showing: arrow, move, hand, text, resize_*, wait, busy, not_allowed, crosshair; other for an app's own; hidden"`
 	HasImage          bool      `json:"has_image"`
 	MIMEType          string    `json:"mime_type"`
 	Elements          []Element `json:"elements,omitempty"`
@@ -133,6 +134,7 @@ type Action struct {
 	Y          *int       `json:"y,omitempty" jsonschema:"Y coordinate relative to the computer_state image"`
 	ToX        *int       `json:"to_x,omitempty" jsonschema:"drag destination X coordinate relative to the state image"`
 	ToY        *int       `json:"to_y,omitempty" jsonschema:"drag destination Y coordinate relative to the state image"`
+	DurationMS int        `json:"duration_ms,omitempty" jsonschema:"how long a drag takes from press to release, as a person's hand would; default 200, at most 5000"`
 	Button     string     `json:"button,omitempty" jsonschema:"mouse button; defaults to left"`
 	Text       string     `json:"text,omitempty" jsonschema:"Unicode text for type_text or set_value"`
 	Key        string     `json:"key,omitempty" jsonschema:"key or modifier combination such as CTRL+L"`
@@ -187,6 +189,9 @@ func Validate(action Action) error {
 		}
 		if err := requirePoint(action.ToX, action.ToY, "drag destination"); err != nil {
 			return err
+		}
+		if action.DurationMS < 0 || action.DurationMS > 5000 {
+			return errors.New("duration_ms must be between 0 and 5000")
 		}
 		return validateButton(action.Button)
 	case "click", "double_click":

@@ -180,6 +180,7 @@ struct StateOutput {
     scale: f32,
     cursor_x: i32,
     cursor_y: i32,
+    cursor_shape: &'static str,
     has_image: bool,
     mime_type: &'static str,
     elements: Vec<Element>,
@@ -233,6 +234,8 @@ struct ActionParams {
     y: Option<i32>,
     to_x: Option<i32>,
     to_y: Option<i32>,
+    #[serde(default)]
+    duration_ms: u32,
     #[serde(default)]
     button: String,
     #[serde(default)]
@@ -475,6 +478,7 @@ impl Engine {
         unsafe {
             let _ = GetCursorPos(&mut cursor);
         }
+        let cursor_shape = cursor_shape();
         let truncated = params.offset + elements.len() < total;
         let encoded = match &image {
             Some(frame) => Some(encode_png(frame)?),
@@ -495,6 +499,7 @@ impl Engine {
             scale: display.as_ref().map(|display| display.scale).unwrap_or(1.0),
             cursor_x: cursor.x - origin.x,
             cursor_y: cursor.y - origin.y,
+            cursor_shape,
             has_image: encoded.is_some(),
             mime_type: "image/png",
             elements,
@@ -789,12 +794,20 @@ fn perform_action(
             let end = (record.bounds.x + x, record.bounds.y + y);
             move_to(start)?;
             mouse_button(&params.button, true)?;
-            for step in 1..=20 {
+            // The pointer moves every eight milliseconds or so across the drag's duration, as a hand does, so what
+            // follows it (a window, a slider) is seen as it would be under a person's drag.
+            let duration = if params.duration_ms == 0 {
+                200
+            } else {
+                params.duration_ms
+            } as i32;
+            let steps = (duration / 8).max(20);
+            for step in 1..=steps {
                 move_to((
-                    start.0 + (end.0 - start.0) * step / 20,
-                    start.1 + (end.1 - start.1) * step / 20,
+                    start.0 + (end.0 - start.0) * step / steps,
+                    start.1 + (end.1 - start.1) * step / steps,
                 ))?;
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(Duration::from_millis((duration / steps).max(1) as u64));
             }
             mouse_button(&params.button, false)
         }
@@ -1377,4 +1390,44 @@ fn main() -> io::Result<()> {
     input::release_all();
     SHUTTING_DOWN.store(true, Ordering::SeqCst);
     Ok(())
+}
+
+/// What the pointer shows now, among the system's own cursors, so a test can see an app change it (a move cursor over
+/// something draggable, a hand over a link); "other" for an app's own cursor, "hidden" when none shows.
+fn cursor_shape() -> &'static str {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CURSOR_SHOWING, CURSORINFO, GetCursorInfo, IDC_APPSTARTING, IDC_ARROW, IDC_CROSS, IDC_HAND,
+        IDC_IBEAM, IDC_NO, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
+        IDC_WAIT, LoadCursorW,
+    };
+    let mut info = CURSORINFO {
+        cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetCursorInfo(&mut info) }.is_err() {
+        return "unknown";
+    }
+    if info.flags.0 & CURSOR_SHOWING.0 == 0 {
+        return "hidden";
+    }
+    let shapes = [
+        (IDC_ARROW, "arrow"),
+        (IDC_SIZEALL, "move"),
+        (IDC_HAND, "hand"),
+        (IDC_IBEAM, "text"),
+        (IDC_SIZEWE, "resize_horizontal"),
+        (IDC_SIZENS, "resize_vertical"),
+        (IDC_SIZENWSE, "resize_diagonal_down"),
+        (IDC_SIZENESW, "resize_diagonal_up"),
+        (IDC_WAIT, "wait"),
+        (IDC_APPSTARTING, "busy"),
+        (IDC_NO, "not_allowed"),
+        (IDC_CROSS, "crosshair"),
+    ];
+    for (id, name) in shapes {
+        if unsafe { LoadCursorW(None, id) }.is_ok_and(|system| system == info.hCursor) {
+            return name;
+        }
+    }
+    "other"
 }
