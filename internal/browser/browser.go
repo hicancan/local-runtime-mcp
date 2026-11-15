@@ -31,22 +31,25 @@ type DesktopGate func(context.Context, string) (context.Context, func(), error)
 
 type Bridge struct {
 	configured bool
-	address    string
-	token      string
-	server     *http.Server
-	mu         sync.Mutex
-	pending    map[string]*pendingCall
-	instances  map[string]*instance
-	tabs       map[string]tabRoute
-	gate       DesktopGate
-	ctx        context.Context
-	cancel     context.CancelFunc
-	sequence   atomic.Uint64
-	prefix     string
-	closeOnce  sync.Once
-	closeErr   error
-	sockets    map[*websocket.Conn]struct{}
-	socketWG   sync.WaitGroup
+	// unavailable says why a configured bridge is not listening, such as its address held by another lrmcp; the
+	// other entry points run on and every browser call reports this instead.
+	unavailable string
+	address     string
+	token       string
+	server      *http.Server
+	mu          sync.Mutex
+	pending     map[string]*pendingCall
+	instances   map[string]*instance
+	tabs        map[string]tabRoute
+	gate        DesktopGate
+	ctx         context.Context
+	cancel      context.CancelFunc
+	sequence    atomic.Uint64
+	prefix      string
+	closeOnce   sync.Once
+	closeErr    error
+	sockets     map[*websocket.Conn]struct{}
+	socketWG    sync.WaitGroup
 }
 
 type instance struct {
@@ -79,10 +82,11 @@ type Peer struct {
 }
 
 type Status struct {
-	Configured bool             `json:"configured"`
-	Connected  bool             `json:"connected"`
-	Address    string           `json:"address,omitempty"`
-	Instances  []InstanceStatus `json:"instances"`
+	Configured  bool             `json:"configured"`
+	Unavailable string           `json:"unavailable,omitempty"`
+	Connected   bool             `json:"connected"`
+	Address     string           `json:"address,omitempty"`
+	Instances   []InstanceStatus `json:"instances"`
 }
 
 type InstanceStatus struct {
@@ -211,8 +215,11 @@ func Start(ctx context.Context, configuration config.Browser) (*Bridge, error) {
 	}
 	listener, err := net.Listen("tcp", configuration.Listen)
 	if err != nil {
+		// Another runtime on this machine holds the address (two agents each with their own lrmcp): this session runs
+		// without the browser and says so, rather than taking the computer and the files down with it.
 		cancel()
-		return nil, fmt.Errorf("start browser extension bridge: %w", err)
+		bridge.unavailable = fmt.Sprintf("browser bridge %s is not listening in this session: %v", configuration.Listen, err)
+		return bridge, nil
 	}
 	bridge.address = listener.Addr().String()
 	mux := http.NewServeMux()
@@ -272,7 +279,7 @@ func (b *Bridge) Close(ctx context.Context) error {
 func (b *Bridge) Status() Status {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	status := Status{Configured: b.configured, Address: b.address, Instances: make([]InstanceStatus, 0, len(b.instances))}
+	status := Status{Configured: b.configured, Unavailable: b.unavailable, Address: b.address, Instances: make([]InstanceStatus, 0, len(b.instances))}
 	for id, instance := range b.instances {
 		connected := instance.socket != nil && time.Since(instance.lastSeen) < 35*time.Second
 		status.Connected = status.Connected || connected
@@ -434,6 +441,9 @@ func (b *Bridge) call(ctx context.Context, browserID, method string, params any,
 	}
 	if !b.configured {
 		return errors.New("browser is not configured; run lrmcp setup browser")
+	}
+	if b.unavailable != "" {
+		return errors.New(b.unavailable)
 	}
 	callContext, cancel := context.WithTimeout(ctx, 35*time.Second)
 	defer cancel()

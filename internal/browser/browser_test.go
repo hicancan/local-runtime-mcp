@@ -374,3 +374,27 @@ func TestActionValidation(t *testing.T) {
 		}
 	}
 }
+
+// Two runtimes on one machine: the second cannot listen on the bridge address, runs on without the browser, and says
+// so in its status and on every browser call.
+func TestBridgeAddressHeldLeavesSessionWithoutBrowser(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	first, err := Start(ctx, config.Browser{Listen: "127.0.0.1:0", Token: testToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close(context.Background())
+	second, err := Start(ctx, config.Browser{Listen: first.Status().Address, Token: testToken})
+	if err != nil {
+		t.Fatalf("a held address must not stop the runtime: %v", err)
+	}
+	defer second.Close(context.Background())
+	status := second.Status()
+	if status.Unavailable == "" || status.Address != "" {
+		t.Fatalf("status should say the bridge is not listening: %+v", status)
+	}
+	if err := second.call(ctx, "", "tabs.list", nil, "", nil); err == nil || err.Error() != status.Unavailable {
+		t.Fatalf("browser calls should report the held address, got %v", err)
+	}
+}
