@@ -274,6 +274,25 @@ func TestRawSourceErrorsAreSanitizedAndUnknownSendIsNotReplayed(t *testing.T) {
 	}
 }
 
+func TestProviderErrorStateIsExplicitAndNeverLeaksThePageError(t *testing.T) {
+	s, f, b := newFixture(t)
+	f.hook = func(ctx context.Context, call sourceCall) (map[string]any, error) {
+		if call.name == "source.read" && f.count("source.start") > 0 {
+			return map[string]any{"state": "error", "text": "", "error": "sensitive-page-error-detail"}, nil
+		}
+		return f.defaultCall(ctx, call)
+	}
+	_, err := s.Generate(context.Background(), request(), "", nil)
+	errorCode(t, err, "provider_unavailable")
+	if strings.Contains(err.Error(), "sensitive-page-error-detail") || f.count("source.start") != 1 || f.count("source.stop") != 1 {
+		t.Fatal("provider rejection leaked or repeated its send")
+	}
+	_, closed, _ := b.counts()
+	if closed != 1 {
+		t.Fatal("provider rejection leaked the owned tab")
+	}
+}
+
 func TestCancellationStopsAndClosesWithIndependentLiveContexts(t *testing.T) {
 	s, f, b := newFixture(t)
 	started := make(chan struct{})

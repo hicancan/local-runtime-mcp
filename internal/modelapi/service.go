@@ -439,6 +439,8 @@ func sourceState(value any) (string, string, error) {
 		return "", "", failure("browser_interaction_required", "The model website requires user interaction.", 409)
 	case "stopped":
 		return "", "", failure("model_interrupted", "The page confirmed that generation stopped before completion.", 409)
+	case "error":
+		return "", "", failure("provider_unavailable", "The model website is temporarily unavailable. Check the page before trying again.", 502)
 	default:
 		return "", "", failure("model_source_error", "The model page did not confirm generation state.", 502)
 	}
