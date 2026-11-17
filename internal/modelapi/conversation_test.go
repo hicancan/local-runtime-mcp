@@ -110,6 +110,93 @@ func TestStudentFormattingRemainsInsideTheToolTransportOnEveryTurn(t *testing.T)
 	}
 }
 
+func TestParallelToolResultsKeepTheirCallArgumentsWhenReturnedInReverseOrder(t *testing.T) {
+	for _, finalTools := range []bool{false, true} {
+		t.Run(fmt.Sprintf("tools-enabled-%t", finalTools), func(t *testing.T) {
+			s, f, b := newFixture(t)
+			var first Assistant
+			f.hook = func(ctx context.Context, call sourceCall) (map[string]any, error) {
+				if call.name == "source.start" && f.count("source.start") == 2 {
+					prompt := call.args["prompt"].(string)
+					at := strings.Index(prompt, "CALL RESULTS CONTEXT:")
+					if at < 0 {
+						t.Fatal("continued results lost their generated call-ID mapping")
+					}
+					var references []toolResultReference
+					if json.Unmarshal([]byte(strings.Split(prompt[at:], "\n")[1]), &references) != nil || len(references) != 2 {
+						t.Fatal("call result references are incomplete")
+					}
+					for index, room := range []string{"B", "A"} {
+						var args map[string]any
+						if json.Unmarshal(references[index].Arguments, &args) != nil || references[index].ID != first.ToolCalls[1-index].ID || references[index].Name != "lookup" || args["room"] != room {
+							t.Fatal("reversed results were associated by position instead of their exact call identity")
+						}
+					}
+					if strings.Contains(prompt, "previous-user-body-not-replayed") {
+						t.Fatal("call references replayed the old conversation body")
+					}
+				}
+				if call.name == "source.read" && f.count("source.start") > 0 {
+					if f.count("source.start") == 1 {
+						return state("complete", `{"content":null,"tool_calls":[{"name":"lookup","arguments":{"room":"A"}},{"name":"lookup","arguments":{"room":"B"}}]}`), nil
+					}
+					if finalTools {
+						return state("complete", `{"content":"B and A confirmed","tool_calls":[]}`), nil
+					}
+					return state("complete", "B and A confirmed"), nil
+				}
+				return f.defaultCall(ctx, call)
+			}
+			r := request()
+			r.Messages = []Message{user("previous-user-body-not-replayed")}
+			r.Tools = []Tool{functionTool("lookup")}
+			var err error
+			first, err = s.Generate(context.Background(), r, "", "api", nil)
+			if err != nil || len(first.ToolCalls) != 2 {
+				t.Fatal("first tool round failed:", err)
+			}
+			r = appendAnswer(r, first, Message{Role: "tool", ToolCallID: first.ToolCalls[1].ID, Content: json.RawMessage(`"result B"`)})
+			r.Messages = append(r.Messages, Message{Role: "tool", ToolCallID: first.ToolCalls[0].ID, Content: json.RawMessage(`"result A"`)})
+			if !finalTools {
+				r.Tools = nil
+			}
+			answer, err := s.Generate(context.Background(), r, "", "api", nil)
+			if err != nil || deref(answer.Content) != "B and A confirmed" {
+				t.Fatal("final result correlation failed:", err)
+			}
+			if opened, _, _ := b.counts(); opened != 1 {
+				t.Fatal("result correlation split the webpage conversation")
+			}
+		})
+	}
+}
+
+func TestMalformedToolHistoryFailsBeforeCreatingAConversation(t *testing.T) {
+	call := ToolCall{ID: "call-once", Type: "function", Function: CallFunction{Name: "lookup", Arguments: `{"room":"A"}`}}
+	assistant := Message{Role: "assistant", Content: json.RawMessage("null"), ToolCalls: []ToolCall{call}}
+	result := Message{Role: "tool", ToolCallID: call.ID, Content: json.RawMessage(`"observed result"`)}
+	for name, history := range map[string][]Message{
+		"dangling-result":          {user("q"), result},
+		"duplicate-call":           {user("q"), {Role: "assistant", Content: json.RawMessage("null"), ToolCalls: []ToolCall{call, call}}, result},
+		"reused-call-id":           {user("q"), assistant, result, assistant, result},
+		"duplicate-result":         {user("q"), assistant, result, result},
+		"missing-result":           {user("q"), assistant},
+		"interrupted-result-group": {user("q"), assistant, user("skip the pending tool"), result},
+		"result-id-on-user":        {{Role: "user", Content: json.RawMessage(`"q"`), ToolCallID: call.ID}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, f, b := newFixture(t)
+			r := request()
+			r.Messages = history
+			_, err := s.Generate(context.Background(), r, "", "api", nil)
+			errorCode(t, err, "invalid_tool_history")
+			if opened, _, _ := b.counts(); opened != 0 || f.count("source.start") != 0 {
+				t.Fatal("invalid tool history reached the webpage")
+			}
+		})
+	}
+}
+
 func TestConversationNormalizesTextPartsAndToolArgumentJSON(t *testing.T) {
 	s, f, _ := newFixture(t)
 	f.hook = func(ctx context.Context, call sourceCall) (map[string]any, error) {

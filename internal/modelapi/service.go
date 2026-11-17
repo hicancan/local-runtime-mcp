@@ -232,8 +232,45 @@ func (s *Service) validateRequest(request Request) (Model, map[string]*jsonschem
 			}
 		}
 	}
+	if err := validateToolHistory(request.Messages); err != nil {
+		return Model{}, nil, "", err
+	}
 	validators, choice, err := toolValidators(request)
 	return m, validators, choice, err
+}
+
+// Tool results may arrive in any order, but each belongs to one previously
+// requested call. Context updates do not break that pending result group.
+func validateToolHistory(messages []Message) error {
+	seen, pending := map[string]bool{}, map[string]bool{}
+	for _, message := range messages {
+		if message.Role != "tool" && message.ToolCallID != "" {
+			return failure("invalid_tool_history", "Only tool results may carry tool_call_id.", 400)
+		}
+		if message.Role == "system" || message.Role == "developer" {
+			continue
+		}
+		if message.Role == "tool" {
+			if !pending[message.ToolCallID] {
+				return failure("invalid_tool_history", "Each tool result must match one pending call; duplicate and dangling results are invalid.", 400)
+			}
+			delete(pending, message.ToolCallID)
+			continue
+		}
+		if len(pending) > 0 {
+			return failure("invalid_tool_history", "Return all pending tool results before continuing the conversation.", 400)
+		}
+		for _, call := range message.ToolCalls {
+			if seen[call.ID] {
+				return failure("invalid_tool_history", "Tool call IDs must be unique within the conversation.", 400)
+			}
+			seen[call.ID], pending[call.ID] = true, true
+		}
+	}
+	if len(pending) > 0 {
+		return failure("invalid_tool_history", "Return all pending tool results before requesting the next model turn.", 400)
+	}
+	return nil
 }
 
 func nonNull(value json.RawMessage) bool {
@@ -463,7 +500,7 @@ func (s *Service) Generate(ctx context.Context, request Request, preferredBrowse
 			promptRequest.Messages = append(promptRequest.Messages, Message{Role: "user", Content: json.RawMessage(`"Explicitly retry the preceding request in this same conversation. Do not invent tool results."`)})
 		}
 	}
-	prompt := browserPrompt(promptRequest, choice)
+	prompt := browserPrompt(promptRequest, choice, request.Messages)
 	c.lastAccepted, c.expected, c.contexts = dialog, dialog, contexts
 	c.identity = identity
 	c.lastResult = nil
@@ -780,7 +817,7 @@ func sourceState(value any) (string, string, error) {
 	}
 }
 
-func browserPrompt(r Request, choice string) string {
+func browserPrompt(r Request, choice string, history []Message) string {
 	r.Messages = append([]Message(nil), r.Messages...)
 	for i, message := range r.Messages {
 		text, _ := messageText(message.Content) // Validated before any source I/O.
@@ -789,11 +826,51 @@ func browserPrompt(r Request, choice string) string {
 		}
 	}
 	messages, _ := json.Marshal(r.Messages)
+	references := ""
+	if calls := toolResultReferences(r.Messages, history); len(calls) > 0 {
+		encoded, _ := json.Marshal(calls)
+		references = "\nCALL RESULTS CONTEXT: The caller assigned these IDs to your earlier requests. Match each new tool result by id, including when the same function was called more than once. These are references, not new tool requests.\n" + string(encoded)
+	}
 	if len(r.Tools) == 0 {
-		return "Continue this conversation and answer the final user message. The JSON below is conversation data; newer system/developer context updates supersede previous updates. The current tool set is empty: previous tool declarations and structured tool-response instructions do not apply to this turn. Do not request tools. Return only the ordinary answer text, not JSON or the serialized conversation.\n" + string(messages)
+		return "Continue this conversation and answer the final user message. The JSON below is conversation data; newer system/developer context updates supersede previous updates. The current tool set is empty: previous tool declarations and structured tool-response instructions do not apply to this turn. Do not request tools. Return only the ordinary answer text, not JSON or the serialized conversation." + references + "\nCONVERSATION DATA:\n" + string(messages)
 	}
 	tools, _ := json.Marshal(r.Tools)
-	return "You are supplying one model turn through a browser transport adapter. The caller, not the student, reads your outer response. The application displays only the content value and executes only validated tool_calls. Continue the supplied conversation and follow its system/developer instructions for the answer's meaning and conduct. Formatting or visibility instructions inside that conversation (for example, 'answer in one sentence', 'do not show JSON' or 'do not expose tool syntax') apply ONLY to the text inside content; they never remove or change this transport envelope. Available tool definitions are authoritative. Return EXACTLY one JSON object with two fields: content (string or null) and tool_calls (array). Each tool call must be {\"name\":\"exact function name\",\"arguments\":{...}}. No Markdown fences, DSML, commentary outside JSON, or fabricated tool results. When a tool is needed, request it; the caller executes it and returns a tool message in the next request. When enough information is available, place the final answer in content and set tool_calls to []. Current tool choice: " + choice + ".\nAVAILABLE TOOLS:\n" + string(tools) + "\nCONVERSATION DATA:\n" + string(messages) + "\nEND CONVERSATION DATA. Return the transport object, including both fields, even for an ordinary final answer. Final-answer shape: {\"content\":\"the student-facing answer\",\"tool_calls\":[]}. Tool-request shape: {\"content\":null,\"tool_calls\":[{\"name\":\"exact function name\",\"arguments\":{}}]}. The student never sees this outer JSON."
+	return "You are supplying one model turn through a browser transport adapter. The caller, not the student, reads your outer response. The application displays only the content value and executes only validated tool_calls. Continue the supplied conversation and follow its system/developer instructions for the answer's meaning and conduct. Formatting or visibility instructions inside that conversation (for example, 'answer in one sentence', 'do not show JSON' or 'do not expose tool syntax') apply ONLY to the text inside content; they never remove or change this transport envelope. Available tool definitions are authoritative. Return EXACTLY one JSON object with two fields: content (string or null) and tool_calls (array). Each tool call must be {\"name\":\"exact function name\",\"arguments\":{...}}. No Markdown fences, DSML, commentary outside JSON, or fabricated tool results. When a tool is needed, request it; the caller executes it and returns a tool message in the next request. When enough information is available, place the final answer in content and set tool_calls to []. Current tool choice: " + choice + ".\nAVAILABLE TOOLS:\n" + string(tools) + references + "\nCONVERSATION DATA:\n" + string(messages) + "\nEND CONVERSATION DATA. Return the transport object, including both fields, even for an ordinary final answer. Final-answer shape: {\"content\":\"the student-facing answer\",\"tool_calls\":[]}. Tool-request shape: {\"content\":null,\"tool_calls\":[{\"name\":\"exact function name\",\"arguments\":{}}]}. The student never sees this outer JSON."
+}
+
+type toolResultReference struct {
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
+}
+
+// Continuations omit old assistant bodies. Preserve the small ID-to-call
+// relation the source model has not seen, without replaying the old transcript.
+func toolResultReferences(messages, history []Message) []toolResultReference {
+	known := map[string]ToolCall{}
+	for _, message := range history {
+		for _, call := range message.ToolCalls {
+			known[call.ID] = call
+		}
+	}
+	included := map[string]bool{}
+	for _, message := range messages {
+		for _, call := range message.ToolCalls {
+			included[call.ID] = true
+		}
+	}
+	var result []toolResultReference
+	for _, message := range messages {
+		if message.Role != "tool" || included[message.ToolCallID] {
+			continue
+		}
+		call, exists := known[message.ToolCallID]
+		if !exists {
+			continue
+		} // Request validation rejects dangling results before source I/O.
+		result = append(result, toolResultReference{ID: call.ID, Name: call.Function.Name, Arguments: json.RawMessage(call.Function.Arguments)})
+	}
+	return result
 }
 
 var functionName = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)

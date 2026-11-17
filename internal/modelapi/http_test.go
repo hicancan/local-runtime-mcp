@@ -81,6 +81,7 @@ func TestHTTPAuthenticatesAndValidatesBeforeAnySSEOrBrowserWork(t *testing.T) {
 		{"usage", `{"model":"web-test","messages":[{"role":"user","content":"q"}],"stream":true,"stream_options":{"include_usage":true}}`, "Bearer " + testKey, "", 400},
 		{"unknown-field", `{"model":"web-test","messages":[{"role":"user","content":"q"}],"stream":true,"unexpected":"sensitive-fixture-data"}`, "Bearer " + testKey, "", 400},
 		{"bad-json", `{"model":"sensitive-fixture-data",`, "Bearer " + testKey, "", 400},
+		{"dangling-tool-result", `{"model":"web-test","conversation_id":"test-conversation","messages":[{"role":"tool","tool_call_id":"unrequested","content":"result"}],"stream":true}`, "Bearer " + testKey, "", 400},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(tc.body))
