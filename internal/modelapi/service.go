@@ -669,7 +669,9 @@ func (s *Service) CloseConversation(ctx context.Context, scope, model, id string
 	c := s.sessions[key]
 	if c == nil {
 		s.mu.Unlock()
-		return failure("conversation_not_found", "This caller does not own that conversation.", 404)
+		// Closing a resource this caller does not currently own is a no-op.
+		// Do not disclose whether another scope uses the same public ID.
+		return nil
 	}
 	c.closing = true
 	cancel := c.cancel

@@ -335,9 +335,20 @@ func TestConversationScopeIsolationAndCloseNeverTouchesUnownedTabs(t *testing.T)
 	if _, err := s.Generate(context.Background(), r, "", "scope-b", nil); err != nil {
 		t.Fatal(err)
 	}
-	errorCode(t, s.CloseConversation(context.Background(), "not-owner", r.Model, r.ConversationID), "conversation_not_found")
+	if err := s.CloseConversation(context.Background(), "not-owner", r.Model, r.ConversationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, closed, _ := b.counts(); closed != 0 {
+		t.Fatal("an unknown scope closed another caller's page")
+	}
 	if err := s.CloseConversation(context.Background(), "scope-a", r.Model, r.ConversationID); err != nil {
 		t.Fatal(err)
+	}
+	if err := s.CloseConversation(context.Background(), "scope-a", r.Model, r.ConversationID); err != nil {
+		t.Fatal("repeated close was not idempotent:", err)
+	}
+	if _, closed, _ := b.counts(); closed != 1 {
+		t.Fatal("repeated close touched an unrelated resource")
 	}
 	if err := s.Close(context.Background()); err != nil {
 		t.Fatal(err)

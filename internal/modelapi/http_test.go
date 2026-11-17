@@ -363,7 +363,7 @@ func TestHTTPCachedRetryAndScopedDeletePreserveConversationIdentity(t *testing.T
 	for _, tc := range []struct {
 		model  string
 		status int
-	}{{"not-owned", 404}, {r.Model, 204}} {
+	}{{"not-owned", 204}, {r.Model, 204}, {r.Model, 204}} {
 		req, _ := http.NewRequest(http.MethodDelete, server.URL+"/v1/conversations/"+r.ConversationID+"?model="+tc.model, nil)
 		req.Header.Set("Authorization", "Bearer "+testKey)
 		res, err := server.Client().Do(req)
