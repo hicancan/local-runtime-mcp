@@ -685,6 +685,12 @@ func (s *Service) CloseConversation(ctx context.Context, scope, model, id string
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	s.mu.Lock()
+	stillOwned := s.sessions[key] == c
+	s.mu.Unlock()
+	if !stillOwned {
+		return nil // A concurrent close already released this exact binding.
+	}
 	if c.tabID != "" {
 		if err := s.browser.CloseTab(ctx, c.tabID, ""); err != nil {
 			return sourceFailure(err, "browser_close_failed", "The owned model page could not be closed.")

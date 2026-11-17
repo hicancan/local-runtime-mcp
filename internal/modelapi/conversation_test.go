@@ -396,6 +396,35 @@ func TestClosingAnActiveConversationCancelsOnlyItsOwnedTurn(t *testing.T) {
 	}
 }
 
+func TestConcurrentCloseCallsReleaseOneBindingOnlyOnce(t *testing.T) {
+	s, _, b := newFixture(t)
+	r := request()
+	if _, err := s.Generate(context.Background(), r, "", "api", nil); err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	var first sync.Once
+	b.closeHook = func(context.Context, string) error {
+		first.Do(func() { close(entered); <-release })
+		return nil
+	}
+	results := make(chan error, 16)
+	go func() { results <- s.CloseConversation(context.Background(), "api", r.Model, r.ConversationID) }()
+	<-entered
+	for i := 1; i < 16; i++ {
+		go func() { results <- s.CloseConversation(context.Background(), "api", r.Model, r.ConversationID) }()
+	}
+	close(release)
+	for i := 0; i < 16; i++ {
+		if err := <-results; err != nil {
+			t.Fatal("concurrent close was not idempotent:", err)
+		}
+	}
+	if _, closed, _ := b.counts(); closed != 1 {
+		t.Fatal("concurrent closes invoked browser closure more than once")
+	}
+}
+
 func TestConversationCapacityRejectsWithoutEvictionAndCloseReleasesSlot(t *testing.T) {
 	s, _, b := newFixture(t)
 	for i := 0; i < 32; i++ {
