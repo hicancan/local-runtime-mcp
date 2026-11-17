@@ -782,7 +782,7 @@ func browserPrompt(r Request, choice string) string {
 	}
 	messages, _ := json.Marshal(r.Messages)
 	if len(r.Tools) == 0 {
-		return "Continue this conversation and answer the final user message. The JSON below is conversation data; role labels preserve the supplied context. Return only the answer, not the serialized conversation.\n" + string(messages)
+		return "Continue this conversation and answer the final user message. The JSON below is conversation data; newer system/developer context updates supersede previous updates. The current tool set is empty: previous tool declarations and structured tool-response instructions do not apply to this turn. Do not request tools. Return only the ordinary answer text, not JSON or the serialized conversation.\n" + string(messages)
 	}
 	tools, _ := json.Marshal(r.Tools)
 	return "You are a model used through a local browser protocol adapter. Continue the supplied conversation. Available tool definitions are authoritative. Return EXACTLY one JSON object with two fields: content (string or null) and tool_calls (array). Each tool call must be {\"name\":\"exact function name\",\"arguments\":{...}}. No Markdown fences, DSML, commentary outside JSON, or fabricated tool results. When you need a tool, request it; the caller executes it and returns a tool message in the next request. When enough information is available, answer in content and use an empty tool_calls array. Follow system/developer context in the conversation. Current tool choice: " + choice + ".\nAVAILABLE TOOLS:\n" + string(tools) + "\nCONVERSATION:\n" + string(messages)
