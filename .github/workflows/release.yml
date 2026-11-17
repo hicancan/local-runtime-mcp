@@ -55,10 +55,18 @@ jobs:
         working-directory: browser-extension
         run: npm run sdk:pack -- ../dist
       - if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        name: Package the Harness integration
+        shell: pwsh
+        run: |
+          $version = (Get-Content -LiteralPath integrations/harness/package.json -Raw | ConvertFrom-Json).version
+          Compress-Archive -Path integrations/harness/* -DestinationPath "dist/local-runtime-harness-$version.zip"
+      - if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         uses: actions/upload-artifact@v7
         with:
           name: web-sdk
-          path: dist/*.tgz
+          path: |
+            dist/*.tgz
+            dist/local-runtime-harness-*.zip
           if-no-files-found: error
       - run: git diff --exit-code -- internal/browser/extension
       - if: runner.os == 'Windows'

@@ -46,7 +46,7 @@ test('real Harness session identity persists across tool rounds and is never inv
   const bodies = [];
   const adapter = new LocalRuntimeAdapter(config, async () => 'fixture-model-key', async (_, init) => { const body = JSON.parse(init.body); bodies.push(body); return textResponse(body.conversation_id); });
   await collect(adapter, { ...options(), sessionId: 'session-a' });
-  await collect(adapter, { ...options(), sessionId: 'session-a', messages: [...options().messages, { role: 'tool', toolCallId: 'call-a', content: [{ type: 'text', text: 'tool result' }] }] });
+  await collect(adapter, { ...options(), sessionId: 'session-a', messages: [...options().messages, { role: 'assistant', content: [{ type: 'tool-call', id: 'call-a', name: 'read_file', arguments: '{"path":"proof.txt"}' }] }, { role: 'tool', toolCallId: 'call-a', content: [{ type: 'text', text: 'tool result' }] }] });
   await collect(adapter, { ...options(), sessionId: 'session-b' });
   await assert.rejects(collect(adapter,{...options(),sessionId:undefined}),error=>error.code==='INVALID_ARGS');
   assert.deepEqual(bodies.map(body => body.conversation_id), ['session-a', 'session-a', 'session-b']);
