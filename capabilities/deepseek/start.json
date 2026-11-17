@@ -1,0 +1,76 @@
+{
+  "description": "Send one new turn in a runtime-owned DeepSeek session. Explicit new requires an empty chat; continue requires an existing runtime marker. A turn ID is never sent twice; unconfirmed outcomes must be read.",
+  "origins": [
+    "https://chat.deepseek.com"
+  ],
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "prompt": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 160000
+      },
+      "mode": {
+        "type": "string",
+        "enum": [
+          "new",
+          "continue"
+        ]
+      },
+      "turn_id": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 100,
+        "pattern": "^[A-Za-z0-9_-]+$"
+      }
+    },
+    "required": [
+      "prompt",
+      "mode",
+      "turn_id"
+    ],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "state": {
+        "type": "string",
+        "enum": [
+          "generating",
+          "complete",
+          "unconfirmed",
+          "login_required",
+          "not_ready",
+          "unsupported",
+          "pending",
+          "stopped",
+          "error"
+        ]
+      },
+      "text": {
+        "type": "string"
+      },
+      "turn_id": {
+        "type": "string",
+        "maxLength": 100
+      },
+      "error": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "state",
+      "text",
+      "turn_id"
+    ],
+    "additionalProperties": false
+  },
+  "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": false,
+    "idempotentHint": false,
+    "openWorldHint": true
+  }
+}

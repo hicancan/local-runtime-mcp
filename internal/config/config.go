@@ -32,15 +32,47 @@ const (
 	EnvOAuthOwnerToken       = EnvironmentPrefix + "OAUTH_OWNER_TOKEN"
 	EnvCloudflareTunnelToken = EnvironmentPrefix + "CLOUDFLARE_TUNNEL_TOKEN"
 	EnvCloudflared           = EnvironmentPrefix + "CLOUDFLARED"
+	EnvModelKey              = EnvironmentPrefix + "MODEL_KEY"
 )
 
 // Config is the complete persistent configuration for one portable runtime.
 // It lives beside the executable as local-runtime-mcp.yaml.
 type Config struct {
-	Browser    Browser    `yaml:"browser,omitempty"`
-	OpenAI     OpenAI     `yaml:"openai,omitempty"`
-	HTTP       HTTP       `yaml:"http,omitempty"`
-	Cloudflare Cloudflare `yaml:"cloudflare,omitempty"`
+	Browser      Browser      `yaml:"browser,omitempty"`
+	OpenAI       OpenAI       `yaml:"openai,omitempty"`
+	HTTP         HTTP         `yaml:"http,omitempty"`
+	Cloudflare   Cloudflare   `yaml:"cloudflare,omitempty"`
+	Capabilities Capabilities `yaml:"capabilities,omitempty"`
+	Models       Models       `yaml:"models,omitempty"`
+}
+
+type Capabilities struct {
+	Directory string     `yaml:"directory,omitempty"`
+	Web       []WebGrant `yaml:"web,omitempty"`
+}
+
+// A web page selects a named capability, never a browser tab or target URL.
+// The owner fixes each target in this exact-origin grant.
+type WebGrant struct {
+	Origin       string            `yaml:"origin"`
+	Models       []string          `yaml:"models,omitempty"`
+	Capabilities map[string]string `yaml:"capabilities,omitempty"`
+}
+
+type Models struct {
+	Key   string         `yaml:"key,omitempty"`
+	Items []BrowserModel `yaml:"items,omitempty"`
+}
+
+type BrowserModel struct {
+	ID             string `yaml:"id"`
+	Title          string `yaml:"title,omitempty"`
+	BrowserID      string `yaml:"browser_id,omitempty"`
+	URL            string `yaml:"url"`
+	Start          string `yaml:"start"`
+	Read           string `yaml:"read"`
+	Stop           string `yaml:"stop"`
+	TimeoutSeconds int    `yaml:"timeout_seconds,omitempty"`
 }
 
 type Browser struct {
@@ -134,6 +166,15 @@ func read(path string) (*Config, error) {
 	return cfg, nil
 }
 
+func resolvePaths(cfg *Config, path string) {
+	if cfg.Capabilities.Directory != "" && !filepath.IsAbs(cfg.Capabilities.Directory) {
+		resolved, err := filepath.Abs(filepath.Join(filepath.Dir(path), cfg.Capabilities.Directory))
+		if err == nil {
+			cfg.Capabilities.Directory = resolved
+		}
+	}
+}
+
 // Resolve applies the single precedence rule used by every entry point:
 // command line overrides environment, environment overrides YAML, and YAML
 // overrides built-in defaults.
@@ -145,6 +186,7 @@ func Resolve(path string, overrides Overrides) (*Config, error) {
 	applyEnvironment(cfg, os.LookupEnv)
 	applyOverrides(cfg, overrides)
 	applyDefaults(cfg)
+	resolvePaths(cfg, path)
 	return cfg, nil
 }
 
@@ -215,6 +257,7 @@ func applyEnvironment(cfg *Config, lookup func(string) (string, bool)) {
 	assign(EnvOAuthOwnerToken, &cfg.HTTP.OAuth.OwnerToken)
 	assign(EnvCloudflareTunnelToken, &cfg.Cloudflare.TunnelToken)
 	assign(EnvCloudflared, &cfg.Cloudflare.Binary)
+	assign(EnvModelKey, &cfg.Models.Key)
 }
 
 func applyOverrides(cfg *Config, overrides Overrides) {

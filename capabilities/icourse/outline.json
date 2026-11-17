@@ -1,0 +1,15 @@
+{
+  "description": "Read the course outline already loaded in a China University MOOC courseware page. Returns observed chapters and only the child items currently loaded; unexpanded chapters are explicitly marked. Does not start videos, open quizzes, save answers, or submit coursework.",
+  "origins": ["https://www.icourse163.org"],
+  "inputSchema": {"type":"object","properties":{},"additionalProperties":false},
+  "outputSchema": {
+    "type":"object",
+    "properties": {
+      "course":{"type":"object","properties":{"title":{"type":"string"},"url":{"type":"string"}},"required":["title","url"],"additionalProperties":false},
+      "chapters":{"type":"array","maxItems":100,"items":{"type":"object","properties":{"title":{"type":"string"},"itemsLoaded":{"type":"boolean"},"items":{"type":"array","maxItems":1000,"items":{"type":"object","properties":{"title":{"type":"string"},"kind":{"type":"string","enum":["video","quiz","unknown"]},"details":{"type":"string"}},"required":["title","kind","details"],"additionalProperties":false}}},"required":["title","itemsLoaded","items"],"additionalProperties":false}}
+    },
+    "required":["course","chapters"],
+    "additionalProperties":false
+  },
+  "annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}
+}

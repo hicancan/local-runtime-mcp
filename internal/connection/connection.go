@@ -86,7 +86,7 @@ func Run(ctx context.Context, cfg *config.Config, options Options, stdin io.Read
 		return err
 	}
 	defer func() {
-		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdown, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		result = errors.Join(result, host.Close(shutdown))
 	}()
@@ -102,6 +102,7 @@ func Run(ctx context.Context, cfg *config.Config, options Options, stdin io.Read
 		if err != nil {
 			return err
 		}
+		httpConfig.Models = host.ModelsHandler()
 		server, err := transport.NewHTTP(host.Server(), httpConfig)
 		if err != nil {
 			return err

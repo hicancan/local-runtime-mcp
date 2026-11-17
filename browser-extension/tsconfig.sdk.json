@@ -1,0 +1,5 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "outDir": "sdk", "declaration": true },
+  "include": ["src/web_sdk.ts", "src/web_protocol.ts"]
+}

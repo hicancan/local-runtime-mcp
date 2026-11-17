@@ -28,3 +28,27 @@ http:
 
 cloudflare:
   tunnel_token: "replace-with-your-cloudflare-managed-tunnel-token"
+
+# Registered tools are same-named JSON + JS pairs in this file tree.
+# Relative paths resolve beside this configuration, not the launch directory.
+capabilities:
+  directory: capabilities
+  web:
+    - origin: https://studev.hicancan.top
+      models: [deepseek-web]
+      # Generic page tools can be granted separately, at owner-fixed target URLs:
+      # capabilities:
+      #   example.read: https://example.com/account
+
+# Only enable models you want to serve. This key grants model use only, never MCP.
+# LOCAL_RUNTIME_MCP_MODEL_KEY can supply it to one child process instead of YAML.
+models:
+  key: "replace-with-a-different-random-model-key-at-least-32-characters"
+  items:
+    - id: deepseek-web
+      title: DeepSeek 网页
+      url: https://chat.deepseek.com/
+      start: deepseek.start
+      read: deepseek.read
+      stop: deepseek.stop
+      timeout_seconds: 300

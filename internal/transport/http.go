@@ -27,6 +27,7 @@ type HTTPConfig struct {
 	PublicHost    string
 	InternalToken bool
 	OAuth         *oauth.Config
+	Models        http.Handler
 }
 
 type HTTPServer struct {
@@ -72,6 +73,10 @@ func NewHTTP(server *mcp.Server, cfg HTTPConfig) (*HTTPServer, error) {
 	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if !allowedHost(request.Host, publicHost) {
 			http.Error(writer, "forbidden host", http.StatusForbidden)
+			return
+		}
+		if !cfg.InternalToken && cfg.Models != nil && strings.HasPrefix(request.URL.Path, "/v1/") {
+			cfg.Models.ServeHTTP(writer, request)
 			return
 		}
 		if request.URL.Path != "/mcp" {

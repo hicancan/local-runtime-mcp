@@ -50,6 +50,16 @@ jobs:
         run: npm run build
       - working-directory: browser-extension
         run: npm test
+      - if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        name: Package the shared browser SDK
+        working-directory: browser-extension
+        run: npm run sdk:pack -- ../dist
+      - if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: web-sdk
+          path: dist/*.tgz
+          if-no-files-found: error
       - run: git diff --exit-code -- internal/browser/extension
       - if: runner.os == 'Windows'
         uses: dtolnay/rust-toolchain@stable
@@ -77,7 +87,7 @@ jobs:
         shell: pwsh
         env:
           LOCAL_RUNTIME_MCP_BROWSER_E2E: '1'
-        run: go test ./internal/browser -run TestEdgeExtensionEndToEnd -count=3 -v
+        run: go test ./internal/browser -run 'TestEdgeExtensionEndToEnd|TestEdgeWebBridgeSDKOriginAndStreaming' -count=3 -v
       - if: runner.os == 'Windows'
         name: Verify idle extension lifetime and reconnect
         shell: pwsh
@@ -105,6 +115,8 @@ jobs:
           Copy-Item README.md,README.zh-CN.md,SECURITY.md,PRIVACY.md,config.example.yaml,LICENSE,THIRD_PARTY_NOTICES.md "dist/$name/"
           Copy-Item -LiteralPath licenses -Destination "dist/$name/licenses" -Recurse
           Copy-Item -LiteralPath docs -Destination "dist/$name/docs" -Recurse
+          Copy-Item -LiteralPath capabilities -Destination "dist/$name/capabilities" -Recurse
+          Copy-Item -LiteralPath integrations -Destination "dist/$name/integrations" -Recurse
           if ("${{ matrix.goos }}" -eq 'windows') {
             Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
           }
@@ -137,7 +149,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
-          $checksums = Get-ChildItem -LiteralPath dist -Filter '*.zip' | Sort-Object Name | ForEach-Object {
+          $checksums = Get-ChildItem -LiteralPath dist -File | Where-Object Extension -in '.zip','.tgz' | Sort-Object Name | ForEach-Object {
             "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
           }
           $checksums | Set-Content -LiteralPath dist/SHA256SUMS -Encoding utf8NoBOM

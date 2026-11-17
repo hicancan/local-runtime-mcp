@@ -1,5 +1,6 @@
 # Binaries
 /bin/
+/dist/
 /lrmcp.exe
 /lrmcp
 
@@ -12,6 +13,7 @@
 /tmp/
 /.pytest_cache/
 /browser-extension/node_modules/
+/browser-extension/sdk/
 /native/computer-windows/target/
 /internal/computer/worker_windows_*.exe
 /cloudflared

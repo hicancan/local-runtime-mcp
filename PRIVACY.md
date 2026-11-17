@@ -1,6 +1,6 @@
 # Privacy
 
-Effective date: October 11, 2026
+Effective date: November 17, 2026
 
 Local Runtime MCP is self-hosted software. Capability data is processed on the machine running `lrmcp` and returned through the selected MCP connection. The project operates no runtime hosting, analytics, telemetry collection, or storage service that receives tool data.
 
@@ -30,6 +30,14 @@ With OAuth enabled on the public origin, the requesting client exchanges its cli
 Browser extensions connect to the configured loopback bridge using an authenticated WebSocket for commands and periodic keepalive messages, and authenticated HTTP for results and desktop-operation authorization. The bridge routes each request to its selected profile instance and tab. Page results travel through the active MCP connection like other tool results.
 
 External MCP clients and tunnel providers may process request content and connection metadata under their own terms and privacy policies. Their histories, logs, retention, and account data are governed by those services and the operator's configuration.
+
+## Web and browser-model calls
+
+The optional top-level content bridge relays explicit SDK requests and responses. It does not inspect page content or grant machine access merely because a page contains the SDK. The runtime checks an exact owner-configured origin and named capability/model grant before disclosure or execution; local credentials stay in the extension and runtime.
+
+Browser-model callers select a stable conversation ID. Its first request creates a dedicated chat tab using the configured browser profile's existing sign-in; subsequent messages and tool results append to the same runtime-owned conversation. Web origins and models have separate conversation scopes. Replies return through the local model API or authorized web bridge. Local Runtime does not extract account cookies or browse unrelated previous chats. The model website may retain the supplied conversation according to its own policy; closing the runtime-owned tab does not delete a conversation on that website.
+
+The model service retains bounded conversation ownership, accepted context and active stream state in memory, without a separate persistent conversation store. Capability definitions and scripts remain in the owner-configured file tree. Cancellations stop the current turn without discarding conversation ownership or replaying uncertain submissions. Explicit close ends the runtime-owned browser resource.
 
 ## Local storage and retention
 

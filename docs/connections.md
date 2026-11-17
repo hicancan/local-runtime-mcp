@@ -2,7 +2,7 @@
 
 **English** · [简体中文](connections.zh-CN.md)
 
-One `lrmcp` process owns one Runtime Host. Its entry points publish the same 21 tools and share process sessions, browser targets, filesystem coordination, and desktop control.
+One `lrmcp` process owns one Runtime Host. Its MCP entry points publish the same 22 built-in tools plus owner-registered capabilities, and share process sessions, browser targets, filesystem coordination, and desktop control.
 
 ## Select transport and providers
 
@@ -59,7 +59,7 @@ These values are stored beside the executable where persistent storage is needed
    ```
 
 7. Continue the client's connection flow. On Local Runtime's consent page, verify the public hostname, registered client, and requested access, then approve using the owner approval key. The browser returns through the registered callback to the client application; token exchange and tool discovery complete the connection.
-8. Confirm the client discovers 21 tools. Start with read-only version, browser status, and file metadata checks before testing side effects.
+8. Confirm the client discovers the 22 built-in tools and any capabilities enabled by the owner. Start with read-only version, browser status, and file metadata checks before testing side effects.
 
 The callback URI must match exactly, including its path and any query component. Repeat `--redirect-uri` to register multiple permitted callbacks for one named client. Running setup again for the same name adds its callbacks while keeping existing credentials. The client name is its client ID; the default is `gemini`. Registration and `--show` display that client's credentials locally.
 
@@ -79,7 +79,7 @@ Use one client connected through OpenAI and another through Cloudflare to test t
 
 | Check | Evidence |
 | --- | --- |
-| Same runtime | Both clients obtain the same executable version and discover 21 tools. |
+| Same runtime | Both clients obtain the same executable version and tool catalog. |
 | Shared process registry | Client A starts a short asynchronous process with a distinctive marker and shares only its `session_id` with B. B reads it with `process_continue` using an explicit cursor; A can still reread the retained output. |
 | Shared browser registry | Both clients see the same connected browser instance IDs and can select distinct instances or existing tabs explicitly. |
 | Shared desktop coordination | A acquires control with a test label. While A holds it, B's acquire reports busy with A's label. A releases only its own control token. |

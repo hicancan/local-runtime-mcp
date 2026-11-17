@@ -61,7 +61,7 @@ test('offline worker retries once, rests until an alarm, and never starts duplic
   let alarm, reads=0;
   const event={addListener(){}};
   globalThis.chrome={
-    runtime:{onMessage:event}, debugger:{onDetach:event,onEvent:event},
+    runtime:{onMessage:event,onConnect:event}, debugger:{onDetach:event,onEvent:event},
     tabs:{onRemoved:event,onUpdated:event},
     storage:{local:{async get(){reads++;return {address:'127.0.0.1:9315',token:'0123456789abcdef0123456789abcdef',instanceId:'profile',label:'test'};}}},
     alarms:{onAlarm:{addListener(listener){alarm=listener;}},async create(){}}

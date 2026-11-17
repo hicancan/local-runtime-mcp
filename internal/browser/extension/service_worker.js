@@ -1,7 +1,8 @@
 import { packagedConfig } from './runtime_config.js';
 import { LaneScheduler } from './scheduler.js';
 import { commandStream } from './connection.js';
-const VERSION = '12.0.1';
+import { VERSION } from './version.js';
+import { installWebBridge } from './web_bridge.js';
 const attachedTabs = new Set();
 const childSessions = new Map();
 const dialogWaiters = new Map();
@@ -19,10 +20,33 @@ const scheduler = new LaneScheduler();
 let connectionAbort = new AbortController();
 let running = false;
 let lastBridgeId = '';
+let browserConnected = false;
 const resultOutbox = new Map();
 let outboxBytes = 0;
 let resultDeliveries = 0;
 let retryDeliveries = 0;
+let settingsRead;
+function bridgeSettings() {
+    if (!settingsRead)
+        settingsRead = (async () => {
+            const settings = await chrome.storage.local.get({ address: packagedConfig.address || '127.0.0.1:9315', token: packagedConfig.token || '', instanceId: '', label: '' });
+            if (!settings.instanceId) {
+                settings.instanceId = crypto.randomUUID();
+                await chrome.storage.local.set({ instanceId: settings.instanceId });
+            }
+            return { address: settings.address, token: settings.token, instanceId: settings.instanceId, label: settings.label };
+        })().finally(() => { settingsRead = undefined; });
+    return settingsRead;
+}
+installWebBridge(async () => {
+    const settings = await bridgeSettings();
+    const deadline = Date.now() + 5000;
+    while (!browserConnected && Date.now() < deadline)
+        await delay(25);
+    if (!browserConnected)
+        throw new Error('local runtime browser connection is not ready');
+    return { address: settings.address, token: settings.token, instanceId: settings.instanceId, bootId };
+}, tabHandle);
 function deliverResult(base, headers, payload) {
     let bytes = JSON.stringify(payload).length;
     if (outboxBytes + bytes > 64 * 1024 * 1024) {
@@ -109,6 +133,7 @@ async function sendCDPAllowDialog(source, method, params) {
 }
 chrome.runtime.onMessage.addListener((message) => {
     if (message?.type === 'settings-changed') {
+        browserConnected = false;
         connectionAbort.abort();
         scheduler.cancelAll();
         bootId = crypto.randomUUID();
@@ -183,15 +208,7 @@ async function run(currentGeneration) {
     try {
         while (currentGeneration === generation) {
             const currentBoot = bootId;
-            const settings = await chrome.storage.local.get({
-                address: packagedConfig.address || '127.0.0.1:9315',
-                token: packagedConfig.token || '',
-                instanceId: '', label: ''
-            });
-            if (!settings.instanceId) {
-                settings.instanceId = crypto.randomUUID();
-                await chrome.storage.local.set({ instanceId: settings.instanceId });
-            }
+            const settings = await bridgeSettings();
             if (!settings.token || settings.token.length < 32) {
                 return;
             }
@@ -202,6 +219,9 @@ async function run(currentGeneration) {
                 return;
             try {
                 await commandStream(settings.address, settings.token, peer, abort.signal, bridgeId => {
+                    if (currentGeneration !== generation)
+                        return;
+                    browserConnected = true;
                     failures = 0;
                     if (lastBridgeId && bridgeId !== lastBridgeId) {
                         scheduler.cancelAll();
@@ -263,12 +283,15 @@ async function run(currentGeneration) {
                 });
             }
             catch (error) {
+                if (currentGeneration === generation)
+                    browserConnected = false;
                 failures++;
                 // Connection diagnostics contain no credential, page content or result.
                 console.warn('Local Runtime MCP bridge disconnected:', error instanceof Error ? error.message : 'connection error');
             }
             finally {
                 if (currentGeneration === generation) {
+                    browserConnected = false;
                     scheduler.cancelAll();
                     pageStates.clear();
                     operationObservations.clear();

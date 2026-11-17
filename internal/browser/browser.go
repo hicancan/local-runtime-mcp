@@ -20,10 +20,11 @@ import (
 	"time"
 
 	"github.com/hicancan/local-runtime-mcp/internal/config"
+	"github.com/hicancan/local-runtime-mcp/internal/version"
 	"golang.org/x/net/websocket"
 )
 
-const ExtensionVersion = "13.0.0"
+const ExtensionVersion = version.Version
 
 // DesktopGate reserves the shared interactive desktop for a browser operation.
 // A successful reservation is released only once execution has acknowledged completion.
@@ -42,6 +43,8 @@ type Bridge struct {
 	instances   map[string]*instance
 	tabs        map[string]tabRoute
 	gate        DesktopGate
+	webHandler  WebHandler
+	webActive   int
 	ctx         context.Context
 	cancel      context.CancelFunc
 	sequence    atomic.Uint64
@@ -226,6 +229,7 @@ func Start(ctx context.Context, configuration config.Browser) (*Bridge, error) {
 	mux.Handle("/v1/connect", websocket.Server{Handshake: bridge.socketHandshake, Handler: bridge.connect})
 	mux.HandleFunc("/v1/result", bridge.receiveResult)
 	mux.HandleFunc("/v1/authorize", bridge.authorizeDesktop)
+	mux.HandleFunc("/v1/web", bridge.receiveWeb)
 	bridge.server = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-bridgeContext.Done()
@@ -315,7 +319,30 @@ func (b *Bridge) CloseTab(ctx context.Context, tabID, controlID string) error {
 	if err != nil {
 		return err
 	}
+	b.mu.Lock()
+	ownedRoute := b.tabs[tabID]
+	b.mu.Unlock()
 	err = b.call(ctx, browserID, "tabs.close", map[string]any{"tab_id": tabID}, controlID, &struct{}{})
+	if err != nil && ctx.Err() == nil {
+		// A person may already have closed the tab. Confirm absence in the
+		// same connected generation; never infer it from provider error prose.
+		if tabs, observed := b.Tabs(ctx, browserID); observed == nil {
+			b.mu.Lock()
+			instance := b.instances[browserID]
+			sameGeneration := instance != nil && instance.peer.BootID == ownedRoute.bootID
+			b.mu.Unlock()
+			present := false
+			for _, tab := range tabs {
+				if tab.ID == tabID {
+					present = true
+					break
+				}
+			}
+			if sameGeneration && !present {
+				err = nil
+			}
+		}
+	}
 	if err == nil {
 		b.mu.Lock()
 		delete(b.tabs, tabID)

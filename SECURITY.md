@@ -8,7 +8,7 @@ Security fixes are released on the latest version. Use the current [GitHub relea
 
 ## Connection boundaries
 
-Every selected connection reaches one shared Runtime Host and the same 21-tool surface. One process can run OpenAI and Cloudflare providers concurrently; both use the same resource coordination services.
+Every selected MCP connection reaches one shared Runtime Host and the same built-in and owner-registered tool surface. One process can run OpenAI and Cloudflare providers concurrently; both use the same resource coordination services.
 
 | Connection | Properties |
 | --- | --- |
@@ -28,7 +28,15 @@ OAuth uses registered clients, exact callback URI matching, Authorization Code f
 
 The owner approval key confirms that the operator authorizes a client's request. Keep it with trusted operators; supply it only on the runtime's own consent page after checking the public origin and client identity. The generated client ID and secret belong in the requesting client's OAuth settings. Cloudflare tunnel tokens and OpenAI provider keys retain their separate provider roles.
 
-An OAuth grant authorizes the complete 21-tool surface with the host account's permissions. Clients share the runtime's authority and resource managers. Process session IDs, browser handles, and desktop control tokens coordinate resources rather than establishing tenant security boundaries.
+An MCP OAuth grant authorizes the complete tool surface with the host account's permissions. Clients share the runtime's authority and resource managers. Process session IDs, browser handles, and desktop control tokens coordinate resources rather than establishing tenant security boundaries.
+
+## Web and model boundaries
+
+Web SDK callers are separate from full-access MCP clients. The extension supplies the real top-level sender origin, document and browser identity. The Host requires an exact configured origin and per-model or per-capability grant. A web caller cannot supply a target tab, browser identity, script, or runtime credential. Registered capability targets are fixed by the owner; both the Host and execution wrapper verify their allowed origin.
+
+The model API uses a distinct random key of at least 32 characters. It cannot authenticate MCP or the browser bridge, and MCP credentials do not authenticate model requests. Direct model HTTP rejects browser Origin headers; authorized websites use the extension SDK instead. Model routes are not exposed on the private OpenAI MCP forwarding hop.
+
+Owner-authored capability scripts are trusted executable code, not a sandbox for arbitrary websites. Input and output schemas, target-origin checks and safe parameter injection constrain invocation; they do not make an unreviewed owner script trustworthy. Model-produced tool requests are validated and returned to the caller, never executed by the model service.
 
 Client credentials and the owner approval key are stored in the adjacent YAML. OAuth registration and `lrmcp setup oauth --show` deliberately display credentials in the local terminal; keep that output private. OAuth authorization codes, access tokens, refresh tokens, and pending consent state live in process memory; runtime restart invalidates them and requires renewed authorization. Protect configuration backups and removable media containing long-lived credentials.
 

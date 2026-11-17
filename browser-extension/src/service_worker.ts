@@ -1,8 +1,9 @@
 import { packagedConfig } from './runtime_config.js';
 import { LaneScheduler } from './scheduler.js';
 import { commandStream } from './connection.js';
+import { VERSION } from './version.js';
+import { installWebBridge } from './web_bridge.js';
 
-const VERSION = '12.0.1';
 const attachedTabs = new Set<number>();
 const childSessions = new Map<number, Set<string>>();
 const dialogWaiters = new Map<number, Set<() => void>>();
@@ -31,11 +32,31 @@ const scheduler = new LaneScheduler();
 let connectionAbort = new AbortController();
 let running = false;
 let lastBridgeId = '';
+let browserConnected = false;
 type Delivery = { base: string; headers: Record<string, string>; payload: Dynamic; bytes: number; attempts: number; active: boolean; readyAt: number };
 const resultOutbox = new Map<string, Delivery>();
 let outboxBytes = 0;
 let resultDeliveries = 0;
 let retryDeliveries = 0;
+type BridgeSettings = { address: string; token: string; instanceId: string; label: string };
+let settingsRead: Promise<BridgeSettings> | undefined;
+
+function bridgeSettings(): Promise<BridgeSettings> {
+  if (!settingsRead) settingsRead = (async () => {
+    const settings = await chrome.storage.local.get({ address: packagedConfig.address || '127.0.0.1:9315', token: packagedConfig.token || '', instanceId: '', label: '' });
+    if (!settings.instanceId) { settings.instanceId = crypto.randomUUID(); await chrome.storage.local.set({ instanceId: settings.instanceId }); }
+    return { address: settings.address, token: settings.token, instanceId: settings.instanceId, label: settings.label };
+  })().finally(() => { settingsRead = undefined; });
+  return settingsRead;
+}
+
+installWebBridge(async () => {
+  const settings = await bridgeSettings();
+  const deadline = Date.now() + 5000;
+  while (!browserConnected && Date.now() < deadline) await delay(25);
+  if (!browserConnected) throw new Error('local runtime browser connection is not ready');
+  return { address: settings.address, token: settings.token, instanceId: settings.instanceId, bootId };
+}, tabHandle);
 
 function deliverResult(base: string, headers: Record<string,string>, payload: Dynamic) {
   let bytes = JSON.stringify(payload).length;
@@ -112,6 +133,7 @@ async function sendCDPAllowDialog(source: DebugSource, method: string, params?: 
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === 'settings-changed') {
+    browserConnected = false;
     connectionAbort.abort(); scheduler.cancelAll();
     bootId = crypto.randomUUID(); tabHandles.clear(); nativeTabs.clear(); pageStates.clear();
     connectionAbort = new AbortController(); void run(++generation);
@@ -172,15 +194,7 @@ async function run(currentGeneration: number) {
   try {
   while (currentGeneration === generation) {
     const currentBoot = bootId;
-    const settings = await chrome.storage.local.get({
-      address: packagedConfig.address || '127.0.0.1:9315',
-      token: packagedConfig.token || '',
-      instanceId: '', label: ''
-    });
-    if (!settings.instanceId) {
-      settings.instanceId = crypto.randomUUID();
-      await chrome.storage.local.set({ instanceId: settings.instanceId });
-    }
+    const settings = await bridgeSettings();
     if (!settings.token || settings.token.length < 32) {
       return;
     }
@@ -190,6 +204,8 @@ async function run(currentGeneration: number) {
     if (currentGeneration !== generation) return;
     try {
       await commandStream(settings.address, settings.token, peer, abort.signal, bridgeId => {
+      if (currentGeneration !== generation) return;
+      browserConnected = true;
       failures = 0;
       if (lastBridgeId && bridgeId !== lastBridgeId) {
         scheduler.cancelAll(); pageStates.clear(); operationObservations.clear(); tabHandles.clear(); nativeTabs.clear();
@@ -236,11 +252,13 @@ async function run(currentGeneration: number) {
             .then(payload => deliverResult(base, headers, payload)).catch(() => {});
       });
     } catch (error) {
+      if (currentGeneration === generation) browserConnected = false;
       failures++;
       // Connection diagnostics contain no credential, page content or result.
       console.warn('Local Runtime MCP bridge disconnected:', error instanceof Error ? error.message : 'connection error');
     } finally {
       if (currentGeneration === generation) {
+        browserConnected = false;
         scheduler.cancelAll();
         pageStates.clear(); operationObservations.clear(); tabHandles.clear(); nativeTabs.clear();
       }

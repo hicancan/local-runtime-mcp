@@ -1,0 +1,53 @@
+{
+  "description": "Click the observed stop-generation control in the runtime-owned DeepSeek conversation and confirm its disappearance; an unavailable or unchanged control returns unconfirmed.",
+  "origins": [
+    "https://chat.deepseek.com"
+  ],
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "turn_id": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 100,
+        "pattern": "^[A-Za-z0-9_-]+$"
+      }
+    },
+    "required": [
+      "turn_id"
+    ],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "state": {
+        "type": "string",
+        "enum": [
+          "stopped",
+          "complete",
+          "unconfirmed"
+        ]
+      },
+      "text": {
+        "type": "string"
+      },
+      "turn_id": {
+        "type": "string",
+        "maxLength": 100
+      }
+    },
+    "required": [
+      "state",
+      "text",
+      "turn_id"
+    ],
+    "additionalProperties": false
+  },
+  "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": true
+  }
+}

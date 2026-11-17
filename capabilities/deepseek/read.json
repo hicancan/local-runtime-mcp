@@ -1,0 +1,59 @@
+{
+  "description": "Observe the runtime-owned DeepSeek conversation's current response and visible generation state, excluding the separate thinking panel. This does not establish the identity of the underlying model.",
+  "origins": [
+    "https://chat.deepseek.com"
+  ],
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "turn_id": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 100,
+        "pattern": "^[A-Za-z0-9_-]+$"
+      }
+    },
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "state": {
+        "type": "string",
+        "enum": [
+          "generating",
+          "complete",
+          "stopped",
+          "pending",
+          "idle",
+          "login_required",
+          "not_ready",
+          "unsupported",
+          "error"
+        ]
+      },
+      "text": {
+        "type": "string"
+      },
+      "error": {
+        "type": "string"
+      },
+      "turn_id": {
+        "type": "string",
+        "maxLength": 100
+      }
+    },
+    "required": [
+      "state",
+      "text",
+      "turn_id"
+    ],
+    "additionalProperties": false
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": true
+  }
+}

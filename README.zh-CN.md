@@ -7,7 +7,9 @@
 
 [English](README.md) · **简体中文**
 
-让 AI 客户端使用运行 `lrmcp` 的机器上的程序、文件、图像、浏览器配置文件和桌面。Local Runtime MCP 是一个便携的机器访问运行时，以 **22 个 MCP 工具覆盖五个能力域**。
+让 AI 客户端使用运行 `lrmcp` 的机器上的程序、文件、图像、浏览器配置文件和桌面。Local Runtime MCP 是一个便携的本地运行时，提供 **22 个内建 MCP 工具**，并从文件树注册可复用网页能力。
+
+同一个运行时还提供按网站来源授权的网页 SDK，以及使用独立 Key 的本地模型 API。浏览器里的模型通过 `start / read / stop` 能力成为模型来源，Harness 和 StuDev 保留自己的工具循环。见 [工具、网页与模型](docs/models.zh-CN.md)。
 
 本地客户端可以使用 stdio 或 Streamable HTTP；远端客户端可以通过 OpenAI Secure MCP Tunnel 和 Cloudflare Tunnel 接入。同一个运行实例可以同时开启两条隧道，共享一套进程会话、浏览器实例和桌面控制。不同进程会话和浏览器标签页可以并发执行，共享文件和桌面输入则按照明确的资源规则协调。
 

@@ -1,0 +1,20 @@
+import { readFile, mkdir, copyFile, rename } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
+
+const directory = fileURLToPath(new URL('../', import.meta.url));
+const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
+const destination = resolve(process.argv[2] || '../dist');
+await mkdir(destination, { recursive: true });
+await copyFile(new URL('../../LICENSE', import.meta.url), new URL('../sdk/LICENSE', import.meta.url));
+if (!process.env.npm_execpath) throw new Error('Run through npm run sdk:pack after npm run build.');
+const packed = spawnSync(process.execPath, [process.env.npm_execpath, 'pack', '--json', '--ignore-scripts', '--pack-destination', destination], { cwd: directory, encoding: 'utf8' });
+if (packed.status !== 0) throw new Error(packed.stderr || 'SDK packaging failed');
+const [result] = JSON.parse(packed.stdout);
+const expected = new Set(['package.json', 'sdk/LICENSE', 'sdk/web_sdk.js', 'sdk/web_sdk.d.ts', 'sdk/web_protocol.js', 'sdk/web_protocol.d.ts']);
+if (result.files.length !== expected.size || result.files.some(file => !expected.has(file.path))) throw new Error('SDK package must contain only the shared SDK, protocol, declarations and license.');
+const target = resolve(destination, `local-runtime-mcp-web-sdk-${pkg.version}.tgz`);
+const original = resolve(destination, result.filename);
+if (original !== target) await rename(original, target);
+console.log(JSON.stringify({ file: target, version: pkg.version, files: result.files.map(file => file.path), bytes: result.size }));

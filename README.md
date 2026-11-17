@@ -7,7 +7,9 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-Give AI clients the programs, files, images, browser profiles, and desktop of the machine running `lrmcp`. Local Runtime MCP is a portable host-access runtime with **22 MCP tools across five capability domains**.
+Give AI clients the programs, files, images, browser profiles, and desktop of the machine running `lrmcp`. Local Runtime MCP is a portable local runtime with **22 built-in MCP tools** and reusable webpage capabilities registered from the file tree.
+
+The same runtime offers an exact-origin-authorized browser SDK and a local model API with a separate model-only key. A browser model uses registered `start / read / stop` capabilities; Harness and applications keep their own agent loops. See [tools, webpages and models](docs/models.zh-CN.md).
 
 Connect locally over stdio or Streamable HTTP, or remotely through OpenAI Secure MCP Tunnel and Cloudflare Tunnel. One running instance can expose both tunnels at once, with one set of process sessions, browser instances, and desktop control. Independent process sessions and browser tabs run concurrently; shared files and desktop input have explicit coordination rules.
 

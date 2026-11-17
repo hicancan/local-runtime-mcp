@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/hicancan/local-runtime-mcp/internal/config"
+	"github.com/hicancan/local-runtime-mcp/internal/version"
 )
 
 func TestVersion(t *testing.T) {
@@ -18,7 +19,7 @@ func TestVersion(t *testing.T) {
 	if err := run(context.Background(), []string{"version"}, strings.NewReader(""), &output, &errors, executable); err != nil {
 		t.Fatal(err)
 	}
-	if output.String() != "lrmcp 13.0.0\n" {
+	if output.String() != "lrmcp "+version.Version+"\n" {
 		t.Fatalf("version output = %q", output.String())
 	}
 }

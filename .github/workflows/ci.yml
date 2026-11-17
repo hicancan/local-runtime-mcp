@@ -30,6 +30,16 @@ jobs:
         run: npm run build
       - working-directory: browser-extension
         run: npm test
+      - if: runner.os == 'Linux'
+        name: Verify official Harness adapter contracts
+        shell: pwsh
+        run: |
+          $taskHarness = Join-Path $env:RUNNER_TEMP 'local-runtime-harness'
+          Copy-Item -LiteralPath integrations/harness -Destination $taskHarness -Recurse
+          npm install --prefix $taskHarness --ignore-scripts --no-package-lock --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw 'Harness peer dependency installation failed' }
+          node --test "$taskHarness/test.mjs"
+          if ($LASTEXITCODE -ne 0) { throw 'Harness adapter contract tests failed' }
       - run: git diff --exit-code -- internal/browser/extension
       - if: runner.os == 'Windows'
         uses: dtolnay/rust-toolchain@stable
@@ -56,7 +66,7 @@ jobs:
         shell: pwsh
         env:
           LOCAL_RUNTIME_MCP_BROWSER_E2E: '1'
-        run: go test ./internal/browser -run TestEdgeExtensionEndToEnd -count=3 -v
+        run: go test ./internal/browser -run 'TestEdgeExtensionEndToEnd|TestEdgeWebBridgeSDKOriginAndStreaming' -count=3 -v
       - if: runner.os == 'Windows'
         name: Verify idle extension lifetime and reconnect
         shell: pwsh
