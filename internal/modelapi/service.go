@@ -152,6 +152,7 @@ type Error struct {
 }
 
 func (e *Error) Error() string                       { return e.Message }
+func (e *Error) ErrorCode() string                   { return e.Code }
 func failure(code, message string, status int) error { return &Error{code, message, status} }
 
 // ValidateRequest performs protocol validation without opening a page or
