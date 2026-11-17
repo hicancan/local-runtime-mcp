@@ -56,6 +56,9 @@ func nextEvent(reader *bufio.Reader) (map[string]any, bool, error) {
 }
 func firstChoice(t *testing.T, event map[string]any) map[string]any {
 	t.Helper()
+	if event["conversation_id"] != "test-conversation" {
+		t.Fatal("completion chunk lost conversation identity")
+	}
 	choices, ok := event["choices"].([]any)
 	if !ok || len(choices) != 1 {
 		t.Fatal("missing completion choice")
@@ -113,13 +116,14 @@ func TestHTTPModelDiscoveryAndNonStreamingCompletion(t *testing.T) {
 	response = postRequest(t, server, context.Background(), request())
 	defer response.Body.Close()
 	var body struct {
-		Object  string `json:"object"`
-		Choices []struct {
+		ConversationID string `json:"conversation_id"`
+		Object         string `json:"object"`
+		Choices        []struct {
 			Message Assistant `json:"message"`
 			Finish  string    `json:"finish_reason"`
 		} `json:"choices"`
 	}
-	if json.NewDecoder(response.Body).Decode(&body) != nil || response.StatusCode != 200 || body.Object != "chat.completion" || len(body.Choices) != 1 || deref(body.Choices[0].Message.Content) != "answer" || body.Choices[0].Finish != "stop" {
+	if json.NewDecoder(response.Body).Decode(&body) != nil || response.StatusCode != 200 || body.ConversationID != "test-conversation" || body.Object != "chat.completion" || len(body.Choices) != 1 || deref(body.Choices[0].Message.Content) != "answer" || body.Choices[0].Finish != "stop" {
 		t.Fatal("nonstreaming completion did not follow the wire contract")
 	}
 }
@@ -269,22 +273,25 @@ func TestSSEMidstreamFailureIsSanitizedAndNeverReportsSuccessfulDone(t *testing.
 		t.Fatal("failed stream leaked detail or claimed success:", text)
 	}
 	_, closed, _ := b.counts()
-	if f.count("source.start") != 1 || f.count("source.stop") != 1 || closed != 1 {
+	if f.count("source.start") != 1 || f.count("source.stop") != 1 || closed != 0 {
 		t.Fatal("stream failure replayed or did not clean up")
 	}
 }
 
 func TestHTTPClientDisconnectCancelsSourceAndCleansUp(t *testing.T) {
 	s, f, b := newFixture(t)
-	started, closed := make(chan struct{}), make(chan struct{})
+	started, stopped, closed := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	f.hook = func(ctx context.Context, call sourceCall) (map[string]any, error) {
 		if call.name == "source.start" {
 			close(started)
 			<-ctx.Done()
 			return nil, ctx.Err()
 		}
-		if call.name == "source.stop" && ctx.Err() != nil {
-			return nil, errors.New("cleanup reused dead context")
+		if call.name == "source.stop" {
+			if ctx.Err() != nil {
+				return nil, errors.New("cleanup reused dead context")
+			}
+			close(stopped)
 		}
 		return f.defaultCall(ctx, call)
 	}
@@ -305,11 +312,74 @@ func TestHTTPClientDisconnectCancelsSourceAndCleansUp(t *testing.T) {
 	cancel()
 	response.Body.Close()
 	select {
-	case <-closed:
+	case <-stopped:
 	case <-time.After(time.Second):
 		t.Fatal("HTTP disconnect did not reach independent cleanup")
 	}
+	if _, count, _ := b.counts(); count != 0 {
+		t.Fatal("HTTP disconnect closed the reusable conversation")
+	}
+	deleteRequest, _ := http.NewRequest(http.MethodDelete, server.URL+"/v1/conversations/test-conversation?model=web-test", nil)
+	deleteRequest.Header.Set("Authorization", "Bearer "+testKey)
+	deleteResponse, err := server.Client().Do(deleteRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteResponse.Body.Close()
+	if deleteResponse.StatusCode != http.StatusNoContent {
+		t.Fatal("explicit HTTP conversation close failed")
+	}
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("explicit close did not close the owned tab")
+	}
 	if f.count("source.start") != 1 || f.count("source.stop") != 1 {
 		t.Fatal("HTTP disconnect retried the source or skipped stop")
+	}
+}
+
+func TestHTTPCachedRetryAndScopedDeletePreserveConversationIdentity(t *testing.T) {
+	s, f, b := newFixture(t)
+	server := httptest.NewServer(&HTTP{Service: s, Key: testKey})
+	defer server.Close()
+	r := request()
+	first := postRequest(t, server, context.Background(), r)
+	io.Copy(io.Discard, first.Body)
+	first.Body.Close()
+	r.Retry = true
+	retry := postRequest(t, server, context.Background(), r)
+	var result map[string]any
+	if json.NewDecoder(retry.Body).Decode(&result) != nil {
+		t.Fatal("invalid cached HTTP response")
+	}
+	retry.Body.Close()
+	if retry.StatusCode != 200 || result["conversation_id"] != r.ConversationID || f.count("source.start") != 1 {
+		t.Fatal("HTTP retry did not return cached authority without another model send")
+	}
+	if _, err := s.Generate(context.Background(), r, "", "web-scope", nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		model  string
+		status int
+	}{{"not-owned", 404}, {r.Model, 204}} {
+		req, _ := http.NewRequest(http.MethodDelete, server.URL+"/v1/conversations/"+r.ConversationID+"?model="+tc.model, nil)
+		req.Header.Set("Authorization", "Bearer "+testKey)
+		res, err := server.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != tc.status {
+			t.Fatal("close did not enforce the scoped model binding")
+		}
+	}
+	opened, closed, _ := b.counts()
+	if opened != 2 || closed != 1 {
+		t.Fatal("API close crossed into another scope")
+	}
+	if _, err := s.Generate(context.Background(), r, "", "web-scope", nil); err != nil {
+		t.Fatal("other scope was damaged:", err)
 	}
 }

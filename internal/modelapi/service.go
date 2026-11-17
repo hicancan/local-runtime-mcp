@@ -12,8 +12,10 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -47,19 +49,41 @@ type Browser interface {
 }
 
 type Service struct {
-	models  map[string]Model
-	order   []string
-	caps    Capabilities
-	browser Browser
-	lanes   map[string]chan struct{}
-	poll    time.Duration
+	models   map[string]Model
+	order    []string
+	caps     Capabilities
+	browser  Browser
+	lanes    map[string]chan struct{}
+	poll     time.Duration
+	mu       sync.Mutex
+	sessions map[sessionKey]*conversation
+	closed   bool
+}
+
+type sessionKey struct{ scope, model, id string }
+type conversation struct {
+	gate                             chan struct{}
+	browserID, tabID, turnID         string
+	started, accepted, closing       bool
+	lastAccepted, expected, contexts []Message
+	identity                         requestIdentity
+	lastResult                       *Assistant
+	partial                          string
+	delivered                        bool
+	cancel                           context.CancelFunc // guarded by Service.mu, including while waiting for a model lane
+}
+type requestIdentity struct {
+	dialogue, contexts []Message
+	tools              []Tool
+	choice             string
+	parallel           bool
 }
 
 func New(models []Model, caps Capabilities, b Browser) (*Service, error) {
 	if len(models) > 0 && (caps == nil || b == nil) {
 		return nil, errors.New("model sources require capabilities and a browser")
 	}
-	s := &Service{models: map[string]Model{}, caps: caps, browser: b, lanes: map[string]chan struct{}{}, poll: 400 * time.Millisecond}
+	s := &Service{models: map[string]Model{}, caps: caps, browser: b, lanes: map[string]chan struct{}{}, poll: 400 * time.Millisecond, sessions: map[sessionKey]*conversation{}}
 	for _, m := range models {
 		u, err := url.Parse(m.URL)
 		if m.ID == "" || strings.ContainsAny(m.ID, " /\\") || err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || m.Start == "" || m.Read == "" || m.Stop == "" {
@@ -122,6 +146,8 @@ type CallFunction struct {
 }
 type Request struct {
 	Model               string          `json:"model"`
+	ConversationID      string          `json:"conversation_id"`
+	Retry               bool            `json:"retry,omitempty"`
 	Messages            []Message       `json:"messages"`
 	Tools               []Tool          `json:"tools,omitempty"`
 	ToolChoice          json.RawMessage `json:"tool_choice,omitempty"`
@@ -138,9 +164,10 @@ type Request struct {
 }
 
 type Assistant struct {
-	Role      string     `json:"role"`
-	Content   *string    `json:"content"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	ConversationID string     `json:"-"`
+	Role           string     `json:"role"`
+	Content        *string    `json:"content"`
+	ToolCalls      []ToolCall `json:"tool_calls,omitempty"`
 }
 type Delta struct {
 	Content   string     `json:"content,omitempty"`
@@ -169,6 +196,9 @@ func (s *Service) validateRequest(request Request) (Model, map[string]*jsonschem
 	m, exists := s.models[request.Model]
 	if !exists {
 		return Model{}, nil, "", failure("model_not_found", "The requested local model is not registered.", 404)
+	}
+	if !conversationID.MatchString(request.ConversationID) {
+		return Model{}, nil, "", failure("invalid_conversation_id", "conversation_id must be a stable identifier of 1 to 128 characters.", 400)
 	}
 	if len(request.Messages) == 0 || len(request.Messages) > 200 {
 		return Model{}, nil, "", failure("invalid_request", "messages must contain between 1 and 200 entries.", 400)
@@ -242,25 +272,121 @@ func messageText(content json.RawMessage) (string, error) {
 	return "", failure("unsupported_content", "This browser model currently accepts text messages only.", 400)
 }
 
-func (s *Service) Generate(ctx context.Context, request Request, preferredBrowser string, emit func(Delta) error) (Assistant, error) {
+var conversationID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+
+func (s *Service) Generate(ctx context.Context, request Request, preferredBrowser, scope string, emit func(Delta) error) (Assistant, error) {
 	m, validators, choice, err := s.validateRequest(request)
 	if err != nil {
 		return Assistant{}, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(m.TimeoutSeconds)*time.Second)
 	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return Assistant{}, err
+	}
+	if scope == "" {
+		return Assistant{}, failure("invalid_scope", "A caller scope is required.", 400)
+	}
+	key := sessionKey{scope, m.ID, request.ConversationID}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return Assistant{}, failure("model_unavailable", "The model runtime is closing.", 503)
+	}
+	c := s.sessions[key]
+	if c == nil {
+		if len(s.sessions) >= 32 {
+			s.mu.Unlock()
+			return Assistant{}, failure("conversation_capacity", "Close an existing conversation before creating another.", 429)
+		}
+		c = &conversation{gate: make(chan struct{}, 1)}
+		s.sessions[key] = c
+	}
+	closing := c.closing
+	s.mu.Unlock()
+	if closing {
+		return Assistant{}, failure("conversation_closed", "The conversation is closing.", 409)
+	}
+	select {
+	case c.gate <- struct{}{}:
+		defer func() { <-c.gate }()
+	case <-ctx.Done():
+		return Assistant{}, ctx.Err()
+	}
+	s.mu.Lock()
+	if c.closing || s.closed {
+		s.mu.Unlock()
+		return Assistant{}, failure("conversation_closed", "The conversation is closing.", 409)
+	}
+	c.cancel = cancel
+	s.mu.Unlock()
+	defer func() { s.mu.Lock(); c.cancel = nil; s.mu.Unlock() }()
+	if err := ctx.Err(); err != nil {
+		return Assistant{}, err
+	}
+	dialog, contexts := normalizedHistory(request.Messages)
+	identity := normalizedIdentity(request, dialog, contexts, choice)
+	var delta []Message
+	retrying := false
+	if c.accepted {
+		if reflect.DeepEqual(dialog, c.lastAccepted) {
+			if !request.Retry {
+				return Assistant{}, failure("conversation_retry_required", "This request was already accepted; use retry:true to explicitly retry in the same conversation.", 409)
+			}
+			if c.lastResult != nil {
+				if !reflect.DeepEqual(identity, c.identity) {
+					return Assistant{}, failure("conversation_retry_mismatch", "Retry must preserve the accepted request, including context and tools.", 409)
+				}
+				answer := cloneAssistant(*c.lastResult)
+				if emit != nil {
+					if err := emit(Delta{Content: deref(answer.Content), ToolCalls: answer.ToolCalls}); err != nil {
+						return Assistant{}, sourceFailure(err, "stream_write_failed", "The response consumer disconnected.")
+					}
+				}
+				return answer, nil
+			}
+			retrying = true
+		} else {
+			if historyPrefix(c.expected, dialog) {
+				delta = dialog[len(c.expected):]
+			} else if !c.delivered && historyPrefix(c.lastAccepted, dialog) {
+				delta = dialog[len(c.lastAccepted):]
+			} else {
+				return Assistant{}, failure("conversation_fork", "The supplied history branches from this conversation; choose a new conversation_id.", 409)
+			}
+			if !c.delivered && len(delta) > 0 && delta[0].Role == "assistant" {
+				text, _ := messageText(delta[0].Content)
+				if len(delta[0].ToolCalls) > 0 || !strings.HasPrefix(c.partial, text) {
+					return Assistant{}, failure("conversation_fork", "The partial assistant does not match this conversation's interrupted output.", 409)
+				}
+				delta = delta[1:] // The website already owns this partial assistant.
+			}
+			if len(delta) == 0 {
+				if c.lastResult != nil {
+					return Assistant{}, failure("conversation_retry_mismatch", "Recover a completed response using its original accepted request; choose a new conversation_id to regenerate.", 409)
+				}
+				if !request.Retry {
+					return Assistant{}, failure("conversation_retry_required", "No new conversation input was supplied; use retry:true for an explicit retry.", 409)
+				}
+				retrying = true
+			}
+		}
+	}
 	select {
 	case s.lanes[m.ID] <- struct{}{}:
 		defer func() { <-s.lanes[m.ID] }()
 	case <-ctx.Done():
 		return Assistant{}, ctx.Err()
 	}
-	if err := ctx.Err(); err != nil {
-		return Assistant{}, err
-	}
 	browserID := m.BrowserID
 	if browserID == "" {
 		browserID = preferredBrowser
+	}
+	if c.browserID != "" {
+		if browserID != "" && browserID != c.browserID {
+			return Assistant{}, failure("conversation_browser_conflict", "This conversation belongs to another browser profile.", 409)
+		}
+		browserID = c.browserID
 	}
 	instances := s.browser.Status().Instances
 	if browserID == "" {
@@ -286,24 +412,24 @@ func (s *Service) Generate(ctx context.Context, request Request, preferredBrowse
 	if !online {
 		return Assistant{}, failure("browser_unavailable", "The selected model browser profile is unavailable.", 503)
 	}
-	tab, err := s.browser.Open(ctx, browserID, m.URL, false, "")
-	if err != nil {
-		return Assistant{}, sourceFailure(err, "browser_open_failed", "The model session could not be opened.")
+	if c.tabID == "" {
+		tab, err := s.browser.Open(ctx, browserID, m.URL, false, "")
+		if err != nil {
+			return Assistant{}, sourceFailure(err, "browser_open_failed", "The model session could not be opened.")
+		}
+		c.tabID, c.browserID = tab.ID, browserID
 	}
 	complete, startAttempted := false, false
+	turnID := "turn_" + randomID()
 	defer func() {
 		if startAttempted && !complete {
 			cleanup, done := context.WithTimeout(context.Background(), 5*time.Second)
-			_, _ = s.caps.Call(cleanup, m.Stop, browserID, tab.ID, map[string]any{})
+			_, _ = s.caps.Call(cleanup, m.Stop, browserID, c.tabID, map[string]any{"turn_id": turnID})
 			done()
 		}
-		// A stop that consumes its deadline must not prevent closing our tab.
-		cleanup, done := context.WithTimeout(context.Background(), 3*time.Second)
-		defer done()
-		_ = s.browser.CloseTab(cleanup, tab.ID, "")
 	}()
-	for {
-		value, err := s.caps.Call(ctx, m.Read, browserID, tab.ID, map[string]any{})
+	for !c.started {
+		value, err := s.caps.Call(ctx, m.Read, browserID, c.tabID, map[string]any{})
 		if err != nil {
 			return Assistant{}, sourceFailure(err, "browser_read_failed", "The model page could not be observed.")
 		}
@@ -321,11 +447,38 @@ func (s *Service) Generate(ctx context.Context, request Request, preferredBrowse
 			return Assistant{}, err
 		}
 	}
-	prompt := browserPrompt(request, choice)
+	promptRequest := request
+	mode := "new"
+	if c.started {
+		mode = "continue"
+		promptRequest.Messages = append([]Message(nil), delta...)
+		if !reflect.DeepEqual(contexts, c.contexts) {
+			updates := contexts
+			if len(updates) == 0 {
+				updates = []Message{{Role: "system", Content: json.RawMessage(`"Previous system/developer context is cleared."`)}}
+			}
+			promptRequest.Messages = append(append([]Message(nil), updates...), promptRequest.Messages...)
+		}
+		if retrying {
+			promptRequest.Messages = append(promptRequest.Messages, Message{Role: "user", Content: json.RawMessage(`"Explicitly retry the preceding request in this same conversation. Do not invent tool results."`)})
+		}
+	}
+	prompt := browserPrompt(promptRequest, choice)
+	c.lastAccepted, c.expected, c.contexts = dialog, dialog, contexts
+	c.identity = identity
+	c.lastResult = nil
+	c.partial = ""
+	c.delivered = false
+	c.accepted = true
+	c.started = true
+	c.turnID = turnID
 	startAttempted = true // Even a lost acknowledgement may follow a real send.
-	start, err := s.caps.Call(ctx, m.Start, browserID, tab.ID, map[string]any{"prompt": prompt})
+	start, err := s.caps.Call(ctx, m.Start, browserID, c.tabID, map[string]any{"prompt": prompt, "mode": mode, "turn_id": turnID})
 	if err != nil {
 		return Assistant{}, sourceFailure(err, "browser_start_failed", "The page did not confirm the send; the request was not replayed.")
+	}
+	if err := validateTurn(start, turnID); err != nil {
+		return Assistant{}, err
 	}
 	state, text, err := sourceState(start)
 	if err != nil {
@@ -343,11 +496,14 @@ func (s *Service) Generate(ctx context.Context, request Request, preferredBrowse
 				if parseErr != nil {
 					return Assistant{}, parseErr
 				}
+				answer.ConversationID = request.ConversationID
+				cacheAnswer(c, dialog, answer)
 				if emit != nil {
 					if err := emit(Delta{Content: deref(answer.Content), ToolCalls: answer.ToolCalls}); err != nil {
 						return Assistant{}, sourceFailure(err, "stream_write_failed", "The model response consumer disconnected.")
 					}
 				}
+				c.delivered = true
 				return answer, nil
 			}
 			if text == "" {
@@ -356,18 +512,23 @@ func (s *Service) Generate(ctx context.Context, request Request, preferredBrowse
 			if !strings.HasPrefix(text, emitted) {
 				return Assistant{}, failure("source_revised_output", "The page revised output that was already streamed.", 502)
 			}
+			answer := Assistant{Role: "assistant", Content: &text, ConversationID: request.ConversationID}
+			cacheAnswer(c, dialog, answer)
 			if emit != nil {
+				c.partial = text
 				if err := emit(Delta{Content: strings.TrimPrefix(text, emitted)}); err != nil {
 					return Assistant{}, sourceFailure(err, "stream_write_failed", "The model response consumer disconnected.")
 				}
 			}
-			return Assistant{Role: "assistant", Content: &text}, nil
+			c.delivered = true
+			return answer, nil
 		}
 		if len(validators) == 0 && emit != nil {
 			stable := commonPrefix(previous, text)
 			if !strings.HasPrefix(stable, emitted) {
 				return Assistant{}, failure("source_revised_output", "The page revised output that was already streamed.", 502)
 			}
+			c.partial = stable
 			if err := emit(Delta{Content: strings.TrimPrefix(stable, emitted)}); err != nil {
 				return Assistant{}, sourceFailure(err, "stream_write_failed", "The model response consumer disconnected.")
 			}
@@ -381,9 +542,12 @@ func (s *Service) Generate(ctx context.Context, request Request, preferredBrowse
 		if err := s.wait(ctx, nil); err != nil {
 			return Assistant{}, err
 		}
-		value, err := s.caps.Call(ctx, m.Read, browserID, tab.ID, map[string]any{})
+		value, err := s.caps.Call(ctx, m.Read, browserID, c.tabID, map[string]any{"turn_id": turnID})
 		if err != nil {
 			return Assistant{}, sourceFailure(err, "browser_read_failed", "The model generation could not be observed; the request was not replayed.")
+		}
+		if err := validateTurn(value, turnID); err != nil {
+			return Assistant{}, err
 		}
 		state, text, err = sourceState(value)
 		if err != nil {
@@ -406,6 +570,167 @@ func (s *Service) wait(ctx context.Context, emit func(Delta) error) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+func validateTurn(value map[string]any, turnID string) error {
+	if value["turn_id"] != turnID {
+		return failure("model_turn_mismatch", "The model page did not confirm this generation turn.", 502)
+	}
+	return nil
+}
+
+func normalizedHistory(messages []Message) (dialogue, contexts []Message) {
+	for _, message := range messages {
+		text, _ := messageText(message.Content)
+		m := Message{Role: message.Role, ToolCallID: message.ToolCallID}
+		for _, call := range message.ToolCalls {
+			var args any
+			_ = json.Unmarshal([]byte(call.Function.Arguments), &args)
+			encoded, _ := json.Marshal(args)
+			call.Function.Arguments = string(encoded)
+			m.ToolCalls = append(m.ToolCalls, call)
+		}
+		if text == "" && len(m.ToolCalls) > 0 {
+			m.Content = json.RawMessage("null")
+		} else {
+			m.Content, _ = json.Marshal(text)
+		}
+		if m.Role == "system" || m.Role == "developer" {
+			contexts = append(contexts, m)
+		} else {
+			dialogue = append(dialogue, m)
+		}
+	}
+	return
+}
+
+func normalizedIdentity(request Request, dialogue, contexts []Message, choice string) requestIdentity {
+	identity := requestIdentity{dialogue: dialogue, contexts: contexts, choice: choice, parallel: request.ParallelToolCalls == nil || *request.ParallelToolCalls}
+	for _, tool := range request.Tools {
+		var schema any
+		_ = json.Unmarshal(tool.Function.Parameters, &schema)
+		tool.Function.Parameters, _ = json.Marshal(schema)
+		if tool.Function.Strict != nil {
+			value := *tool.Function.Strict
+			tool.Function.Strict = &value
+		}
+		identity.tools = append(identity.tools, tool)
+	}
+	return identity
+}
+
+func cloneAssistant(answer Assistant) Assistant {
+	if answer.Content != nil {
+		text := *answer.Content
+		answer.Content = &text
+	}
+	answer.ToolCalls = append([]ToolCall(nil), answer.ToolCalls...)
+	return answer
+}
+
+func cacheAnswer(c *conversation, dialogue []Message, answer Assistant) {
+	value := cloneAssistant(answer)
+	c.lastResult = &value
+	c.expected = append(append([]Message(nil), dialogue...), normalizedAssistant(answer))
+}
+
+func normalizedAssistant(answer Assistant) Message {
+	m := Message{Role: "assistant", ToolCalls: answer.ToolCalls}
+	if answer.Content == nil {
+		m.Content = json.RawMessage("null")
+	} else {
+		m.Content, _ = json.Marshal(*answer.Content)
+	}
+	dialogue, _ := normalizedHistory([]Message{m})
+	return dialogue[0]
+}
+
+func historyPrefix(prefix, whole []Message) bool {
+	if len(prefix) > len(whole) {
+		return false
+	}
+	for i := range prefix {
+		if !reflect.DeepEqual(prefix[i], whole[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// CloseConversation closes only the page owned by this exact caller/model/id.
+// Cancellation stops an active turn before the page is closed; website history
+// is never deleted. Ordinary request cancellation does not call this method.
+func (s *Service) CloseConversation(ctx context.Context, scope, model, id string) error {
+	if s == nil || scope == "" || model == "" || !conversationID.MatchString(id) {
+		return failure("invalid_conversation_id", "A caller scope, model and valid conversation_id are required.", 400)
+	}
+	key := sessionKey{scope, model, id}
+	s.mu.Lock()
+	c := s.sessions[key]
+	if c == nil {
+		s.mu.Unlock()
+		return failure("conversation_not_found", "This caller does not own that conversation.", 404)
+	}
+	c.closing = true
+	cancel := c.cancel
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	select {
+	case c.gate <- struct{}{}:
+		defer func() { <-c.gate }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if c.tabID != "" {
+		if err := s.browser.CloseTab(ctx, c.tabID, ""); err != nil {
+			return sourceFailure(err, "browser_close_failed", "The owned model page could not be closed.")
+		}
+	}
+	s.mu.Lock()
+	if s.sessions[key] == c {
+		delete(s.sessions, key)
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Service) Close(ctx context.Context) error { return s.CloseAll(ctx) }
+
+func (s *Service) CloseAll(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	s.closed = true
+	keys := make([]sessionKey, 0, len(s.sessions))
+	for key, c := range s.sessions {
+		keys = append(keys, key)
+		c.closing = true
+		if c.cancel != nil {
+			c.cancel()
+		}
+	}
+	s.mu.Unlock()
+	var wg sync.WaitGroup
+	results := make(chan error, len(keys))
+	for _, key := range keys {
+		wg.Add(1)
+		go func(key sessionKey) {
+			defer wg.Done()
+			results <- s.CloseConversation(ctx, key.scope, key.model, key.id)
+		}(key)
+	}
+	wg.Wait()
+	close(results)
+	var errs []error
+	for err := range results {
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func sourceFailure(err error, code, message string) error {

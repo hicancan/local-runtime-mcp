@@ -31,9 +31,25 @@ func (f *fakeSource) Call(ctx context.Context, name, profile, tab string, args m
 	hook := f.hook
 	f.mu.Unlock()
 	if hook != nil {
-		return hook(ctx, call)
+		value, err := hook(ctx, call)
+		return echoTurn(value, call.args), err
 	}
-	return f.defaultCall(ctx, call)
+	value, err := f.defaultCall(ctx, call)
+	return echoTurn(value, call.args), err
+}
+func echoTurn(value map[string]any, args map[string]any) map[string]any {
+	if value != nil {
+		if _, exists := value["turn_id"]; !exists {
+			copy := map[string]any{}
+			for k, v := range value {
+				copy[k] = v
+			}
+			id, _ := args["turn_id"].(string)
+			copy["turn_id"] = id
+			return copy
+		}
+	}
+	return value
 }
 func (f *fakeSource) defaultCall(ctx context.Context, call sourceCall) (map[string]any, error) {
 	if err := ctx.Err(); err != nil {
@@ -130,10 +146,11 @@ func newFixture(t *testing.T) (*Service, *fakeSource, *fakeBrowser) {
 		t.Fatal(err)
 	}
 	s.poll = time.Millisecond
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
 	return s, f, b
 }
 func request() Request {
-	return Request{Model: "web-test", Messages: []Message{{Role: "user", Content: json.RawMessage(`"question"`)}}}
+	return Request{Model: "web-test", ConversationID: "test-conversation", Messages: []Message{{Role: "user", Content: json.RawMessage(`"question"`)}}}
 }
 func errorCode(t *testing.T, err error, code string) {
 	t.Helper()
@@ -151,6 +168,8 @@ func TestValidationRejectsUnsupportedRequestsBeforeBrowserActivity(t *testing.T)
 		code string
 	}{
 		{"unknown-model", func(r *Request) { r.Model = "missing" }, "model_not_found"},
+		{"missing-conversation", func(r *Request) { r.ConversationID = "" }, "invalid_conversation_id"},
+		{"invalid-conversation", func(r *Request) { r.ConversationID = "../other" }, "invalid_conversation_id"},
 		{"no-messages", func(r *Request) { r.Messages = nil }, "invalid_request"},
 		{"unknown-role", func(r *Request) { r.Messages[0].Role = "other" }, "invalid_request"},
 		{"missing-content", func(r *Request) { r.Messages[0].Content = nil }, "invalid_request"},
@@ -167,7 +186,7 @@ func TestValidationRejectsUnsupportedRequestsBeforeBrowserActivity(t *testing.T)
 			r := request()
 			tc.edit(&r)
 			errorCode(t, s.ValidateRequest(r), tc.code)
-			_, err := s.Generate(context.Background(), r, "", nil)
+			_, err := s.Generate(context.Background(), r, "", "test", nil)
 			errorCode(t, err, tc.code)
 		})
 	}
@@ -201,13 +220,13 @@ func TestReadinessWaitsOnlyBeforeOneSendAndTextPartsRemainText(t *testing.T) {
 	r := request()
 	r.Messages[0].Content = json.RawMessage(`[{"type":"text","text":"hello "},{"type":"text","text":"world"}]`)
 	r.Metadata = json.RawMessage(`{"private":"client-private-metadata"}`)
-	answer, err := s.Generate(context.Background(), r, "", nil)
+	answer, err := s.Generate(context.Background(), r, "", "test", nil)
 	if err != nil || deref(answer.Content) != "answer" || readiness != 3 || f.count("source.start") != 1 || f.count("source.stop") != 0 {
 		t.Fatal("readiness/send lifecycle failed:", err)
 	}
 	opened, closed, _ := b.counts()
-	if opened != 1 || closed != 1 {
-		t.Fatal("owned model tab was not closed")
+	if opened != 1 || closed != 0 {
+		t.Fatal("successful conversation did not retain its owned page")
 	}
 }
 
@@ -223,11 +242,11 @@ func TestEmptyCompleteLostStateAndStoppedDoNotResend(t *testing.T) {
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
-			_, err := s.Generate(ctx, request(), "", nil)
+			_, err := s.Generate(ctx, request(), "", "test", nil)
 			errorCode(t, err, tc.code)
 			_, closed, _ := b.counts()
-			if f.count("source.start") != 1 || closed != 1 {
-				t.Fatal("an interrupted/empty response replayed start or leaked its tab")
+			if f.count("source.start") != 1 || closed != 0 {
+				t.Fatal("an interrupted/empty response replayed start or discarded its conversation")
 			}
 		})
 	}
@@ -240,7 +259,7 @@ func TestReadinessCannotSendIntoOccupiedOrUnreadySessions(t *testing.T) {
 			f.hook = func(context.Context, sourceCall) (map[string]any, error) { return state(phase, ""), nil }
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 			defer cancel()
-			_, err := s.Generate(ctx, request(), "", nil)
+			_, err := s.Generate(ctx, request(), "", "test", nil)
 			if phase == "not_ready" {
 				if !errors.Is(err, context.DeadlineExceeded) {
 					t.Fatal("unready admission ignored cancellation")
@@ -249,8 +268,8 @@ func TestReadinessCannotSendIntoOccupiedOrUnreadySessions(t *testing.T) {
 				errorCode(t, err, "model_session_not_empty")
 			}
 			_, closed, _ := b.counts()
-			if f.count("source.start") != 0 || f.count("source.stop") != 0 || closed != 1 {
-				t.Fatal("readiness changed a generation it did not start or leaked a tab")
+			if f.count("source.start") != 0 || f.count("source.stop") != 0 || closed != 0 {
+				t.Fatal("readiness changed a generation it did not start or discarded its binding")
 			}
 		})
 	}
@@ -266,7 +285,7 @@ func TestRawSourceErrorsAreSanitizedAndUnknownSendIsNotReplayed(t *testing.T) {
 				}
 				return f.defaultCall(ctx, call)
 			}
-			_, err := s.Generate(context.Background(), request(), "", nil)
+			_, err := s.Generate(context.Background(), request(), "", "test", nil)
 			if err == nil || strings.Contains(err.Error(), "sensitive-source-detail") || f.count("source.start") > 1 {
 				t.Fatal("raw error leaked or a send was replayed")
 			}
@@ -282,14 +301,14 @@ func TestProviderErrorStateIsExplicitAndNeverLeaksThePageError(t *testing.T) {
 		}
 		return f.defaultCall(ctx, call)
 	}
-	_, err := s.Generate(context.Background(), request(), "", nil)
+	_, err := s.Generate(context.Background(), request(), "", "test", nil)
 	errorCode(t, err, "provider_unavailable")
 	if strings.Contains(err.Error(), "sensitive-page-error-detail") || f.count("source.start") != 1 || f.count("source.stop") != 1 {
 		t.Fatal("provider rejection leaked or repeated its send")
 	}
 	_, closed, _ := b.counts()
-	if closed != 1 {
-		t.Fatal("provider rejection leaked the owned tab")
+	if closed != 0 {
+		t.Fatal("provider rejection discarded the conversation")
 	}
 }
 
@@ -318,15 +337,22 @@ func TestCancellationStopsAndClosesWithIndependentLiveContexts(t *testing.T) {
 		return nil
 	}
 	done := make(chan error, 1)
-	go func() { _, err := s.Generate(ctx, request(), "", nil); done <- err }()
+	go func() { _, err := s.Generate(ctx, request(), "", "test", nil); done <- err }()
 	<-started
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) || f.count("source.stop") != 1 {
 		t.Fatal("cancel did not propagate and stop once:", err)
 	}
 	_, closed, _ := b.counts()
+	if closed != 0 {
+		t.Fatal("request cancellation discarded a conversation")
+	}
+	if err := s.CloseConversation(context.Background(), "test", "web-test", request().ConversationID); err != nil {
+		t.Fatal(err)
+	}
+	_, closed, _ = b.counts()
 	if closed != 1 {
-		t.Fatal("cancel left an owned page open")
+		t.Fatal("explicit close did not close the owned page")
 	}
 }
 
@@ -350,7 +376,10 @@ func TestStopDeadlineCannotConsumeCloseDeadline(t *testing.T) {
 		}
 		return nil
 	}
-	_, err := s.Generate(ctx, request(), "", nil)
+	_, err := s.Generate(ctx, request(), "", "test", nil)
+	if closeErr := s.CloseConversation(context.Background(), "test", "web-test", request().ConversationID); closeErr != nil {
+		t.Fatal(closeErr)
+	}
 	_, closed, _ := b.counts()
 	if !errors.Is(err, context.Canceled) || closed != 1 {
 		t.Fatal("stop timeout prevented close")
@@ -368,11 +397,13 @@ func TestOneModelSerializesSessionsAndWaitingCancellationDoesNotOpen(t *testing.
 		return f.defaultCall(ctx, call)
 	}
 	first := make(chan error, 1)
-	go func() { _, err := s.Generate(context.Background(), request(), "", nil); first <- err }()
+	go func() { _, err := s.Generate(context.Background(), request(), "", "test", nil); first <- err }()
 	<-entered
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if _, err := s.Generate(ctx, request(), "", nil); !errors.Is(err, context.DeadlineExceeded) {
+	second := request()
+	second.ConversationID = "second-conversation"
+	if _, err := s.Generate(ctx, second, "", "test", nil); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatal("waiting request ignored its deadline")
 	}
 	opened, _, peak := b.counts()
@@ -383,26 +414,26 @@ func TestOneModelSerializesSessionsAndWaitingCancellationDoesNotOpen(t *testing.
 	if err := <-first; err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Generate(context.Background(), request(), "", nil); err != nil {
+	if _, err := s.Generate(context.Background(), second, "", "test", nil); err != nil {
 		t.Fatal("lane was not released:", err)
 	}
 	_, closed, peak := b.counts()
-	if closed != 2 || peak != 1 {
-		t.Fatal("model sessions overlapped or failed to clean up")
+	if closed != 0 || peak != 2 {
+		t.Fatal("completed conversations did not retain their independent pages")
 	}
 }
 
 func TestBrowserSelectionRequiresExplicitChoiceForMultipleProfiles(t *testing.T) {
 	s, _, b := newFixture(t)
 	b.instances = append(b.instances, browser.InstanceStatus{BrowserID: "profile-b", Connected: true})
-	_, err := s.Generate(context.Background(), request(), "", nil)
+	_, err := s.Generate(context.Background(), request(), "", "test", nil)
 	errorCode(t, err, "browser_selection_required")
 	if opened, _, _ := b.counts(); opened != 0 {
 		t.Fatal("ambiguous selection opened a tab")
 	}
-	_, err = s.Generate(context.Background(), request(), "unknown-profile", nil)
+	_, err = s.Generate(context.Background(), request(), "unknown-profile", "test", nil)
 	errorCode(t, err, "browser_unavailable")
-	if _, err := s.Generate(context.Background(), request(), "profile-b", nil); err != nil {
+	if _, err := s.Generate(context.Background(), request(), "profile-b", "test", nil); err != nil {
 		t.Fatal(err)
 	}
 	b.mu.Lock()
@@ -414,7 +445,9 @@ func TestBrowserSelectionRequiresExplicitChoiceForMultipleProfiles(t *testing.T)
 	m := s.models["web-test"]
 	m.BrowserID = "profile-a"
 	s.models[m.ID] = m
-	if _, err := s.Generate(context.Background(), request(), "profile-b", nil); err != nil {
+	other := request()
+	other.ConversationID = "configured-profile"
+	if _, err := s.Generate(context.Background(), other, "profile-b", "test", nil); err != nil {
 		t.Fatal(err)
 	}
 	b.mu.Lock()

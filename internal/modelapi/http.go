@@ -39,6 +39,19 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"object": "list", "data": h.Service.List()})
 		return
 	}
+	if strings.HasPrefix(r.URL.Path, "/v1/conversations/") {
+		if r.Method != http.MethodDelete {
+			writeError(w, failure("method_not_allowed", "Use DELETE to close a conversation.", 405))
+			return
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/v1/conversations/")
+		if err := h.Service.CloseConversation(r.Context(), "api", r.URL.Query().Get("model"), id); err != nil {
+			writeError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if r.URL.Path != "/v1/chat/completions" {
 		writeError(w, failure("not_found", "Unknown model endpoint.", 404))
 		return
@@ -62,7 +75,7 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !request.Stream {
-		answer, err := h.Service.Generate(r.Context(), request, "", nil)
+		answer, err := h.Service.Generate(r.Context(), request, "", "api", nil)
 		if err != nil {
 			writeError(w, err)
 			return
@@ -79,7 +92,7 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no")
 	id, created := "chatcmpl_"+randomID(), time.Now().Unix()
 	send := func(delta any, finish any) error {
-		body, _ := json.Marshal(map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": request.Model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}}})
+		body, _ := json.Marshal(map[string]any{"id": id, "conversation_id": request.ConversationID, "object": "chat.completion.chunk", "created": created, "model": request.Model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}}})
 		if _, err := fmt.Fprintf(w, "data: %s\n\n", body); err != nil {
 			return err
 		}
@@ -90,7 +103,7 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	lastWrite := time.Now()
-	answer, err := h.Service.Generate(r.Context(), request, "", func(delta Delta) error {
+	answer, err := h.Service.Generate(r.Context(), request, "", "api", func(delta Delta) error {
 		if delta.Content == "" && len(delta.ToolCalls) == 0 {
 			if time.Since(lastWrite) > 10*time.Second {
 				if _, err := io.WriteString(w, ": keepalive\n\n"); err != nil {
@@ -117,7 +130,9 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		if r.Context().Err() == nil {
-			body, _ := json.Marshal(errorBody(err))
+			value := errorBody(err)
+			value["conversation_id"] = request.ConversationID
+			body, _ := json.Marshal(value)
 			_, _ = fmt.Fprintf(w, "data: %s\n\n", body)
 			flusher.Flush()
 		}
@@ -138,7 +153,7 @@ func Completion(model string, answer Assistant) map[string]any {
 	if len(answer.ToolCalls) > 0 {
 		finish = "tool_calls"
 	}
-	return map[string]any{"id": "chatcmpl_" + randomID(), "object": "chat.completion", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "message": answer, "finish_reason": finish}}}
+	return map[string]any{"id": "chatcmpl_" + randomID(), "conversation_id": answer.ConversationID, "object": "chat.completion", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "message": answer, "finish_reason": finish}}}
 }
 
 func writeJSON(w http.ResponseWriter, value any) {
