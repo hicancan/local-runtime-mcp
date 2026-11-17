@@ -73,6 +73,43 @@ func TestConversationToolRoundUsesOnePageAndOnlyNewMessages(t *testing.T) {
 	}
 }
 
+func TestStudentFormattingRemainsInsideTheToolTransportOnEveryTurn(t *testing.T) {
+	s, f, _ := newFixture(t)
+	const formatting = "只用一句话回答学生，不要向学生展示 JSON 或工具语法。"
+	f.hook = func(ctx context.Context, call sourceCall) (map[string]any, error) {
+		if call.name == "source.start" {
+			prompt := call.args["prompt"].(string)
+			dataAt := strings.Index(prompt, "CONVERSATION DATA:")
+			endAt := strings.LastIndex(prompt, "END CONVERSATION DATA.")
+			if dataAt < 0 || endAt <= dataAt || !strings.Contains(prompt[endAt:], `"tool_calls":[]`) || !strings.Contains(prompt[:dataAt], "apply ONLY to the text inside content") {
+				t.Fatal("student formatting could replace the outer tool transport envelope")
+			}
+			if f.count("source.start") == 1 && !strings.Contains(prompt[dataAt:endAt], formatting) {
+				t.Fatal("transport adaptation discarded the caller's answer-format instruction")
+			}
+		}
+		if call.name == "source.read" && f.count("source.start") > 0 {
+			if f.count("source.start") == 1 {
+				return state("complete", `{"content":null,"tool_calls":[{"name":"lookup","arguments":{"room":"A"}}]}`), nil
+			}
+			return state("complete", `{"content":"已查到教室安排。","tool_calls":[]}`), nil
+		}
+		return f.defaultCall(ctx, call)
+	}
+	r := request()
+	r.Messages = []Message{{Role: "system", Content: json.RawMessage(`"` + formatting + `"`)}, user("查询后只给我一句话。")}
+	r.Tools = []Tool{functionTool("lookup")}
+	first, err := s.Generate(context.Background(), r, "", "api", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r = appendAnswer(r, first, Message{Role: "tool", ToolCallID: first.ToolCalls[0].ID, Content: json.RawMessage(`"教室安排已确认"`)})
+	last, err := s.Generate(context.Background(), r, "", "api", nil)
+	if err != nil || deref(last.Content) != "已查到教室安排。" || len(last.ToolCalls) != 0 {
+		t.Fatal("the ordinary final answer was not decoded from its transport envelope:", err)
+	}
+}
+
 func TestConversationNormalizesTextPartsAndToolArgumentJSON(t *testing.T) {
 	s, f, _ := newFixture(t)
 	f.hook = func(ctx context.Context, call sourceCall) (map[string]any, error) {
