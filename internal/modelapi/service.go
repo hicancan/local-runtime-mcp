@@ -553,8 +553,16 @@ func (s *Service) Generate(ctx context.Context, request Request, preferredBrowse
 		c.lastResult, c.partial, c.delivered = nil, "", false
 		c.accepted, c.started = true, true
 	}
-	output, cancelOutput := context.WithTimeoutCause(ctx, s.limits.output,
-		failure("model_first_output_timeout", "The model page produced no answer within the time limit.", 504))
+	var cancelOutput context.CancelFunc
+	nextOutputDeadline := func(cause error) context.Context {
+		if cancelOutput != nil {
+			cancelOutput()
+		}
+		deadline, release := context.WithTimeoutCause(ctx, s.limits.output, cause)
+		cancelOutput = release
+		return deadline
+	}
+	output := nextOutputDeadline(failure("model_first_output_timeout", "The model page produced no answer within the time limit.", 504))
 	defer func() { cancelOutput() }()
 	if err := progress(output, emit, "waiting"); err != nil {
 		return Assistant{}, err
@@ -592,9 +600,7 @@ func (s *Service) Generate(ctx context.Context, request Request, preferredBrowse
 			return Assistant{}, failure("model_generation_lost", "The model page lost the active generation state; the request was not replayed.", 502)
 		}
 		if text != "" && text != previous {
-			cancelOutput()
-			output, cancelOutput = context.WithTimeoutCause(ctx, s.limits.output,
-				failure("model_output_stalled", "The model page stopped producing new output before it finished.", 504))
+			output = nextOutputDeadline(failure("model_output_stalled", "The model page stopped producing new output before it finished.", 504))
 			if !hasOutput {
 				hasOutput = true
 				if err := progress(output, emit, "generating"); err != nil {
