@@ -110,6 +110,20 @@ func Run(ctx context.Context, cfg *config.Config, options Options, stdin io.Read
 		fmt.Fprintf(log, "[http] Streamable HTTP listening on http://%s/mcp (auth=%s)\n", server.Address(), cfg.HTTP.Auth)
 		components = append(components, component{"http", server.Run})
 	}
+	if native := cfg.Capabilities.Native; native != nil {
+		components = append(components, component{"native-capabilities", func(ctx context.Context) error {
+			address := native.Listen
+			if address == "" {
+				address = config.DefaultNativeHTTP
+			}
+			server, err := transport.NewNativeCapabilityHTTP(address, native.Key, host.NativeCapabilitiesHandler())
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(log, "[native-capabilities] listening locally on http://%s/capabilities\n", server.Address())
+			return server.Run(ctx)
+		}})
+	}
 	if options.has("openai") {
 		components = append(components, component{"openai", func(ctx context.Context) error {
 			return openaitunnel.Run(ctx, host.Server(), openaitunnel.Config{TunnelID: cfg.OpenAI.TunnelID, APIKey: cfg.OpenAI.APIKey})

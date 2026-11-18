@@ -84,11 +84,12 @@ func allowsTarget(d capability.Definition, target string) bool {
 	return false
 }
 
-type webTabs interface {
-	Tabs(context.Context, string) ([]browser.Tab, error)
+type capabilityRequest struct {
+	Name  string         `json:"name"`
+	Input map[string]any `json:"input"`
 }
 
-func webHandler(grants []config.WebGrant, registry *capability.Registry, models *modelapi.Service, tabs webTabs) browser.WebHandler {
+func webHandler(grants []config.WebGrant, registry *capability.Registry, models *modelapi.Service) browser.WebHandler {
 	byOrigin := map[string]config.WebGrant{}
 	for _, g := range grants {
 		byOrigin[g.Origin] = g
@@ -108,10 +109,7 @@ func webHandler(grants []config.WebGrant, registry *capability.Registry, models 
 			}
 			return result, nil
 		case "capabilities.invoke":
-			var p struct {
-				Name  string         `json:"name"`
-				Input map[string]any `json:"input"`
-			}
+			var p capabilityRequest
 			if decodeWeb(request.Params, &p) != nil || p.Input == nil {
 				return nil, errors.New("invalid capability input")
 			}
@@ -119,24 +117,11 @@ func webHandler(grants []config.WebGrant, registry *capability.Registry, models 
 			if !ok {
 				return nil, errors.New("this capability is not granted to this website")
 			}
-			available, err := tabs.Tabs(ctx, source.BrowserID)
+			result, err := registry.CallBound(ctx, p.Name, source.BrowserID, target, p.Input)
 			if err != nil {
-				return nil, errors.New("target browser is unavailable")
-			}
-			targetID := ""
-			for _, tab := range available {
-				if tab.URL == target {
-					if targetID != "" {
-						return nil, errors.New("several target tabs are open; leave one matching tab")
-					}
-					targetID = tab.ID
+				if errors.Is(err, capability.ErrTargetMissing) || errors.Is(err, capability.ErrTargetAmbiguous) || errors.Is(err, capability.ErrBrowserTabs) || errors.Is(err, capability.ErrInvalidInput) {
+					return nil, err
 				}
-			}
-			if targetID == "" {
-				return nil, errors.New("open the owner-configured target page in this browser profile")
-			}
-			result, err := registry.Call(ctx, p.Name, source.BrowserID, targetID, p.Input)
-			if err != nil {
 				return nil, errors.New("capability execution failed; no request was replayed")
 			}
 			return result, nil

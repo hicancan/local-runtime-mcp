@@ -100,6 +100,25 @@ running the function, and validates the returned object. Parameters are passed
 as JSON values, never interpolated as executable source. A page navigation or
 unknown outcome does not automatically repeat an action.
 
+## Same-computer native clients
+
+With `lrmcp serve --transport http`, the owner can enable `capabilities.native`
+in `local-runtime-mcp.yaml`. It reuses the fixed capability targets of the
+web grant named by `origin`. Use a separate `key` or supply it to the process
+with `LOCAL_RUNTIME_MCP_NATIVE_CAPABILITY_KEY`. Connect through
+`127.0.0.1:9317` by default. If multiple browser profiles are connected, set
+`browser_id` in this configuration. The configured browser must have exactly
+one tab open at the exact configured target URL, including any fragment.
+
+Send `Authorization: Bearer <native capability key>` on both requests:
+
+- `GET /capabilities` returns the granted read-only browser tool definitions.
+- `POST /capabilities/invoke` takes `{"name":"icourse.outline","input":{}}`
+  as `application/json` and returns the validated tool result as JSON.
+
+The dedicated listener serves no model, machine or tunnel routes. Errors from
+the capability API carry an `error` object with a `code` and `message`.
+
 ## Local app tools
 
 Local app tools are opt-in on `lrmcp serve --transport stdio`. This catalog

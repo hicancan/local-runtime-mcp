@@ -20,15 +20,16 @@ import (
 // Host owns the machine-local dependencies shared by every connection mode.
 // Connections only determine how MCP messages reach this one runtime.
 type Host struct {
-	server       *mcp.Server
-	bridge       *browser.Bridge
-	controller   computer.Controller
-	processes    *runtimeprocess.Manager
-	models       http.Handler
-	modelService *modelapi.Service
-	cancel       context.CancelFunc
-	closeOnce    sync.Once
-	closeErr     error
+	server             *mcp.Server
+	bridge             *browser.Bridge
+	controller         computer.Controller
+	processes          *runtimeprocess.Manager
+	models             http.Handler
+	modelService       *modelapi.Service
+	nativeCapabilities http.Handler
+	cancel             context.CancelFunc
+	closeOnce          sync.Once
+	closeErr           error
 }
 
 func Start(ctx context.Context, cfg *config.Config, localApps bool) (*Host, error) {
@@ -42,6 +43,10 @@ func Start(ctx context.Context, cfg *config.Config, localApps bool) (*Host, erro
 		return nil, err
 	}
 	if err := validateWebConfig(cfg); err != nil {
+		return nil, err
+	}
+	nativeGrant, err := nativeCapabilityGrant(cfg)
+	if err != nil {
 		return nil, err
 	}
 	// The Host keeps resource transport alive until its ordered Close, so a
@@ -71,18 +76,23 @@ func Start(ctx context.Context, cfg *config.Config, localApps bool) (*Host, erro
 		_ = bridge.Close(context.Background())
 		return nil, err
 	}
-	bridge.SetWebHandler(webHandler(cfg.Capabilities.Web, registry, models, bridge))
+	bridge.SetWebHandler(webHandler(cfg.Capabilities.Web, registry, models))
+	var nativeCapabilities http.Handler
+	if nativeGrant != nil {
+		nativeCapabilities = nativeCapabilityHandler(*nativeGrant, cfg.Capabilities.Native.BrowserID, registry, bridge.Status)
+	}
 	controller := computer.New(ctx)
 	bridge.SetDesktopGate(controller.BeginDesktopOperation)
 	processes := runtimeprocess.NewManager(ctx)
 	return &Host{
-		server:       mcpserver.New(mcpserver.Dependencies{Process: processes, Filesystem: filesystem.New(), Browser: bridge, Computer: controller, Capabilities: registry, LocalApps: localApps}),
-		bridge:       bridge,
-		controller:   controller,
-		processes:    processes,
-		models:       &modelapi.HTTP{Service: models, Key: cfg.Models.Key},
-		modelService: models,
-		cancel:       cancel,
+		server:             mcpserver.New(mcpserver.Dependencies{Process: processes, Filesystem: filesystem.New(), Browser: bridge, Computer: controller, Capabilities: registry, LocalApps: localApps}),
+		bridge:             bridge,
+		controller:         controller,
+		processes:          processes,
+		models:             &modelapi.HTTP{Service: models, Key: cfg.Models.Key},
+		modelService:       models,
+		nativeCapabilities: nativeCapabilities,
+		cancel:             cancel,
 	}, nil
 }
 
@@ -90,6 +100,9 @@ func (h *Host) Server() *mcp.Server { return h.server }
 
 // ModelsHandler uses its own model-only key and is never the private MCP hop.
 func (h *Host) ModelsHandler() http.Handler { return h.models }
+
+// NativeCapabilitiesHandler is mounted only on the dedicated local listener.
+func (h *Host) NativeCapabilitiesHandler() http.Handler { return h.nativeCapabilities }
 
 func (h *Host) Close(ctx context.Context) error {
 	h.closeOnce.Do(func() {

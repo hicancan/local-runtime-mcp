@@ -19,8 +19,13 @@ func (t *unavailableTabs) Tabs(context.Context, string) ([]browser.Tab, error) {
 	return nil, nil
 }
 
+func (t *unavailableTabs) Act(context.Context, browser.Action) (browser.ActionResult, error) {
+	panic("unexpected browser action")
+}
+
 func TestWebOriginAndModelGrants(t *testing.T) {
-	registry, err := capability.Load("", nil)
+	tabs := &unavailableTabs{}
+	registry, err := capability.Load("", tabs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,8 +33,7 @@ func TestWebOriginAndModelGrants(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tabs := &unavailableTabs{}
-	handler := webHandler([]config.WebGrant{{Origin: "https://studev.example", Models: nil}}, registry, service, tabs)
+	handler := webHandler([]config.WebGrant{{Origin: "https://studev.example", Models: nil}}, registry, service)
 	source := browser.WebSource{Origin: "https://evil.example", BrowserID: "browser-a"}
 	emit := func(browser.WebEvent) error { t.Fatal("unauthorized request emitted an event"); return nil }
 	for _, method := range []string{"models.list", "models.chat", "models.close", "capabilities.list", "capabilities.invoke"} {

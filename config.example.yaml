@@ -39,6 +39,15 @@ capabilities:
       # Generic page tools can be granted separately, at owner-fixed target URLs:
       # capabilities:
       #   example.read: https://example.com/account
+      #   icourse.outline: "https://www.icourse163.org/learn/COURSE#/learn/content"
+  # Opt in when serving HTTP, for a native app on the same computer only.
+  # Grant targets come from the origin above. Only read-only tools are listed.
+  # native:
+  #   listen: 127.0.0.1:9317
+  #   key: "replace-with-a-separate-random-key-of-at-least-32-characters"
+  #        # Or set LOCAL_RUNTIME_MCP_NATIVE_CAPABILITY_KEY when starting lrmcp.
+  #   origin: https://studev.hicancan.top
+  #   browser_id: "owner-selected-profile-id" # Optional if one profile is online.
 
 # Only enable models you want to serve. This key grants model use only, never MCP.
 # LOCAL_RUNTIME_MCP_MODEL_KEY can supply it to one child process instead of YAML.

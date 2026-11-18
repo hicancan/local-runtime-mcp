@@ -112,7 +112,11 @@ func NewHTTP(server *mcp.Server, cfg HTTPConfig) (*HTTPServer, error) {
 		}
 		mcpHandler.ServeHTTP(writer, request)
 	})
-	listener, err := net.Listen("tcp", cfg.Listen)
+	return newLoopbackHTTP(cfg.Listen, handler)
+}
+
+func newLoopbackHTTP(address string, handler http.Handler) (*HTTPServer, error) {
+	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return nil, fmt.Errorf("listen for Streamable HTTP: %w", err)
 	}

@@ -61,6 +61,13 @@ type Registry struct {
 	browser Browser
 }
 
+var (
+	ErrInvalidInput    = errors.New("capability arguments do not match inputSchema")
+	ErrTargetMissing   = errors.New("open the owner-configured target page in this browser profile")
+	ErrTargetAmbiguous = errors.New("several target tabs are open; leave one matching tab")
+	ErrBrowserTabs     = errors.New("target browser is unavailable")
+)
+
 var validName = regexp.MustCompile(`^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$`)
 
 // Load reads and validates the complete tree before returning it. An empty
@@ -258,6 +265,20 @@ func (r *Registry) definitions(apps bool) []Definition {
 // Call validates parameters and the selected target before using the existing
 // short browser evaluate operation. Scripts are trusted owner code, not a sandbox.
 func (r *Registry) Call(ctx context.Context, name, browserID, tabID string, args map[string]any) (map[string]any, error) {
+	return r.call(ctx, name, browserID, tabID, "", args)
+}
+
+// CallBound finds a unique tab at the owner's exact configured URL and checks
+// the URL again in the page just before executing the registered script.
+func (r *Registry) CallBound(ctx context.Context, name, browserID, targetURL string, args map[string]any) (map[string]any, error) {
+	if targetURL == "" {
+		return nil, ErrTargetMissing
+	}
+	return r.call(ctx, name, browserID, "", targetURL, args)
+}
+
+func (r *Registry) call(ctx context.Context, name, browserID, tabID, targetURL string, args map[string]any) (map[string]any, error) {
+	bound := targetURL != ""
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -268,7 +289,7 @@ func (r *Registry) Call(ctx context.Context, name, browserID, tabID string, args
 	if !ok || e.command != nil {
 		return nil, errors.New("capability is not registered")
 	}
-	if r.browser == nil || browserID == "" || tabID == "" {
+	if r.browser == nil || browserID == "" || tabID == "" && !bound {
 		return nil, errors.New("a browser instance and tab are required")
 	}
 	if args == nil {
@@ -280,16 +301,22 @@ func (r *Registry) Call(ctx context.Context, name, browserID, tabID string, args
 	}
 	var input map[string]any
 	if err := json.Unmarshal(encoded, &input); err != nil || e.input.Validate(input) != nil {
-		return nil, errors.New("capability arguments do not match inputSchema")
+		return nil, ErrInvalidInput
 	}
 	tabs, err := r.browser.Tabs(ctx, browserID)
 	if err != nil {
+		if bound && ctx.Err() == nil {
+			return nil, ErrBrowserTabs
+		}
 		return nil, err
 	}
 	found := false
 	for _, tab := range tabs {
-		if tab.ID != tabID {
+		if bound && tab.URL != targetURL || !bound && tab.ID != tabID {
 			continue
+		}
+		if found {
+			return nil, ErrTargetAmbiguous
 		}
 		if tab.BrowserID != "" && tab.BrowserID != browserID {
 			return nil, errors.New("capability tab belongs to another browser instance")
@@ -298,16 +325,23 @@ func (r *Registry) Call(ctx context.Context, name, browserID, tabID string, args
 		if err != nil || !contains(e.definition.Origins, origin) {
 			return nil, errors.New("target origin is not allowed for capability")
 		}
+		tabID = tab.ID
 		found = true
-		break
+		if !bound {
+			break
+		}
 	}
-	if !found {
+	if !found || tabID == "" {
+		if bound {
+			return nil, ErrTargetMissing
+		}
 		return nil, errors.New("capability tab is not present in the selected browser instance")
 	}
 	origins, _ := json.Marshal(e.definition.Origins)
+	target, _ := json.Marshal(targetURL)
 	// A navigation between tab discovery and execution must not run the script
 	// on an unintended origin. Arguments are JSON literals, never script source.
-	script := fmt.Sprintf("(async () => { if (!%s.includes(location.origin)) throw new Error('capability target origin changed'); const execute = %s\n; if (typeof execute !== 'function') throw new Error('capability implementation must be a function'); return await execute(%s); })()", origins, e.script, encoded)
+	script := fmt.Sprintf("(async () => { const target = %s; if (!%s.includes(location.origin) || (target && location.href !== target)) throw new Error('capability target changed'); const execute = %s\n; if (typeof execute !== 'function') throw new Error('capability implementation must be a function'); return await execute(%s); })()", target, origins, e.script, encoded)
 	result, err := r.browser.Act(ctx, browser.Action{TabID: tabID, Kind: "evaluate", Script: script})
 	if err != nil {
 		return nil, err

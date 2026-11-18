@@ -1,4 +1,5 @@
 {
+  "title": "课程目录（中国大学 MOOC）",
   "description": "Read the course outline already loaded in a China University MOOC courseware page. Returns observed chapters and only the child items currently loaded; unexpanded chapters are explicitly marked. Does not start videos, open quizzes, save answers, or submit coursework.",
   "origins": ["https://www.icourse163.org"],
   "inputSchema": {"type":"object","properties":{},"additionalProperties":false},

@@ -35,3 +35,23 @@ func TestCapabilityDirectoryUsesConfigurationLocation(t *testing.T) {
 		t.Fatal("model key environment override not applied")
 	}
 }
+
+func TestNativeCapabilityKeyEnvironmentNeedsAnExplicitGrant(t *testing.T) {
+	path := filepath.Join(t.TempDir(), FileName)
+	t.Setenv(EnvNativeCapabilityKey, "isolated-native-key")
+	cfg, err := Resolve(path, Overrides{})
+	if err != nil || cfg.Capabilities.Native != nil {
+		t.Fatal("a credential alone must not enable the native listener", err)
+	}
+	if err := os.WriteFile(path, []byte("capabilities:\n  native:\n    origin: https://studev.example\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Resolve(path, Overrides{})
+	if err != nil || cfg.Capabilities.Native == nil || cfg.Capabilities.Native.Key != "isolated-native-key" {
+		t.Fatal("explicit native grant did not receive its process key", err)
+	}
+	stored, err := Load(path)
+	if err != nil || stored.Capabilities.Native.Key != "" {
+		t.Fatal("process key was persisted to the configuration", err)
+	}
+}

@@ -223,12 +223,14 @@ func TestActualJavaScriptWrapperKeepsArgumentsAsDataAndChecksNavigation(t *testi
 	}
 	r, b := registryFixture(t)
 	origin := "https://example.test"
+	target := b.tabs[0].URL
+	href := target
 	b.act = func(ctx context.Context, action browser.Action) (browser.ActionResult, error) {
-		payload, _ := json.Marshal(map[string]any{"script": action.Script, "origin": origin})
+		payload, _ := json.Marshal(map[string]any{"script": action.Script, "origin": origin, "href": href})
 		// This is an isolated JS VM, not a real browser, page, account, or service.
 		cmd := exec.CommandContext(ctx, node, "--input-type=module", "-e", `import vm from 'node:vm';
 let data='';for await(const chunk of process.stdin)data+=chunk;
-const p=JSON.parse(data), sandbox={location:{origin:p.origin},pwned:false};
+const p=JSON.parse(data), sandbox={location:{origin:p.origin,href:p.href},pwned:false};
 try { const value=await vm.runInNewContext(p.script,sandbox); process.stdout.write(JSON.stringify({value,pwned:sandbox.pwned})); }
 catch { process.stdout.write(JSON.stringify({error:true,pwned:sandbox.pwned})); }`)
 		cmd.Stdin = bytes.NewReader(payload)
@@ -257,11 +259,19 @@ catch { process.stdout.write(JSON.stringify({error:true,pwned:sandbox.pwned})); 
 	if err != nil || output["text"] != text {
 		t.Fatal("literal JSON input did not survive actual page-expression execution:", err)
 	}
+	output, err = r.CallBound(context.Background(), "example.echo", "profile", target, map[string]any{"text": text})
+	if err != nil || output["text"] != text {
+		t.Fatal("the fixed target failed at its exact URL:", err)
+	}
 	// The tab list still points at the allowed URL, but navigation completes
 	// before evaluation. The page guard must stop the trusted script itself.
 	e := r.entries["example.echo"]
 	e.script = "async function(input) { globalThis.pwned=true; return {text:input.text}; }"
 	r.entries["example.echo"] = e
+	href = origin + "/another-page"
+	if _, err := r.CallBound(context.Background(), "example.echo", "profile", target, map[string]any{"text": "hi"}); err == nil {
+		t.Fatal("navigation race executed the bound capability on another page at the same origin")
+	}
 	origin = "https://evil.test"
 	if _, err := r.Call(context.Background(), "example.echo", "profile", "tab", map[string]any{"text": "hi"}); err == nil {
 		t.Fatal("navigation race executed the capability on another origin")

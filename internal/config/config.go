@@ -17,6 +17,7 @@ const (
 	FileName          = "local-runtime-mcp.yaml"
 	DefaultBrowser    = "127.0.0.1:9315"
 	DefaultHTTP       = "127.0.0.1:9316"
+	DefaultNativeHTTP = "127.0.0.1:9317"
 	EnvironmentPrefix = "LOCAL_RUNTIME_MCP_"
 )
 
@@ -33,6 +34,7 @@ const (
 	EnvCloudflareTunnelToken = EnvironmentPrefix + "CLOUDFLARE_TUNNEL_TOKEN"
 	EnvCloudflared           = EnvironmentPrefix + "CLOUDFLARED"
 	EnvModelKey              = EnvironmentPrefix + "MODEL_KEY"
+	EnvNativeCapabilityKey   = EnvironmentPrefix + "NATIVE_CAPABILITY_KEY"
 )
 
 // Config is the complete persistent configuration for one portable runtime.
@@ -47,8 +49,18 @@ type Config struct {
 }
 
 type Capabilities struct {
-	Directory string     `yaml:"directory,omitempty"`
-	Web       []WebGrant `yaml:"web,omitempty"`
+	Directory string                 `yaml:"directory,omitempty"`
+	Web       []WebGrant             `yaml:"web,omitempty"`
+	Native    *NativeCapabilityGrant `yaml:"native,omitempty"`
+}
+
+// NativeCapabilityGrant reuses the fixed targets of one configured web grant.
+// The native listener accepts only read-only browser capabilities.
+type NativeCapabilityGrant struct {
+	Listen    string `yaml:"listen,omitempty"`
+	Key       string `yaml:"key,omitempty"`
+	Origin    string `yaml:"origin"`
+	BrowserID string `yaml:"browser_id,omitempty"`
 }
 
 // A web page selects a named capability, never a browser tab or target URL.
@@ -258,6 +270,9 @@ func applyEnvironment(cfg *Config, lookup func(string) (string, bool)) {
 	assign(EnvCloudflareTunnelToken, &cfg.Cloudflare.TunnelToken)
 	assign(EnvCloudflared, &cfg.Cloudflare.Binary)
 	assign(EnvModelKey, &cfg.Models.Key)
+	if cfg.Capabilities.Native != nil {
+		assign(EnvNativeCapabilityKey, &cfg.Capabilities.Native.Key)
+	}
 }
 
 func applyOverrides(cfg *Config, overrides Overrides) {
