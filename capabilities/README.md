@@ -1,8 +1,8 @@
-# Browser capabilities
+# Browser and local app capabilities
 
-Each capability is an owner-authored JSON definition beside a same-named
-JavaScript function. The directory is the catalog; no registration manifest is
-needed.
+The capability tree is the catalog. Browser capabilities use an owner-authored
+JSON definition beside a same-named JavaScript function. A local app capability
+uses a JSON definition with a fixed command.
 
 ```text
 capabilities/
@@ -99,6 +99,53 @@ and has an allowed origin, checks the origin again inside the page before
 running the function, and validates the returned object. Parameters are passed
 as JSON values, never interpolated as executable source. A page navigation or
 unknown outcome does not automatically repeat an action.
+
+## Local app tools
+
+Local app tools are opt-in on `lrmcp serve --transport stdio`. This catalog
+is visible to the same-host MCP client that starts the runtime. HTTP, tunnels,
+web grants and model sources publish the browser catalog separately.
+
+To expose the read-only StuDev Windows query, add `studev/next-class.json`
+under the configured capability directory and point it at your installed
+copy of StuDev:
+
+```json
+{
+  "title": "查下节课",
+  "description": "Read the next class from this device's StuDev timetable.",
+  "command": {
+    "executable": "D:\\Apps\\StuDev\\StuDev.exe",
+    "args": ["--next-class"]
+  },
+  "inputSchema": {"type": "object", "additionalProperties": false},
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "state": {"enum": ["found", "class_required", "no_upcoming_class", "timetable_unavailable"]},
+      "name": {"type": "string"},
+      "date": {"type": "string"},
+      "starts_at": {"type": "string"},
+      "ends_at": {"type": "string"},
+      "room": {"type": ["string", "null"]}
+    },
+    "required": ["state"],
+    "additionalProperties": false
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}
+```
+
+The client invokes `studev.next-class` with `{}`. The owner picks the
+absolute executable, arguments and optional fixed `command.environment`.
+For an isolated StuDev data directory, set `STUDEV_DATA_DIR` in that object.
+The runtime starts the command directly. It allows up to five seconds and 64
+KiB of stdout, and validates one JSON object before returning it.
 
 Capabilities use the existing short browser-call deadline. Model adapters may
 compose `start`, `read`, and `stop` rather than keep one browser evaluation open

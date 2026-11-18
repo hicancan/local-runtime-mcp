@@ -1,11 +1,16 @@
 {
   "name": "@local-runtime-mcp/browser-extension",
   "private": true,
-  "version": "14.0.0",
+  "version": "14.1.0",
   "license": "AGPL-3.0-only",
-  "files": ["sdk"],
+  "files": [
+    "sdk"
+  ],
   "exports": {
-    "./sdk": { "types": "./sdk/web_sdk.d.ts", "import": "./sdk/web_sdk.js" }
+    "./sdk": {
+      "types": "./sdk/web_sdk.d.ts",
+      "import": "./sdk/web_sdk.js"
+    }
   },
   "scripts": {
     "build": "node scripts/generate-version.mjs && tsc -p tsconfig.json && tsc -p tsconfig.sdk.json",

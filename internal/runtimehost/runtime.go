@@ -31,7 +31,7 @@ type Host struct {
 	closeErr     error
 }
 
-func Start(ctx context.Context, cfg *config.Config) (*Host, error) {
+func Start(ctx context.Context, cfg *config.Config, localApps bool) (*Host, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -76,7 +76,7 @@ func Start(ctx context.Context, cfg *config.Config) (*Host, error) {
 	bridge.SetDesktopGate(controller.BeginDesktopOperation)
 	processes := runtimeprocess.NewManager(ctx)
 	return &Host{
-		server:       mcpserver.New(mcpserver.Dependencies{Process: processes, Filesystem: filesystem.New(), Browser: bridge, Computer: controller, Capabilities: registry}),
+		server:       mcpserver.New(mcpserver.Dependencies{Process: processes, Filesystem: filesystem.New(), Browser: bridge, Computer: controller, Capabilities: registry, LocalApps: localApps}),
 		bridge:       bridge,
 		controller:   controller,
 		processes:    processes,

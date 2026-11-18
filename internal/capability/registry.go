@@ -1,6 +1,4 @@
-// Package capability loads owner-authored browser tools from the file tree.
-// A definition and its same-named JavaScript implementation are one capability;
-// there is no separate registration manifest or execution service.
+// Package capability loads owner-authored browser and local app tools from one file tree.
 package capability
 
 import (
@@ -53,6 +51,7 @@ type Definition struct {
 type entry struct {
 	definition Definition
 	script     string
+	command    *appCommand
 	input      *jsonschema.Resolved
 	output     *jsonschema.Resolved
 }
@@ -128,6 +127,7 @@ func loadEntry(path, name string) (entry, error) {
 		OutputSchema json.RawMessage `json:"outputSchema"`
 		Annotations  json.RawMessage `json:"annotations"`
 		Origins      []string        `json:"origins"`
+		Command      *appCommand     `json:"command"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
@@ -154,6 +154,33 @@ func loadEntry(path, name string) (entry, error) {
 	if annotations.ReadOnlyHint && annotations.DestructiveHint {
 		return entry{}, errors.New("a read-only capability cannot declare destructive effects")
 	}
+	input, err := resolveSchema(file.InputSchema)
+	if err != nil {
+		return entry{}, fmt.Errorf("invalid inputSchema: %w", err)
+	}
+	output, err := resolveSchema(file.OutputSchema)
+	if err != nil {
+		return entry{}, fmt.Errorf("invalid outputSchema: %w", err)
+	}
+	loaded := entry{
+		definition: Definition{Name: name, Title: file.Title, Description: file.Description,
+			InputSchema: file.InputSchema, OutputSchema: file.OutputSchema, Annotations: annotations},
+		input: input, output: output,
+	}
+	scriptPath := strings.TrimSuffix(path, ".json") + ".js"
+	if file.Command != nil {
+		if len(file.Origins) > 0 || !annotations.ReadOnlyHint || annotations.DestructiveHint || annotations.OpenWorldHint {
+			return entry{}, errors.New("local app tools require a read-only, closed-world declaration without browser origins")
+		}
+		if _, err := os.Lstat(scriptPath); !errors.Is(err, os.ErrNotExist) {
+			return entry{}, errors.New("local app definitions cannot also supply a browser script")
+		}
+		if err := file.Command.validate(file.InputSchema); err != nil {
+			return entry{}, err
+		}
+		loaded.command = file.Command
+		return loaded, nil
+	}
 	if len(file.Origins) == 0 {
 		return entry{}, errors.New("at least one allowed target origin is required")
 	}
@@ -171,21 +198,13 @@ func loadEntry(path, name string) (entry, error) {
 			origins = append(origins, origin)
 		}
 	}
-	input, err := resolveSchema(file.InputSchema)
-	if err != nil {
-		return entry{}, fmt.Errorf("invalid inputSchema: %w", err)
-	}
-	output, err := resolveSchema(file.OutputSchema)
-	if err != nil {
-		return entry{}, fmt.Errorf("invalid outputSchema: %w", err)
-	}
-	script, err := readRegularFile(strings.TrimSuffix(path, ".json")+".js", 1<<20)
+	script, err := readRegularFile(scriptPath, 1<<20)
 	if err != nil || strings.TrimSpace(string(script)) == "" {
 		return entry{}, errors.New("a nonempty same-named JavaScript implementation is required")
 	}
-	return entry{definition: Definition{Name: name, Title: file.Title, Description: file.Description,
-		InputSchema: file.InputSchema, OutputSchema: file.OutputSchema, Annotations: annotations, Origins: origins},
-		script: string(script), input: input, output: output}, nil
+	loaded.definition.Origins = origins
+	loaded.script = string(script)
+	return loaded, nil
 }
 
 func resolveSchema(data []byte) (*jsonschema.Resolved, error) {
@@ -207,14 +226,25 @@ func readRegularFile(path string, limit int64) ([]byte, error) {
 	return os.ReadFile(path)
 }
 
-// List returns detached definitions in stable name order. Changing a returned
-// value cannot change the executable registry or its origin constraints.
+// List returns browser definitions only, including for the web and model routes.
 func (r *Registry) List() []Definition {
+	return r.definitions(false)
+}
+
+// AppDefinitions returns tools for owner-started local stdio sessions.
+func (r *Registry) AppDefinitions() []Definition {
+	return r.definitions(true)
+}
+
+func (r *Registry) definitions(apps bool) []Definition {
 	result := make([]Definition, 0)
 	if r == nil {
 		return result
 	}
 	for _, e := range r.entries {
+		if (e.command != nil) != apps {
+			continue
+		}
 		d := e.definition
 		d.InputSchema = append(json.RawMessage(nil), d.InputSchema...)
 		d.OutputSchema = append(json.RawMessage(nil), d.OutputSchema...)
@@ -235,7 +265,7 @@ func (r *Registry) Call(ctx context.Context, name, browserID, tabID string, args
 		return nil, errors.New("capability is not registered")
 	}
 	e, ok := r.entries[name]
-	if !ok {
+	if !ok || e.command != nil {
 		return nil, errors.New("capability is not registered")
 	}
 	if r.browser == nil || browserID == "" || tabID == "" {

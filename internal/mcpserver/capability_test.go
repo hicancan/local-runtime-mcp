@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -12,6 +13,71 @@ import (
 	"github.com/hicancan/local-runtime-mcp/internal/capability"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+func TestLocalAppToolHasNoServerRouteWithoutStdioActivation(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, _ := json.Marshal(executable)
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "fixture"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	definition := fmt.Sprintf(`{
+		"description":"Read a local app",
+		"command":{"executable":%s,"args":[]},
+		"inputSchema":{"type":"object","additionalProperties":false},
+		"outputSchema":{"type":"object","additionalProperties":false},
+		"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}
+	}`, path)
+	if err := os.WriteFile(filepath.Join(root, "fixture", "read.json"), []byte(definition), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := capability.Load(root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name  string
+		local bool
+	}{
+		{"http and tunnel", false},
+		{"stdio", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			serverTransport, clientTransport := mcp.NewInMemoryTransports()
+			go func() { _ = New(Dependencies{Capabilities: registry, LocalApps: tc.local}).Run(ctx, serverTransport) }()
+			client := mcp.NewClient(&mcp.Implementation{Name: "app-catalog-fixture", Version: "1"}, nil)
+			session, err := client.Connect(ctx, clientTransport, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer session.Close()
+			listed, err := session.ListTools(ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, tool := range listed.Tools {
+				if tool.Name == "fixture.read" {
+					found = true
+				}
+			}
+			if found != tc.local {
+				t.Fatal("app tool visibility does not match its activation")
+			}
+			if !tc.local {
+				result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "fixture.read", Arguments: map[string]any{}})
+				if err == nil && !result.IsError {
+					t.Fatal("unregistered app tool remained callable")
+				}
+			}
+		})
+	}
+}
 
 type capabilityBrowser struct{ calls int }
 

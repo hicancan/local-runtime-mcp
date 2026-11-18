@@ -46,7 +46,7 @@ func TestMultiIngressHostSharesSessionsAndSurvivesPrivateClosure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	t.Cleanup(cancel)
 	bridgeToken := multiIngressToken(t)
-	host, err := Start(ctx, &config.Config{Browser: config.Browser{Listen: "127.0.0.1:0", Token: bridgeToken}})
+	host, err := Start(ctx, &config.Config{Browser: config.Browser{Listen: "127.0.0.1:0", Token: bridgeToken}}, false)
 	if err != nil {
 		t.Fatal(err)
 	}

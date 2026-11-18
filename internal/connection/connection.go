@@ -81,7 +81,7 @@ func Run(ctx context.Context, cfg *config.Config, options Options, stdin io.Read
 			return err
 		}
 	}
-	host, err := runtimehost.Start(ctx, cfg)
+	host, err := runtimehost.Start(ctx, cfg, options.Transport == "stdio")
 	if err != nil {
 		return err
 	}

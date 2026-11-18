@@ -34,13 +34,37 @@ func registerCapabilityTools(server *mcp.Server, registry *capability.Registry) 
 			if err != nil {
 				return capabilityFailure(err), nil
 			}
-			text, err := json.Marshal(result)
-			if err != nil {
-				return capabilityFailure(errors.New("capability result is not JSON")), nil
-			}
-			return &mcp.CallToolResult{StructuredContent: result, Content: []mcp.Content{&mcp.TextContent{Text: string(text)}}}, nil
+			return capabilityResult(result), nil
 		})
 	}
+}
+
+func registerLocalAppTools(server *mcp.Server, registry *capability.Registry) {
+	for _, definition := range registry.AppDefinitions() {
+		annotations := definition.Annotations
+		registered := tool(definition.Name, definition.Title, definition.Description,
+			annotations.ReadOnlyHint, annotations.DestructiveHint, annotations.IdempotentHint, annotations.OpenWorldHint)
+		registered.InputSchema, registered.OutputSchema = definition.InputSchema, definition.OutputSchema
+		server.AddTool(registered, func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			input := map[string]any{}
+			if len(request.Params.Arguments) > 0 && json.Unmarshal(request.Params.Arguments, &input) != nil {
+				return capabilityFailure(errors.New("local app arguments must be an empty object")), nil
+			}
+			result, err := registry.CallApp(ctx, definition.Name, input)
+			if err != nil {
+				return capabilityFailure(err), nil
+			}
+			return capabilityResult(result), nil
+		})
+	}
+}
+
+func capabilityResult(result map[string]any) *mcp.CallToolResult {
+	text, err := json.Marshal(result)
+	if err != nil {
+		return capabilityFailure(errors.New("capability result is not JSON"))
+	}
+	return &mcp.CallToolResult{StructuredContent: result, Content: []mcp.Content{&mcp.TextContent{Text: string(text)}}}
 }
 
 func capabilityFailure(err error) *mcp.CallToolResult {

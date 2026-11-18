@@ -26,6 +26,7 @@ type Dependencies struct {
 	Browser      *browser.Bridge
 	Computer     computer.Controller
 	Capabilities *capability.Registry
+	LocalApps    bool
 }
 
 func New(deps Dependencies) *mcp.Server {
@@ -54,6 +55,9 @@ func New(deps Dependencies) *mcp.Server {
 	registerBrowserTools(server, deps.Browser)
 	registerComputerTools(server, deps.Computer)
 	registerCapabilityTools(server, deps.Capabilities)
+	if deps.LocalApps {
+		registerLocalAppTools(server, deps.Capabilities)
+	}
 	return server
 }
 
