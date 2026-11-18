@@ -55,15 +55,20 @@ type Service struct {
 	browser  Browser
 	lanes    map[string]chan struct{}
 	poll     time.Duration
+	limits   phaseLimits
 	mu       sync.Mutex
 	sessions map[sessionKey]*conversation
 	closed   bool
 }
 
+type phaseLimits struct {
+	queue, ready, output time.Duration
+}
+
 type sessionKey struct{ scope, model, id string }
 type conversation struct {
 	gate                             chan struct{}
-	browserID, tabID, turnID         string
+	browserID, tabID                 string
 	started, accepted, closing       bool
 	lastAccepted, expected, contexts []Message
 	identity                         requestIdentity
@@ -71,6 +76,7 @@ type conversation struct {
 	partial                          string
 	delivered                        bool
 	cancel                           context.CancelFunc // guarded by Service.mu, including while waiting for a model lane
+	users                            int                // guarded by Service.mu
 }
 type requestIdentity struct {
 	dialogue, contexts []Message
@@ -83,7 +89,11 @@ func New(models []Model, caps Capabilities, b Browser) (*Service, error) {
 	if len(models) > 0 && (caps == nil || b == nil) {
 		return nil, errors.New("model sources require capabilities and a browser")
 	}
-	s := &Service{models: map[string]Model{}, caps: caps, browser: b, lanes: map[string]chan struct{}{}, poll: 400 * time.Millisecond, sessions: map[sessionKey]*conversation{}}
+	s := &Service{
+		models: map[string]Model{}, caps: caps, browser: b, lanes: map[string]chan struct{}{},
+		poll: 400 * time.Millisecond, limits: phaseLimits{queue: 25 * time.Second, ready: 35 * time.Second, output: 60 * time.Second},
+		sessions: map[sessionKey]*conversation{},
+	}
 	for _, m := range models {
 		u, err := url.Parse(m.URL)
 		if m.ID == "" || strings.ContainsAny(m.ID, " /\\") || err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || m.Start == "" || m.Read == "" || m.Stop == "" {
@@ -170,6 +180,7 @@ type Assistant struct {
 	ToolCalls      []ToolCall `json:"tool_calls,omitempty"`
 }
 type Delta struct {
+	Stage     string     `json:"stage,omitempty"`
 	Content   string     `json:"content,omitempty"`
 	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 }
@@ -316,9 +327,10 @@ func (s *Service) Generate(ctx context.Context, request Request, preferredBrowse
 	if err != nil {
 		return Assistant{}, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(m.TimeoutSeconds)*time.Second)
+	ctx, cancel := context.WithTimeoutCause(ctx, time.Duration(m.TimeoutSeconds)*time.Second,
+		failure("model_timeout", "The model request exceeded its overall time limit.", 504))
 	defer cancel()
-	if err := ctx.Err(); err != nil {
+	if err := context.Cause(ctx); err != nil {
 		return Assistant{}, err
 	}
 	if scope == "" {
@@ -339,16 +351,31 @@ func (s *Service) Generate(ctx context.Context, request Request, preferredBrowse
 		c = &conversation{gate: make(chan struct{}, 1)}
 		s.sessions[key] = c
 	}
-	closing := c.closing
-	s.mu.Unlock()
-	if closing {
+	if c.closing {
+		s.mu.Unlock()
 		return Assistant{}, failure("conversation_closed", "The conversation is closing.", 409)
+	}
+	c.users++
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		c.users--
+		if c.users == 0 && !c.closing && c.tabID == "" && s.sessions[key] == c {
+			delete(s.sessions, key)
+		}
+	}()
+	queued, cancelQueue := context.WithTimeoutCause(ctx, s.limits.queue,
+		failure("model_queue_timeout", "The model is busy. Wait for the active request and try again.", 504))
+	defer cancelQueue()
+	if err := progress(queued, emit, "queued"); err != nil {
+		return Assistant{}, err
 	}
 	select {
 	case c.gate <- struct{}{}:
 		defer func() { <-c.gate }()
-	case <-ctx.Done():
-		return Assistant{}, ctx.Err()
+	case <-queued.Done():
+		return Assistant{}, context.Cause(queued)
 	}
 	s.mu.Lock()
 	if c.closing || s.closed {
@@ -358,7 +385,7 @@ func (s *Service) Generate(ctx context.Context, request Request, preferredBrowse
 	c.cancel = cancel
 	s.mu.Unlock()
 	defer func() { s.mu.Lock(); c.cancel = nil; s.mu.Unlock() }()
-	if err := ctx.Err(); err != nil {
+	if err := context.Cause(queued); err != nil {
 		return Assistant{}, err
 	}
 	dialog, contexts := normalizedHistory(request.Messages)
@@ -412,8 +439,18 @@ func (s *Service) Generate(ctx context.Context, request Request, preferredBrowse
 	select {
 	case s.lanes[m.ID] <- struct{}{}:
 		defer func() { <-s.lanes[m.ID] }()
-	case <-ctx.Done():
-		return Assistant{}, ctx.Err()
+	case <-queued.Done():
+		return Assistant{}, context.Cause(queued)
+	}
+	if err := context.Cause(queued); err != nil {
+		return Assistant{}, err
+	}
+	cancelQueue()
+	ready, cancelReady := context.WithTimeoutCause(ctx, s.limits.ready,
+		failure("browser_ready_timeout", "The model page did not become ready. Check the page and try again.", 504))
+	defer cancelReady()
+	if err := progress(ready, emit, "preparing"); err != nil {
+		return Assistant{}, err
 	}
 	browserID := m.BrowserID
 	if browserID == "" {
@@ -450,9 +487,9 @@ func (s *Service) Generate(ctx context.Context, request Request, preferredBrowse
 		return Assistant{}, failure("browser_unavailable", "The selected model browser profile is unavailable.", 503)
 	}
 	if c.tabID == "" {
-		tab, err := s.browser.Open(ctx, browserID, m.URL, false, "")
+		tab, err := s.browser.Open(ready, browserID, m.URL, false, "")
 		if err != nil {
-			return Assistant{}, sourceFailure(err, "browser_open_failed", "The model session could not be opened.")
+			return Assistant{}, phaseFailure(ready, err, "browser_open_failed", "The model session could not be opened.")
 		}
 		c.tabID, c.browserID = tab.ID, browserID
 	}
@@ -466,9 +503,9 @@ func (s *Service) Generate(ctx context.Context, request Request, preferredBrowse
 		}
 	}()
 	for !c.started {
-		value, err := s.caps.Call(ctx, m.Read, browserID, c.tabID, map[string]any{})
+		value, err := s.caps.Call(ready, m.Read, browserID, c.tabID, map[string]any{})
 		if err != nil {
-			return Assistant{}, sourceFailure(err, "browser_read_failed", "The model page could not be observed.")
+			return Assistant{}, phaseFailure(ready, err, "browser_read_failed", "The model page could not be observed.")
 		}
 		state, _, err := sourceState(value)
 		if err != nil {
@@ -480,10 +517,17 @@ func (s *Service) Generate(ctx context.Context, request Request, preferredBrowse
 		if state != "not_ready" {
 			return Assistant{}, failure("model_session_not_empty", "The model session was not confirmed empty before sending.", 409)
 		}
-		if err := s.wait(ctx, emit); err != nil {
+		if err := progress(ready, emit, ""); err != nil {
+			return Assistant{}, err
+		}
+		if err := s.wait(ready); err != nil {
 			return Assistant{}, err
 		}
 	}
+	if err := context.Cause(ready); err != nil {
+		return Assistant{}, err
+	}
+	cancelReady()
 	promptRequest := request
 	mode := "new"
 	if c.started {
@@ -501,30 +545,62 @@ func (s *Service) Generate(ctx context.Context, request Request, preferredBrowse
 		}
 	}
 	prompt := browserPrompt(promptRequest, choice, request.Messages)
-	c.lastAccepted, c.expected, c.contexts = dialog, dialog, contexts
-	c.identity = identity
-	c.lastResult = nil
-	c.partial = ""
-	c.delivered = false
-	c.accepted = true
-	c.started = true
-	c.turnID = turnID
+	// The browser may send before its acknowledgement reaches us. Commit the
+	// accepted history for an acknowledged or potentially sent turn.
+	accept := func() {
+		c.lastAccepted, c.expected, c.contexts = dialog, dialog, contexts
+		c.identity = identity
+		c.lastResult, c.partial, c.delivered = nil, "", false
+		c.accepted, c.started = true, true
+	}
+	output, cancelOutput := context.WithTimeoutCause(ctx, s.limits.output,
+		failure("model_first_output_timeout", "The model page produced no answer within the time limit.", 504))
+	defer func() { cancelOutput() }()
+	if err := progress(output, emit, "waiting"); err != nil {
+		return Assistant{}, err
+	}
 	startAttempted = true // Even a lost acknowledgement may follow a real send.
-	start, err := s.caps.Call(ctx, m.Start, browserID, c.tabID, map[string]any{"prompt": prompt, "mode": mode, "turn_id": turnID})
+	start, err := s.caps.Call(output, m.Start, browserID, c.tabID, map[string]any{"prompt": prompt, "mode": mode, "turn_id": turnID})
 	if err != nil {
-		return Assistant{}, sourceFailure(err, "browser_start_failed", "The page did not confirm the send; the request was not replayed.")
+		accept()
+		return Assistant{}, phaseFailure(output, err, "browser_start_failed", "The page did not confirm the send; the request was not replayed.")
 	}
 	if err := validateTurn(start, turnID); err != nil {
+		accept()
 		return Assistant{}, err
 	}
 	state, text, err := sourceState(start)
+	if sent, known := start["sent"].(bool); known && !sent && text == "" &&
+		(state == "not_ready" || err != nil) {
+		startAttempted = false
+		if err != nil {
+			return Assistant{}, err
+		}
+		return Assistant{}, failure("browser_composer_not_ready", "The page did not send this message. Check the composer and try again.", 409)
+	}
+	accept()
 	if err != nil {
 		return Assistant{}, err
 	}
 	emitted, previous, previousState := "", "", ""
+	hasOutput := false
 	for {
+		if err := context.Cause(output); err != nil {
+			return Assistant{}, err
+		}
 		if state == "not_ready" || state == "idle" {
 			return Assistant{}, failure("model_generation_lost", "The model page lost the active generation state; the request was not replayed.", 502)
+		}
+		if text != "" && text != previous {
+			cancelOutput()
+			output, cancelOutput = context.WithTimeoutCause(ctx, s.limits.output,
+				failure("model_output_stalled", "The model page stopped producing new output before it finished.", 504))
+			if !hasOutput {
+				hasOutput = true
+				if err := progress(output, emit, "generating"); err != nil {
+					return Assistant{}, err
+				}
+			}
 		}
 		if state == "complete" && previousState == "complete" && previous == text {
 			complete = true
@@ -576,12 +652,12 @@ func (s *Service) Generate(ctx context.Context, request Request, preferredBrowse
 			}
 		}
 		previous, previousState = text, state
-		if err := s.wait(ctx, nil); err != nil {
+		if err := s.wait(output); err != nil {
 			return Assistant{}, err
 		}
-		value, err := s.caps.Call(ctx, m.Read, browserID, c.tabID, map[string]any{"turn_id": turnID})
+		value, err := s.caps.Call(output, m.Read, browserID, c.tabID, map[string]any{"turn_id": turnID})
 		if err != nil {
-			return Assistant{}, sourceFailure(err, "browser_read_failed", "The model generation could not be observed; the request was not replayed.")
+			return Assistant{}, phaseFailure(output, err, "browser_read_failed", "The model generation could not be observed; the request was not replayed.")
 		}
 		if err := validateTurn(value, turnID); err != nil {
 			return Assistant{}, err
@@ -593,20 +669,37 @@ func (s *Service) Generate(ctx context.Context, request Request, preferredBrowse
 	}
 }
 
-func (s *Service) wait(ctx context.Context, emit func(Delta) error) error {
+func progress(ctx context.Context, emit func(Delta) error, stage string) error {
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
 	if emit != nil {
-		if err := emit(Delta{}); err != nil {
+		if err := emit(Delta{Stage: stage}); err != nil {
 			return sourceFailure(err, "stream_write_failed", "The model response consumer disconnected.")
 		}
 	}
+	return context.Cause(ctx)
+}
+
+func (s *Service) wait(ctx context.Context) error {
 	timer := time.NewTimer(s.poll)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return context.Cause(ctx)
 	case <-timer.C:
 		return nil
 	}
+}
+
+func phaseFailure(ctx context.Context, err error, code, message string) error {
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return failure(code, message, 504)
+	}
+	return sourceFailure(err, code, message)
 }
 
 func validateTurn(value map[string]any, turnID string) error {
@@ -808,6 +901,8 @@ func sourceState(value any) (string, string, error) {
 		return "", "", failure("browser_login_required", "Sign in to the model website in the selected browser profile.", 401)
 	case "blocked":
 		return "", "", failure("browser_interaction_required", "The model website requires user interaction.", 409)
+	case "unsupported":
+		return "", "", failure("browser_composer_unsupported", "The browser adapter could not recognize the model page.", 502)
 	case "stopped":
 		return "", "", failure("model_interrupted", "The page confirmed that generation stopped before completion.", 409)
 	case "error":

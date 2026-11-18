@@ -4,8 +4,8 @@ import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
 async function capability(name,environment,input={}){const source=await readFile(new URL('../../capabilities/deepseek/'+name+'.js',import.meta.url),'utf8');return await vm.runInNewContext('('+source+')',environment)(input);}
 const input=(turn,prompt='fixture',mode='new')=>({turn_id:turn,prompt,mode});
-function page({existing=false,draft='',disabled=false}={}){
- let value=draft,busy=false,sends=0,stops=0,sequence=0;
+function page({existing=false,draft='',disabled=false,enableAtTick=0}={}){
+ let value=draft,busy=false,sends=0,stops=0,sequence=0,now=0,ticks=0,composerVisible=true;
  const messages=[],banners=[],controls=[];
  const make=(kind,text='')=>{const node={kind,text,order:++sequence,querySelector(selector){if(selector==='.ds-collapsible-text')return kind==='user'?{textContent:node.text}:null;if(selector==='.ds-assistant-message-main-content')return kind==='assistant'&&node.text?{innerText:node.text}:null;return null;},compareDocumentPosition(other){return node.order<other.order?4:2;}};messages.push(node);return node;};
  if(existing){make('user','old question');make('assistant','old answer');}
@@ -13,15 +13,18 @@ function page({existing=false,draft='',disabled=false}={}){
  const editor=new Textarea();
  const button={classList:{contains:()=>disabled||!value&&!busy},getAttribute:()=>null,click(){if(busy){stops++;busy=false;}else{sends++;make('user',value);make('assistant');value='';busy=true;}}};
  const stopPath={closest:()=>button};
- const composer={querySelector(selector){if(selector==='.ds-button--primary.ds-button--circle')return button;if(selector.includes('M2 4.88'))return busy?stopPath:null;return null;}};editor.parentElement=composer;
+ const composer={querySelector(selector){if(selector==='.ds-button--primary.ds-button--circle')return composerVisible?button:null;if(selector.includes('M2 4.88'))return busy?stopPath:null;return null;}};editor.parentElement=composer;
  const document={querySelector(selector){if(selector.startsWith('textarea'))return editor;if(selector==='.ds-message')return messages[0]||null;return null;},querySelectorAll(selector){if(selector==='.ds-message')return messages;if(selector==='div > span:first-child')return banners;if(selector==='[role="button"],button')return controls;return [];}};
- const environment={document,location:{origin:'https://chat.deepseek.com',pathname:'/'},HTMLTextAreaElement:Textarea,Event,Date,setTimeout,Node:{DOCUMENT_POSITION_FOLLOWING:4}};
- return {environment,enable(){disabled=false},counts:()=>({sends,stops,busy,value}),finish(text){const node=[...messages].reverse().find(node=>node.kind==='assistant');node.text=text;busy=false;},error({quoted=false}={}){const user=[...messages].reverse().find(node=>node.kind==='user');const banner={children:[],textContent:'服务器暂时不可用',order:user.order+.25,closest:()=>quoted?user:null,nextElementSibling:{querySelector:()=>({})}};banners.push(banner);busy=false;return banner;},continuation(){const user=[...messages].reverse().find(node=>node.kind==='user');controls.push({textContent:'继续生成',order:user.order+2,closest:()=>null});busy=false;}};
+ const schedule=(callback,millis)=>queueMicrotask(()=>{now+=millis;if(++ticks===enableAtTick)disabled=false;callback()});
+ const environment={document,location:{origin:'https://chat.deepseek.com',pathname:'/'},HTMLTextAreaElement:Textarea,Event,Date:{now:()=>now},setTimeout:schedule,Node:{DOCUMENT_POSITION_FOLLOWING:4}};
+ return {environment,enable(){disabled=false},disable(){disabled=true},showComposer(on){composerVisible=on},counts:()=>({sends,stops,busy,value}),finish(text){const node=[...messages].reverse().find(node=>node.kind==='assistant');node.text=text;busy=false;},error({quoted=false}={}){const user=[...messages].reverse().find(node=>node.kind==='user');const banner={children:[],textContent:'服务器暂时不可用',order:user.order+.25,closest:()=>quoted?user:null,nextElementSibling:{querySelector:()=>({})}};banners.push(banner);busy=false;return banner;},continuation(){const user=[...messages].reverse().find(node=>node.kind==='user');controls.push({textContent:'继续生成',order:user.order+2,closest:()=>null});busy=false;}};
 }
 
 test('readiness never imports an existing user conversation',async()=>{
  assert.deepEqual(JSON.parse(JSON.stringify(await capability('read',page().environment))),{state:'idle',text:'',turn_id:''});
  assert.equal((await capability('read',page({existing:true}).environment)).state,'unsupported');
+ const loading=page();loading.showComposer(false);
+ assert.equal((await capability('read',loading.environment)).state,'not_ready');
 });
 test('start sends exactly once with explicit mode/turn and refuses old chats or drafts',async()=>{
  const f=page();assert.equal((await capability('start',f.environment,input('turn-one'))).state,'generating');assert.equal(f.counts().sends,1);
@@ -36,13 +39,28 @@ test('continue stays in one owned page and never reuses the previous assistant a
  f.finish('second answer');const done=await capability('read',f.environment,{turn_id:'turn-two'});assert.equal(done.state,'complete');assert.equal(done.text,'second answer');assert.equal(f.counts().sends,2);
  await assert.rejects(capability('read',f.environment,{turn_id:'turn-one'}),/identity changed/);
 });
-test('an explicit retry can replace only its own prepared unsent draft',async()=>{
- const f=page({disabled:true});assert.equal((await capability('start',f.environment,input('turn-one','prepared'))).state,'not_ready');assert.equal(f.counts().sends,0);
- assert.equal((await capability('read',f.environment,{turn_id:'turn-one'})).state,'not_ready');
- f.enable();assert.equal((await capability('start',f.environment,input('turn-two','explicit retry','continue'))).state,'generating');assert.equal(f.counts().sends,1);
- const changed=page({disabled:true});await capability('start',changed.environment,input('turn-one','prepared'));
- changed.environment.document.querySelector('textarea').value='personal replacement';changed.enable();
- await assert.rejects(capability('start',changed.environment,input('turn-two','retry','continue')),/existing draft/);assert.equal(changed.counts().sends,0);
+test('the adapter waits for a reactive composer before clicking once',async()=>{
+ const f=page({disabled:true,enableAtTick:3});
+ const result=await capability('start',f.environment,input('turn-one'));
+ assert.equal(result.sent,true);assert.equal(result.state,'generating');assert.equal(f.counts().sends,1);
+});
+test('a definitively unsent turn restores its draft and previous ownership',async()=>{
+ const f=page({disabled:true});const first=await capability('start',f.environment,input('turn-one','initial'));
+ assert.equal(first.state,'not_ready');assert.equal(first.sent,false);assert.equal(f.counts().sends,0);assert.equal(f.counts().value,'');
+ assert.equal((await capability('read',f.environment)).state,'idle');
+ f.enable();await capability('start',f.environment,input('turn-one','initial'));f.finish('first answer');f.disable();
+ const second=await capability('start',f.environment,input('turn-two','next','continue'));
+ assert.equal(second.sent,false);assert.equal(f.counts().sends,1);assert.equal(f.counts().value,'');
+ assert.equal((await capability('read',f.environment,{turn_id:'turn-one'})).text,'first answer');
+ f.enable();await capability('start',f.environment,input('turn-two','next','continue'));
+ assert.equal(f.counts().sends,2);
+});
+test('a composer remount during an accepted turn cannot discard its generation',async()=>{
+ const f=page();await capability('start',f.environment,input('turn-one'));
+ f.showComposer(false);
+ assert.equal((await capability('read',f.environment,{turn_id:'turn-one'})).state,'generating');
+ f.showComposer(true);f.finish('answer after remount');
+ assert.equal((await capability('read',f.environment,{turn_id:'turn-one'})).text,'answer after remount');
 });
 test('stop is bound to the current turn and preserves stopped rather than calling partial text complete',async()=>{
  const f=page();await capability('start',f.environment,input('turn-one'));await assert.rejects(capability('stop',f.environment,{turn_id:'wrong'}),/matching/);assert.equal(f.counts().stops,0);

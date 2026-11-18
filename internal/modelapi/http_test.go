@@ -208,6 +208,31 @@ func TestSSEFlushesActualIncrementalTextBeforeTheSourceCompletes(t *testing.T) {
 	}
 }
 
+func TestSSEExposesSourceProgressWithoutDeclaringAnAssistantOnTimeout(t *testing.T) {
+	s, f, _ := newFixture(t)
+	s.limits.output = 15 * time.Millisecond
+	f.hook = func(ctx context.Context, call sourceCall) (map[string]any, error) {
+		if call.name == "source.read" && call.args["turn_id"] != nil {
+			return state("generating", ""), nil
+		}
+		return f.defaultCall(ctx, call)
+	}
+	server := httptest.NewServer(&HTTP{Service: s, Key: testKey})
+	defer server.Close()
+	r := request()
+	r.Stream = true
+	response := postRequest(t, server, context.Background(), r)
+	defer response.Body.Close()
+	data, err := io.ReadAll(response.Body)
+	raw := string(data)
+	if err != nil || response.StatusCode != 200 ||
+		!strings.Contains(raw, ": stage queued\n\n: stage preparing\n\n: stage waiting\n\n") ||
+		!strings.Contains(raw, `"code":"model_first_output_timeout"`) ||
+		strings.Contains(raw, `"role":"assistant"`) || strings.Contains(raw, "[DONE]") {
+		t.Fatalf("unexpected timeout stream: %q (%v)", raw, err)
+	}
+}
+
 func TestSSEToolCallsUseIndexedArgumentsAndToolFinishWithoutProtocolText(t *testing.T) {
 	s, f, _ := newFixture(t)
 	f.hook = func(ctx context.Context, call sourceCall) (map[string]any, error) {

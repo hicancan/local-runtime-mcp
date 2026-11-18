@@ -293,6 +293,106 @@ func TestRawSourceErrorsAreSanitizedAndUnknownSendIsNotReplayed(t *testing.T) {
 	}
 }
 
+func TestUnsentTurnCanRetryTheIntendedTurnWithoutConsumingItsHistory(t *testing.T) {
+	s, f, b := newFixture(t)
+	f.hook = func(ctx context.Context, call sourceCall) (map[string]any, error) {
+		if call.name == "source.start" {
+			if i := f.count("source.start"); i == 1 || i == 3 {
+				return map[string]any{"state": "not_ready", "text": "", "sent": false}, nil
+			}
+		}
+		return f.defaultCall(ctx, call)
+	}
+	r := request()
+	_, err := s.Generate(context.Background(), r, "", "test", nil)
+	errorCode(t, err, "browser_composer_not_ready")
+	first, err := s.Generate(context.Background(), r, "", "test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r = appendAnswer(r, first, user("second question"))
+	_, err = s.Generate(context.Background(), r, "", "test", nil)
+	errorCode(t, err, "browser_composer_not_ready")
+	second, err := s.Generate(context.Background(), r, "", "test", nil)
+	if err != nil || second.ConversationID != r.ConversationID {
+		t.Fatal("continued turn lost its original conversation:", err)
+	}
+	starts := sourceStarts(f)
+	if len(starts) != 4 {
+		t.Fatalf("expected four explicit starts, got %d", len(starts))
+	}
+	for i, mode := range []string{"new", "new", "continue", "continue"} {
+		if starts[i].args["mode"] != mode || starts[0].tab != starts[i].tab {
+			t.Fatal("unsent browser result used a different mode or page on retry")
+		}
+	}
+	if opened, _, _ := b.counts(); opened != 1 || f.count("source.stop") != 0 {
+		t.Fatal("an unsent turn caused a browser reopen or stop")
+	}
+}
+
+func TestWaitDeadlinesIdentifyTheStageAndStopOnlyAnAttemptedTurn(t *testing.T) {
+	for _, tc := range []struct {
+		name, code, before, after string
+		stops                     int
+		stages                    string
+	}{
+		{"preparing", "browser_ready_timeout", "not_ready", "", 0, "queued preparing"},
+		{"first output", "model_first_output_timeout", "idle", "", 1, "queued preparing waiting"},
+		{"after output", "model_output_stalled", "idle", "partial", 1, "queued preparing waiting generating"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, f, _ := newFixture(t)
+			s.limits.ready, s.limits.output = 15*time.Millisecond, 15*time.Millisecond
+			f.hook = func(ctx context.Context, call sourceCall) (map[string]any, error) {
+				if call.name == "source.read" {
+					if call.args["turn_id"] == nil {
+						return state(tc.before, ""), nil
+					}
+					return state("generating", tc.after), nil
+				}
+				return f.defaultCall(ctx, call)
+			}
+			var stages []string
+			_, err := s.Generate(context.Background(), request(), "", "test", func(delta Delta) error {
+				if delta.Stage != "" {
+					stages = append(stages, delta.Stage)
+				}
+				return nil
+			})
+			errorCode(t, err, tc.code)
+			if stages := strings.Join(stages, " "); stages != tc.stages || f.count("source.stop") != tc.stops {
+				t.Fatalf("got phases %q and %d stops", stages, f.count("source.stop"))
+			}
+			if tc.stops > 0 {
+				start := sourceStarts(f)[0]
+				stop := f.calls[len(f.calls)-1]
+				if start.args["turn_id"] != stop.args["turn_id"] || start.tab != stop.tab {
+					t.Fatal("deadline did not stop the exact attempted turn")
+				}
+			}
+		})
+	}
+}
+
+func TestTimedOutQueuesReleaseUnusedConversationSlots(t *testing.T) {
+	s, f, b := newFixture(t)
+	s.limits.queue = 10 * time.Millisecond
+	// Occupy the model's lane without opening a page or touching a conversation.
+	s.lanes["web-test"] <- struct{}{}
+	for i := 0; i < 40; i++ {
+		r := request()
+		r.ConversationID = "queued-" + randomID()
+		_, err := s.Generate(context.Background(), r, "", "test", nil)
+		errorCode(t, err, "model_queue_timeout")
+	}
+	<-s.lanes["web-test"]
+	opened, _, _ := b.counts()
+	if len(s.sessions) != 0 || opened != 0 || f.count("source.stop") != 0 {
+		t.Fatal("queued failures retained empty sessions or touched the browser")
+	}
+}
+
 func TestProviderErrorStateIsExplicitAndNeverLeaksThePageError(t *testing.T) {
 	s, f, b := newFixture(t)
 	f.hook = func(ctx context.Context, call sourceCall) (map[string]any, error) {

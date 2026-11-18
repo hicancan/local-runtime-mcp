@@ -99,11 +99,17 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 		return nil
 	}
-	if send(map[string]any{"role": "assistant"}, nil) != nil {
-		return
-	}
 	lastWrite := time.Now()
+	roleSent := false
 	answer, err := h.Service.Generate(r.Context(), request, "", "api", func(delta Delta) error {
+		if delta.Stage != "" {
+			if _, err := fmt.Fprintf(w, ": stage %s\n\n", delta.Stage); err != nil {
+				return err
+			}
+			flusher.Flush()
+			lastWrite = time.Now()
+			return nil
+		}
 		if delta.Content == "" && len(delta.ToolCalls) == 0 {
 			if time.Since(lastWrite) > 10*time.Second {
 				if _, err := io.WriteString(w, ": keepalive\n\n"); err != nil {
@@ -113,6 +119,12 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				lastWrite = time.Now()
 			}
 			return nil
+		}
+		if !roleSent {
+			if err := send(map[string]any{"role": "assistant"}, nil); err != nil {
+				return err
+			}
+			roleSent = true
 		}
 		wire := map[string]any{}
 		if delta.Content != "" {
@@ -166,7 +178,7 @@ func errorBody(err error) map[string]any {
 	if errors.As(err, &modelError) {
 		code, message = modelError.Code, modelError.Message
 	} else if errors.Is(err, context.DeadlineExceeded) {
-		code, message = "model_timeout", "The model request timed out; source stop was requested."
+		code, message = "model_timeout", "The model request exceeded its caller deadline."
 	} else if errors.Is(err, context.Canceled) {
 		code, message = "request_cancelled", "The model request was cancelled."
 	}

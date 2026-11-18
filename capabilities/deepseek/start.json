@@ -58,6 +58,10 @@
       },
       "error": {
         "type": "string"
+      },
+      "sent": {
+        "type": "boolean",
+        "description": "Whether this invocation clicked send. False confirms that the turn can still be submitted."
       }
     },
     "required": [

@@ -6,7 +6,7 @@ async function (input) {
   if (previous?.turn_id === input.turn_id) throw new Error('This turn was already started; read it instead of sending again');
   const normalize = text => (text || '').replace(/\s+/gu, ' ').trim();
   const editor = document.querySelector('textarea[placeholder*="DeepSeek"]');
-  const early = state => ({state,text:'',turn_id:input.turn_id});
+  const early = state => ({state,text:'',turn_id:input.turn_id,sent:false});
   if (!editor) return early(document.querySelector('input[type="password"],a[href*="sign_in"],a[href*="login"]') ? 'login_required' : 'not_ready');
   const baseline = [...document.querySelectorAll('.ds-message')];
   if (input.mode === 'new' && (previous?.owned || baseline.length || /^\/a\/chat\/s\//.test(location.pathname))) throw new Error('A new session requires an empty conversation');
@@ -22,6 +22,11 @@ async function (input) {
   if (editor.value.trim() && !(input.mode === 'continue' && previous?.preparedPrompt === editor.value)) throw new Error('DeepSeek composer contains an existing draft');
   const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')?.set;
   if (!setter) return early('unsupported');
+  const originalDraft = editor.value;
+  const setDraft = (target, value) => {
+    setter.call(target,value);
+    target.dispatchEvent(new Event('input',{bubbles:true}));
+  };
   const turn={owned:true,turn_id:input.turn_id,baseline:new Set(baseline),expected:normalize(input.prompt),preparedPrompt:input.prompt,user:null,assistant:null,stopped:false,observe:null};
   turn.observe=()=>{
     if (globalThis.__LRMCP_DEEPSEEK_SESSION__!==turn) throw new Error('DeepSeek turn changed');
@@ -39,20 +44,33 @@ async function (input) {
     const error=turn.assistant?.querySelector('[role="alert"]');
     if (error) return result('error','',error.innerText.slice(0,1000));
     const currentComposer=composerFor();
-    if (!currentComposer?.querySelector('.ds-button--primary.ds-button--circle')) return result('not_ready');
+    if (!currentComposer?.querySelector('.ds-button--primary.ds-button--circle')) return result('generating',text);
     if (currentComposer.querySelector('.ds-loading,svg[data-icon="spin"],svg path[d^="M2 4.88"]')) return result('generating',text);
     const continuation=[...document.querySelectorAll('[role="button"],button')].some(button=>button.textContent?.trim()==='继续生成' && !button.closest('a,nav,aside,.ds-assistant-message-main-content,.ds-think-content') && afterUser(button));
     if (turn.stopped || continuation) return result('stopped',text);
     return result(answer && text?'complete':'pending',text);
   };
   globalThis.__LRMCP_DEEPSEEK_SESSION__=turn;
-  setter.call(editor,input.prompt);editor.dispatchEvent(new Event('input',{bubbles:true}));
+  setDraft(editor,input.prompt);
+  const enabled = button => button && !button.disabled && button.getAttribute('aria-disabled')!=='true' && !button.classList.contains('ds-button--disabled');
+  const deadlineToSend = Date.now()+2400;
   await new Promise(resolve=>setTimeout(resolve,0));
-  const send=composerFor()?.querySelector('.ds-button--primary.ds-button--circle');
-  if (!send || send.getAttribute('aria-disabled')==='true' || send.classList.contains('ds-button--disabled')) return early('not_ready');
+  let send, prepared;
+  while (globalThis.__LRMCP_DEEPSEEK_SESSION__===turn) {
+    prepared=document.querySelector('textarea[placeholder*="DeepSeek"]');
+    send=composerFor()?.querySelector('.ds-button--primary.ds-button--circle');
+    if (prepared?.value!==input.prompt || enabled(send) || Date.now()>=deadlineToSend) break;
+    await new Promise(resolve=>setTimeout(resolve,50));
+  }
+  if (globalThis.__LRMCP_DEEPSEEK_SESSION__!==turn) return early('not_ready');
+  if (prepared?.value!==input.prompt || !enabled(send)) {
+    if (prepared?.value===input.prompt) setDraft(prepared,originalDraft);
+    globalThis.__LRMCP_DEEPSEEK_SESSION__=previous;
+    return early('not_ready');
+  }
   turn.preparedPrompt=null;
   send.click();
   const deadline=Date.now()+5000;
-  while(Date.now()<deadline){const result=turn.observe();if(turn.user)return result;await new Promise(resolve=>setTimeout(resolve,50));}
-  return {state:'unconfirmed',text:'',turn_id:turn.turn_id};
+  while(Date.now()<deadline){const result=turn.observe();if(turn.user)return {...result,sent:true};await new Promise(resolve=>setTimeout(resolve,50));}
+  return {state:'unconfirmed',text:'',turn_id:turn.turn_id,sent:true};
 }
