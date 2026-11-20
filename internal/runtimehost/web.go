@@ -89,13 +89,9 @@ type capabilityRequest struct {
 	Input map[string]any `json:"input"`
 }
 
-func webHandler(grants []config.WebGrant, registry *capability.Registry, models *modelapi.Service) browser.WebHandler {
-	byOrigin := map[string]config.WebGrant{}
-	for _, g := range grants {
-		byOrigin[g.Origin] = g
-	}
+func webHandler(grants *grantStore, registry *capability.Registry, models *modelapi.Service) browser.WebHandler {
 	return func(ctx context.Context, source browser.WebSource, request browser.WebRequest, emit func(browser.WebEvent) error) (any, error) {
-		grant, ok := byOrigin[source.Origin]
+		grant, ok := grants.get(source.Origin)
 		if !ok {
 			return nil, errors.New("this website has no local runtime grant")
 		}
@@ -107,11 +103,20 @@ func webHandler(grants []config.WebGrant, registry *capability.Registry, models 
 					result = append(result, d)
 				}
 			}
+			// Machine tools lent to this site come with their annotations: the site asks its person before any change.
+			for _, d := range grants.machine.list() {
+				if contains(grant.Tools, d.Name) {
+					result = append(result, d)
+				}
+			}
 			return result, nil
 		case "capabilities.invoke":
 			var p capabilityRequest
 			if decodeWeb(request.Params, &p) != nil || p.Input == nil {
 				return nil, errors.New("invalid capability input")
+			}
+			if contains(grant.Tools, p.Name) {
+				return grants.machine.call(ctx, p.Name, p.Input)
 			}
 			target, ok := grant.Capabilities[p.Name]
 			if !ok {

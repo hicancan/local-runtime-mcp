@@ -1,0 +1,127 @@
+{
+  "extName": {
+    "message": "Local Runtime MCP"
+  },
+  "extDescription": {
+    "message": "Lend this computer's tools to the websites you choose, and let websites offer theirs."
+  },
+  "connected": {
+    "message": "Connected to lrmcp"
+  },
+  "disconnected": {
+    "message": "lrmcp is not running or not set up"
+  },
+  "openSettings": {
+    "message": "Connection settings"
+  },
+  "notAWebsite": {
+    "message": "Open a website to manage what it may use or provide."
+  },
+  "usesTitle": {
+    "message": "Let this site use this computer"
+  },
+  "usesHint": {
+    "message": "Tools marked “changes” always ask you first unless the site is set to automatic."
+  },
+  "providesTitle": {
+    "message": "Offer this site's tools"
+  },
+  "providesHint": {
+    "message": "Choose which sites may use each of this site's tools, on this page."
+  },
+  "noPageTools": {
+    "message": "This site has no page tools yet. An AI can explore it and save one for you to approve."
+  },
+  "noConsumers": {
+    "message": "No site uses this computer yet. Turn that on from the site first."
+  },
+  "groupRead": {
+    "message": "Reads"
+  },
+  "groupChange": {
+    "message": "Changes"
+  },
+  "groupPage": {
+    "message": "Page tools"
+  },
+  "groupModels": {
+    "message": "Browser models · experimental"
+  },
+  "saved": {
+    "message": "Saved"
+  },
+  "failed": {
+    "message": "Could not save: $REASON$",
+    "placeholders": {
+      "reason": {
+        "content": "$1"
+      }
+    }
+  },
+  "tool_filesystem_list": {
+    "message": "List a folder"
+  },
+  "tool_filesystem_stat": {
+    "message": "Inspect a file"
+  },
+  "tool_filesystem_read_text": {
+    "message": "Read a text file"
+  },
+  "tool_filesystem_write_text": {
+    "message": "Write a text file"
+  },
+  "tool_filesystem_patch_text": {
+    "message": "Edit a text file"
+  },
+  "tool_filesystem_search_text": {
+    "message": "Search files"
+  },
+  "tool_image_read": {
+    "message": "Read an image"
+  },
+  "tool_process_run": {
+    "message": "Run a program"
+  },
+  "tool_process_continue": {
+    "message": "Continue a program"
+  },
+  "tool_browser_status": {
+    "message": "Browser status"
+  },
+  "tool_browser_tabs": {
+    "message": "List browser tabs"
+  },
+  "tool_browser_open": {
+    "message": "Open a tab"
+  },
+  "tool_browser_close": {
+    "message": "Close a tab"
+  },
+  "tool_browser_navigate": {
+    "message": "Navigate a tab"
+  },
+  "tool_browser_snapshot": {
+    "message": "Read a page"
+  },
+  "tool_browser_screenshot": {
+    "message": "Capture a page"
+  },
+  "tool_browser_action": {
+    "message": "Act on a page"
+  },
+  "tool_computer_control": {
+    "message": "Take the desktop"
+  },
+  "tool_computer_targets": {
+    "message": "List screens and windows"
+  },
+  "tool_computer_state": {
+    "message": "Look at the screen"
+  },
+  "tool_computer_wait": {
+    "message": "Wait for something on screen"
+  },
+  "tool_computer_action": {
+    "message": "Act on the desktop"
+  }
+}

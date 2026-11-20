@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -44,6 +45,7 @@ type Bridge struct {
 	tabs        map[string]tabRoute
 	gate        DesktopGate
 	webHandler  WebHandler
+	grants      GrantHandler
 	webActive   int
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -230,6 +232,7 @@ func Start(ctx context.Context, configuration config.Browser) (*Bridge, error) {
 	mux.HandleFunc("/v1/result", bridge.receiveResult)
 	mux.HandleFunc("/v1/authorize", bridge.authorizeDesktop)
 	mux.HandleFunc("/v1/web", bridge.receiveWeb)
+	mux.HandleFunc("/v1/grants", bridge.receiveGrants)
 	bridge.server = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-bridgeContext.Done()
@@ -791,32 +794,31 @@ func validateAction(action Action) error {
 	return nil
 }
 
-//go:embed extension/*
+//go:embed all:extension
 var extensionFiles embed.FS
 
+// InstallExtension writes the unpacked extension, with its icons and language packs, into directory.
 func InstallExtension(directory string) (string, error) {
 	abs, err := filepath.Abs(directory)
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(abs, 0o755); err != nil {
-		return "", err
-	}
-	entries, err := extensionFiles.ReadDir("extension")
+	err = fs.WalkDir(extensionFiles, "extension", func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(abs, filepath.FromSlash(strings.TrimPrefix(strings.TrimPrefix(path, "extension"), "/")))
+		if entry.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		data, err := extensionFiles.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, data, 0o644)
+	})
 	if err != nil {
 		return "", err
-	}
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		data, err := extensionFiles.ReadFile("extension/" + entry.Name())
-		if err != nil {
-			return "", err
-		}
-		if err := os.WriteFile(filepath.Join(abs, entry.Name()), data, 0o644); err != nil {
-			return "", err
-		}
 	}
 	return abs, nil
 }

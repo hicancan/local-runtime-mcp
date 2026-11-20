@@ -33,7 +33,7 @@ func TestWebOriginAndModelGrants(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := webHandler([]config.WebGrant{{Origin: "https://studev.example", Models: nil}}, registry, service)
+	handler := webHandler(newGrantStore([]config.WebGrant{{Origin: "https://studev.example", Models: nil}}, "", registry, nil, nil), registry, service)
 	source := browser.WebSource{Origin: "https://evil.example", BrowserID: "browser-a"}
 	emit := func(browser.WebEvent) error { t.Fatal("unauthorized request emitted an event"); return nil }
 	for _, method := range []string{"models.list", "models.chat", "models.close", "capabilities.list", "capabilities.invoke"} {

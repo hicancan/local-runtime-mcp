@@ -76,7 +76,7 @@ func Start(ctx context.Context, cfg *config.Config, localApps bool) (*Host, erro
 		_ = bridge.Close(context.Background())
 		return nil, err
 	}
-	bridge.SetWebHandler(webHandler(cfg.Capabilities.Web, registry, models))
+
 	var nativeCapabilities http.Handler
 	if nativeGrant != nil {
 		nativeCapabilities = nativeCapabilityHandler(*nativeGrant, cfg.Capabilities.Native.BrowserID, registry, bridge.Status)
@@ -84,8 +84,26 @@ func Start(ctx context.Context, cfg *config.Config, localApps bool) (*Host, erro
 	controller := computer.New(ctx)
 	bridge.SetDesktopGate(controller.BeginDesktopOperation)
 	processes := runtimeprocess.NewManager(ctx)
+	server := mcpserver.New(mcpserver.Dependencies{Process: processes, Filesystem: filesystem.New(), Browser: bridge, Computer: controller, Capabilities: registry, LocalApps: localApps})
+	// Websites the owner lends machine tools to reach them through this same Server.
+	machine, err := connectMachineTools(ctx, server)
+	if err != nil {
+		cancel()
+		_ = bridge.Close(context.Background())
+		return nil, err
+	}
+	grants := newGrantStore(cfg.Capabilities.Web, cfg.Path, registry, models.List(), machine)
+	for _, g := range cfg.Capabilities.Web {
+		if err := grants.check(g); err != nil {
+			cancel()
+			_ = bridge.Close(context.Background())
+			return nil, err
+		}
+	}
+	bridge.SetWebHandler(webHandler(grants, registry, models))
+	bridge.SetGrantHandler(grants.handle)
 	return &Host{
-		server:             mcpserver.New(mcpserver.Dependencies{Process: processes, Filesystem: filesystem.New(), Browser: bridge, Computer: controller, Capabilities: registry, LocalApps: localApps}),
+		server:             server,
 		bridge:             bridge,
 		controller:         controller,
 		processes:          processes,

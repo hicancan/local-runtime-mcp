@@ -3,6 +3,8 @@ import { LaneScheduler } from './scheduler.js';
 import { commandStream } from './connection.js';
 import { VERSION } from './version.js';
 import { installWebBridge } from './web_bridge.js';
+import { grants, roles } from './grants.js';
+import { paintIcon } from './icon.js';
 const attachedTabs = new Set();
 const childSessions = new Map();
 const dialogWaiters = new Map();
@@ -132,6 +134,10 @@ async function sendCDPAllowDialog(source, method, params) {
     }
 }
 chrome.runtime.onMessage.addListener((message) => {
+    if (message?.type === 'grants-changed') {
+        void refreshIcons();
+        return;
+    }
     if (message?.type === 'settings-changed') {
         browserConnected = false;
         connectionAbort.abort();
@@ -189,15 +195,55 @@ chrome.tabs.onRemoved.addListener((tabId) => {
         nativeTabs.delete(handle);
     tabHandles.delete(tabId);
 });
-chrome.tabs.onUpdated.addListener((tabId, change) => {
+chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
     if (change.status === 'loading' || change.url)
         invalidateDocument(tabId);
+    if (change.url)
+        void paintTab(tab);
 });
+chrome.tabs.onActivated.addListener(({ tabId }) => { void chrome.tabs.get(tabId).then(paintTab, () => { }); });
+// The toolbar L tells, for each tab, whether lrmcp is reachable and whether the site uses or provides capabilities.
+let grantView = null;
+let iconsConnected = false;
+async function paintTab(tab) {
+    if (tab.id === undefined)
+        return;
+    let origin = '';
+    try {
+        origin = new URL(tab.url ?? '').origin;
+    }
+    catch { /* not a web page */ }
+    const { uses, provides } = roles(grantView, origin);
+    await paintIcon(tab.id, iconsConnected, uses, provides).catch(() => { });
+}
+async function refreshIcons() {
+    // Grants are only asked for while the bridge is up; an absent lrmcp is simply grey.
+    if (browserConnected) {
+        try {
+            grantView = await grants('get');
+        }
+        catch {
+            grantView = null;
+        }
+    }
+    else
+        grantView = null;
+    iconsConnected = browserConnected && grantView !== null;
+    try {
+        await paintIcon(undefined, iconsConnected, false, false);
+        for (const tab of await chrome.tabs.query({ active: true }))
+            await paintTab(tab);
+    }
+    catch { /* no window to paint */ }
+}
+function connectionChanged() { void refreshIcons(); }
 // An alarm wakes an offline worker to reconnect after the host becomes
 // available. Healthy connections are kept alive by actual WebSocket traffic.
 chrome.alarms.onAlarm.addListener(alarm => {
     if (alarm.name === 'bridge-reconnect' && !running)
         void run(++generation);
+    if (alarm.name === 'bridge-reconnect' && browserConnected)
+        void refreshIcons();
 });
 void chrome.alarms.create('bridge-reconnect', { periodInMinutes: 0.5 });
 void run(++generation);
@@ -222,6 +268,7 @@ async function run(currentGeneration) {
                     if (currentGeneration !== generation)
                         return;
                     browserConnected = true;
+                    connectionChanged();
                     failures = 0;
                     if (lastBridgeId && bridgeId !== lastBridgeId) {
                         scheduler.cancelAll();
@@ -292,6 +339,7 @@ async function run(currentGeneration) {
             finally {
                 if (currentGeneration === generation) {
                     browserConnected = false;
+                    connectionChanged();
                     scheduler.cancelAll();
                     pageStates.clear();
                     operationObservations.clear();

@@ -1,0 +1,127 @@
+{
+  "extName": {
+    "message": "Local Runtime MCP"
+  },
+  "extDescription": {
+    "message": "把这台电脑的能力借给你选定的网站，也让网站交出自己的能力。"
+  },
+  "connected": {
+    "message": "已连接 lrmcp"
+  },
+  "disconnected": {
+    "message": "lrmcp 未运行或未设置"
+  },
+  "openSettings": {
+    "message": "连接设置"
+  },
+  "notAWebsite": {
+    "message": "打开一个网站，就能管理它可以使用或交出的能力。"
+  },
+  "usesTitle": {
+    "message": "允许这个网站使用本机能力"
+  },
+  "usesHint": {
+    "message": "标着“会改动”的能力，除非网站设成“自动”，每次都会先问你。"
+  },
+  "providesTitle": {
+    "message": "交出这个网站的能力"
+  },
+  "providesHint": {
+    "message": "选择哪些网站可以在这个页面上使用它的每项能力。"
+  },
+  "noPageTools": {
+    "message": "这个网站还没有网页工具。以后 AI 探索后可以沉淀出来，交给你审批。"
+  },
+  "noConsumers": {
+    "message": "还没有网站在使用本机能力，先到那个网站上打开。"
+  },
+  "groupRead": {
+    "message": "只读"
+  },
+  "groupChange": {
+    "message": "会改动"
+  },
+  "groupPage": {
+    "message": "网页工具"
+  },
+  "groupModels": {
+    "message": "浏览器模型 · 实验"
+  },
+  "saved": {
+    "message": "已保存"
+  },
+  "failed": {
+    "message": "没有保存成功：$REASON$",
+    "placeholders": {
+      "reason": {
+        "content": "$1"
+      }
+    }
+  },
+  "tool_filesystem_list": {
+    "message": "列出文件夹"
+  },
+  "tool_filesystem_stat": {
+    "message": "查看文件信息"
+  },
+  "tool_filesystem_read_text": {
+    "message": "读取文本文件"
+  },
+  "tool_filesystem_write_text": {
+    "message": "写入文本文件"
+  },
+  "tool_filesystem_patch_text": {
+    "message": "修改文本文件"
+  },
+  "tool_filesystem_search_text": {
+    "message": "搜索文件内容"
+  },
+  "tool_image_read": {
+    "message": "读取图片"
+  },
+  "tool_process_run": {
+    "message": "运行程序"
+  },
+  "tool_process_continue": {
+    "message": "继续运行中的程序"
+  },
+  "tool_browser_status": {
+    "message": "浏览器状态"
+  },
+  "tool_browser_tabs": {
+    "message": "列出浏览器标签页"
+  },
+  "tool_browser_open": {
+    "message": "打开新标签页"
+  },
+  "tool_browser_close": {
+    "message": "关闭标签页"
+  },
+  "tool_browser_navigate": {
+    "message": "让标签页跳转"
+  },
+  "tool_browser_snapshot": {
+    "message": "读取网页内容"
+  },
+  "tool_browser_screenshot": {
+    "message": "网页截图"
+  },
+  "tool_browser_action": {
+    "message": "在网页上操作"
+  },
+  "tool_computer_control": {
+    "message": "接管桌面操作"
+  },
+  "tool_computer_targets": {
+    "message": "列出屏幕和窗口"
+  },
+  "tool_computer_state": {
+    "message": "查看屏幕"
+  },
+  "tool_computer_wait": {
+    "message": "等待屏幕出现内容"
+  },
+  "tool_computer_action": {
+    "message": "在桌面上操作"
+  }
+}

@@ -46,6 +46,8 @@ type Config struct {
 	Cloudflare   Cloudflare   `yaml:"cloudflare,omitempty"`
 	Capabilities Capabilities `yaml:"capabilities,omitempty"`
 	Models       Models       `yaml:"models,omitempty"`
+	// Path is where this configuration was read from, so owner edits made while running (web grants) go back there.
+	Path string `yaml:"-"`
 }
 
 type Capabilities struct {
@@ -69,6 +71,9 @@ type WebGrant struct {
 	Origin       string            `yaml:"origin"`
 	Models       []string          `yaml:"models,omitempty"`
 	Capabilities map[string]string `yaml:"capabilities,omitempty"`
+	// Tools names built-in machine tools (files, processes, desktop, browser) the owner lends this website.
+	// Each keeps its read-only or changing annotation, which the website must respect when asking its person.
+	Tools []string `yaml:"tools,omitempty"`
 }
 
 type Models struct {
@@ -199,6 +204,7 @@ func Resolve(path string, overrides Overrides) (*Config, error) {
 	applyOverrides(cfg, overrides)
 	applyDefaults(cfg)
 	resolvePaths(cfg, path)
+	cfg.Path = path
 	return cfg, nil
 }
 

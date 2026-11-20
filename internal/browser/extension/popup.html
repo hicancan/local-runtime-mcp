@@ -1,0 +1,39 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <style>
+      :root { color-scheme: light dark; --ink: #1b1d20; --muted: #62666c; --faint: #9ba0a6; --line: #e2e7ef; --paper: #fff; --sunken: #edf1f6; --blue: #1f6feb; --green: #0e9f85; }
+      @media (prefers-color-scheme: dark) { :root { --ink: #eceef0; --muted: #a3a8ae; --faint: #6b7076; --line: #30363e; --paper: #121416; --sunken: #0f1216; --blue: #5b9bff; --green: #3bd8bb; } }
+      body { width: 340px; margin: 0; font: 13px/1.5 system-ui, "Microsoft YaHei", sans-serif; color: var(--ink); background: var(--paper); }
+      header { display: flex; align-items: center; gap: 10px; padding: 14px 16px 10px; }
+      header img { width: 28px; height: 28px; }
+      header b { display: block; font-size: 14px; }
+      header small { color: var(--muted); }
+      header small.off { color: #e5484d; }
+      header a { margin-left: auto; color: var(--muted); font-size: 12px; text-decoration: none; }
+      .site { margin: 0 16px 6px; padding: 8px 10px; border-radius: 10px; background: var(--sunken); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      section { margin: 8px 12px; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+      section > label { display: flex; align-items: center; gap: 10px; padding: 10px 12px; cursor: pointer; font-weight: 600; }
+      section > label .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+      section.uses .dot { background: var(--blue); } section.provides .dot { background: var(--green); }
+      section > label input { margin-left: auto; }
+      .hint { margin: -4px 12px 8px; color: var(--muted); font-size: 12px; }
+      .group { padding: 4px 12px 8px; border-top: 1px solid var(--line); }
+      .group h4 { margin: 6px 0 2px; color: var(--faint); font-size: 11.5px; font-weight: 500; }
+      .row { display: flex; align-items: center; gap: 8px; padding: 3px 0; cursor: pointer; }
+      .row span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .row input { flex: none; }
+      section.uses input { accent-color: var(--blue); } section.provides input { accent-color: var(--green); }
+      .empty { padding: 8px 12px 10px; color: var(--muted); font-size: 12px; }
+      #status { min-height: 18px; margin: 4px 16px 12px; color: var(--muted); font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <header><img src="icons/icon-48.png" alt=""><div><b data-i18n="extName"></b><small id="connection"></small></div><a id="settings" href="#" data-i18n="openSettings"></a></header>
+    <div class="site" id="site"></div>
+    <main id="panel"></main>
+    <div id="status" role="status"></div>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
