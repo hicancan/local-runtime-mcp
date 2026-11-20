@@ -21,7 +21,7 @@ import (
 // in it (environment overrides and secrets never leave memory).
 type grantStore struct {
 	mu       sync.RWMutex
-	byOrigin map[string]config.WebGrant
+	bySite   map[string]config.WebGrant
 	path     string
 	registry *capability.Registry
 	models   []map[string]any
@@ -29,36 +29,44 @@ type grantStore struct {
 }
 
 func newGrantStore(grants []config.WebGrant, path string, registry *capability.Registry, models []map[string]any, machine *machineTools) *grantStore {
-	store := &grantStore{byOrigin: map[string]config.WebGrant{}, path: path, registry: registry, models: models, machine: machine}
+	store := &grantStore{bySite: map[string]config.WebGrant{}, path: path, registry: registry, models: models, machine: machine}
 	for _, g := range grants {
-		store.byOrigin[g.Origin] = g
+		store.bySite[g.Site] = g
 	}
 	return store
 }
 
+// get finds the grant covering one page origin.
 func (s *grantStore) get(origin string) (config.WebGrant, bool) {
+	site, err := config.SiteOf(origin)
+	if err != nil {
+		return config.WebGrant{}, false
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	g, ok := s.byOrigin[origin]
+	g, ok := s.bySite[site]
 	return g, ok
 }
 
 func (s *grantStore) all() []config.WebGrant {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]config.WebGrant, 0, len(s.byOrigin))
-	for _, g := range s.byOrigin {
+	out := make([]config.WebGrant, 0, len(s.bySite))
+	for _, g := range s.bySite {
 		out = append(out, g)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Origin < out[j].Origin })
+	sort.Slice(out, func(i, j int) bool { return out[i].Site < out[j].Site })
 	return out
 }
 
-// check refuses a grant naming anything the Host does not offer, as Start refuses such a configuration.
-func (s *grantStore) check(g config.WebGrant) error {
-	u, err := url.Parse(g.Origin)
-	if err != nil || u.Host == "" || strings.ContainsAny(u.Host, "*\\") || u.User != nil || u.Scheme != "https" && u.Scheme != "http" || g.Origin != u.Scheme+"://"+u.Host {
-		return errors.New("a grant needs one exact HTTP(S) origin")
+// check refuses a grant naming anything the Host does not offer, or a page tool on a site that does not offer its
+// tools, as Start refuses such a configuration. providers answers, for a page origin, whether its site provides.
+func (s *grantStore) check(g config.WebGrant, providers providerLookup) error {
+	if !config.ValidSite(g.Site) {
+		return errors.New("a grant needs one site, like https://example.com")
+	}
+	if !g.Use && (len(g.Models) > 0 || len(g.Capabilities) > 0 || len(g.Tools) > 0) {
+		return errors.New("a site uses nothing until its use switch is on")
 	}
 	for _, id := range g.Models {
 		if !slices.ContainsFunc(s.models, func(m map[string]any) bool { return m["id"] == id }) {
@@ -78,6 +86,9 @@ func (s *grantStore) check(g config.WebGrant) error {
 		if !ok || !allowsTarget(d, target) {
 			return fmt.Errorf("page tool %q does not work on %s", name, t.Host)
 		}
+		if !providers.lookup(t.Scheme + "://" + t.Host) {
+			return fmt.Errorf("%s does not offer its page tools", t.Host)
+		}
 	}
 	for _, name := range g.Tools {
 		if _, ok := s.machine.find(name); !ok {
@@ -87,25 +98,66 @@ func (s *grantStore) check(g config.WebGrant) error {
 	return nil
 }
 
+// checkAll checks a whole set of grants against each other.
+func (s *grantStore) checkAll(grants map[string]config.WebGrant) error {
+	for _, g := range grants {
+		if err := s.check(g, providerLookup(grants)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// providerLookup answers, for one page origin, whether the site covering it provides its page tools.
+type providerLookup map[string]config.WebGrant
+
+func (p providerLookup) lookup(origin string) bool {
+	site, err := config.SiteOf(origin)
+	return err == nil && p[site].Provide
+}
+
+func siteCovers(site, origin string) bool {
+	covering, err := config.SiteOf(origin)
+	return err == nil && covering == site
+}
+
 // set replaces one origin's grant (an empty one removes it) and writes the grants back to the file.
 func (s *grantStore) set(g config.WebGrant) error {
 	slices.Sort(g.Models)
 	g.Models = slices.Compact(g.Models)
 	slices.Sort(g.Tools)
 	g.Tools = slices.Compact(g.Tools)
-	if err := s.check(g); err != nil {
-		return err
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	next := map[string]config.WebGrant{}
-	for origin, existing := range s.byOrigin {
-		next[origin] = existing
+	for site, existing := range s.bySite {
+		next[site] = existing
 	}
-	if len(g.Models) == 0 && len(g.Capabilities) == 0 && len(g.Tools) == 0 {
-		delete(next, g.Origin)
+	if !g.Use && !g.Provide {
+		delete(next, g.Site)
 	} else {
-		next[g.Origin] = g
+		next[g.Site] = g
+	}
+	// A site that stops providing takes back every lend of its page tools.
+	if !g.Provide {
+		for site, other := range next {
+			kept := map[string]string{}
+			for name, target := range other.Capabilities {
+				if t, err := url.Parse(target); err != nil || !siteCovers(g.Site, t.Scheme+"://"+t.Host) {
+					kept[name] = target
+				}
+			}
+			if len(kept) != len(other.Capabilities) {
+				other.Capabilities = kept
+				next[site] = other
+			}
+		}
+	}
+	if err := s.check(g, providerLookup(next)); err != nil {
+		return err
+	}
+	if err := s.checkAll(next); err != nil {
+		return err
 	}
 	if s.path != "" {
 		raw, err := config.Load(s.path)
@@ -116,18 +168,20 @@ func (s *grantStore) set(g config.WebGrant) error {
 		for _, kept := range next {
 			raw.Capabilities.Web = append(raw.Capabilities.Web, kept)
 		}
-		sort.Slice(raw.Capabilities.Web, func(i, j int) bool { return raw.Capabilities.Web[i].Origin < raw.Capabilities.Web[j].Origin })
+		sort.Slice(raw.Capabilities.Web, func(i, j int) bool { return raw.Capabilities.Web[i].Site < raw.Capabilities.Web[j].Site })
 		if _, err := config.Save(s.path, raw); err != nil {
 			return fmt.Errorf("save grants: %w", err)
 		}
 	}
-	s.byOrigin = next
+	s.bySite = next
 	return nil
 }
 
-// view is what the panel shows: every grant, and the catalog grants choose from.
-func (s *grantStore) view() map[string]any {
+// view is what the panel shows: every grant, the catalog grants choose from, and the site of the page it is open on.
+func (s *grantStore) view(origin string) map[string]any {
+	site, _ := config.SiteOf(origin)
 	return map[string]any{
+		"site":      site,
 		"grants":    s.all(),
 		"pageTools": s.registry.List(),
 		"machine":   s.machine.list(),
@@ -135,7 +189,7 @@ func (s *grantStore) view() map[string]any {
 	}
 }
 
-func (s *grantStore) handle(method string, body json.RawMessage) (any, error) {
+func (s *grantStore) handle(method, origin string, body json.RawMessage) (any, error) {
 	if method == "set" {
 		var g config.WebGrant
 		if err := json.Unmarshal(body, &g); err != nil {
@@ -145,7 +199,7 @@ func (s *grantStore) handle(method string, body json.RawMessage) (any, error) {
 			return nil, err
 		}
 	}
-	return s.view(), nil
+	return s.view(origin), nil
 }
 
 // machineTools lends built-in tools to websites through an in-process MCP session to the Host's own Server, so a

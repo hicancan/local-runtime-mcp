@@ -21,16 +21,16 @@
     "message": "Let this site use this computer"
   },
   "usesHint": {
-    "message": "Tools marked “changes” always ask you first unless the site is set to automatic."
+    "message": "The switch is your permission; tick below what this site may use. Tools marked “changes” ask you first unless the site is set to automatic."
   },
   "providesTitle": {
     "message": "Offer this site's tools"
   },
   "providesHint": {
-    "message": "Choose which sites may use each of this site's tools, on this page."
+    "message": "The switch is your permission for this site to lend its page tools, now and as an AI distils new ones. Choose below which sites may use each."
   },
   "noPageTools": {
-    "message": "This site has no page tools yet. An AI can explore it and save one for you to approve."
+    "message": "No page tools yet. With this on, an AI can explore the site and save tools for you to approve."
   },
   "noConsumers": {
     "message": "No site uses this computer yet. Turn that on from the site first."

@@ -33,7 +33,7 @@ func TestWebOriginAndModelGrants(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := webHandler(newGrantStore([]config.WebGrant{{Origin: "https://studev.example", Models: nil}}, "", registry, nil, nil), registry, service)
+	handler := webHandler(newGrantStore([]config.WebGrant{{Site: "https://studev.example", Use: true, Models: nil}}, "", registry, nil, nil), registry, service)
 	source := browser.WebSource{Origin: "https://evil.example", BrowserID: "browser-a"}
 	emit := func(browser.WebEvent) error { t.Fatal("unauthorized request emitted an event"); return nil }
 	for _, method := range []string{"models.list", "models.chat", "models.close", "capabilities.list", "capabilities.invoke"} {
@@ -64,7 +64,7 @@ func TestWebOriginAndModelGrants(t *testing.T) {
 func TestValidateExactOriginsAndCredentialSeparation(t *testing.T) {
 	for _, origin := range []string{"https://example.com/", "https://example.com/path", "https://example.com#fragment", "https://user@example.com", "https://*.example.com"} {
 		cfg := config.Default()
-		cfg.Capabilities.Web = []config.WebGrant{{Origin: origin}}
+		cfg.Capabilities.Web = []config.WebGrant{{Site: origin}}
 		if err := validateWebConfig(cfg); err == nil {
 			t.Fatalf("accepted non-exact origin %s", origin)
 		}
@@ -76,7 +76,7 @@ func TestValidateExactOriginsAndCredentialSeparation(t *testing.T) {
 		t.Fatal("machine credential accepted as model credential")
 	}
 	cfg.Models.Key = strings.Repeat("y", 32)
-	cfg.Capabilities.Web = []config.WebGrant{{Origin: "http://127.0.0.1:4321"}}
+	cfg.Capabilities.Web = []config.WebGrant{{Site: "http://127.0.0.1:4321"}}
 	if err := validateWebConfig(cfg); err != nil {
 		t.Fatal(err)
 	}

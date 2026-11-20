@@ -35,7 +35,7 @@ func fixtureMachine(t *testing.T) *machineTools {
 
 func TestGrantChangesGoBackToTheFileAndNothingElse(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "local-runtime-mcp.yaml")
-	original := "browser:\n  token: \"kept-browser-token-0123456789abcdefghij\"\ncapabilities:\n  web:\n    - origin: https://old.example\n      models: []\n"
+	original := "browser:\n  token: \"kept-browser-token-0123456789abcdefghij\"\ncapabilities:\n  web:\n    - site: https://old.example\n      models: []\n"
 	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -44,10 +44,10 @@ func TestGrantChangesGoBackToTheFileAndNothingElse(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := newGrantStore(nil, path, registry, nil, fixtureMachine(t))
-	if err := store.set(config.WebGrant{Origin: "https://studev.example", Tools: []string{"echo_read"}}); err != nil {
+	if err := store.set(config.WebGrant{Site: "https://studev.example", Use: true, Tools: []string{"echo_read"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.set(config.WebGrant{Origin: "https://studev.example", Tools: []string{"process_run"}}); err == nil {
+	if err := store.set(config.WebGrant{Site: "https://studev.example", Use: true, Tools: []string{"process_run"}}); err == nil {
 		t.Fatal("a tool the Host does not offer was granted")
 	}
 	saved, err := config.Load(path)
@@ -57,10 +57,10 @@ func TestGrantChangesGoBackToTheFileAndNothingElse(t *testing.T) {
 	if saved.Browser.Token != "kept-browser-token-0123456789abcdefghij" {
 		t.Fatalf("the rest of the file changed: token %q", saved.Browser.Token)
 	}
-	if len(saved.Capabilities.Web) != 1 || saved.Capabilities.Web[0].Origin != "https://studev.example" || saved.Capabilities.Web[0].Tools[0] != "echo_read" {
+	if len(saved.Capabilities.Web) != 1 || saved.Capabilities.Web[0].Site != "https://studev.example" || saved.Capabilities.Web[0].Tools[0] != "echo_read" {
 		t.Fatalf("grants not written back: %+v", saved.Capabilities.Web)
 	}
-	if err := store.set(config.WebGrant{Origin: "https://studev.example"}); err != nil {
+	if err := store.set(config.WebGrant{Site: "https://studev.example"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := store.get("https://studev.example"); ok {
@@ -77,7 +77,7 @@ func TestLentMachineToolsAreListedWithAnnotationsAndRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := newGrantStore([]config.WebGrant{{Origin: "https://studev.example", Tools: []string{"echo_read"}}}, "", registry, nil, fixtureMachine(t))
+	store := newGrantStore([]config.WebGrant{{Site: "https://studev.example", Use: true, Tools: []string{"echo_read"}}}, "", registry, nil, fixtureMachine(t))
 	handler := webHandler(store, registry, service)
 	source := browser.WebSource{Origin: "https://studev.example"}
 	listed, err := handler(context.Background(), source, browser.WebRequest{Method: "capabilities.list", Params: json.RawMessage(`{}`)}, nil)
@@ -95,8 +95,62 @@ func TestLentMachineToolsAreListedWithAnnotationsAndRun(t *testing.T) {
 	if !strings.Contains(result.(map[string]any)["text"].(string), "heard hi") {
 		t.Fatalf("tool did not run: %+v", result)
 	}
+	sub := browser.WebSource{Origin: "https://app.studev.example"}
+	if _, err := handler(context.Background(), sub, browser.WebRequest{Method: "capabilities.list", Params: json.RawMessage(`{}`)}, nil); err != nil {
+		t.Fatalf("a subdomain of the granted site was refused: %v", err)
+	}
 	other := browser.WebSource{Origin: "https://other.example"}
 	if _, err := handler(context.Background(), other, browser.WebRequest{Method: "capabilities.invoke", Params: json.RawMessage(`{"name":"echo_read","input":{}}`)}, nil); err == nil {
 		t.Fatal("a site without the grant ran a machine tool")
+	}
+}
+
+func TestSwitchesAreKeptWithNothingTickedAndProvidingGuardsPageTools(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "local-runtime-mcp.yaml")
+	if err := os.WriteFile(path, []byte("capabilities:\n  web: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "icourse"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "icourse", "outline.json"), []byte(`{"description":"Read the outline.","inputSchema":{"type":"object"},"outputSchema":{"type":"object"},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"origins":["https://www.icourse163.org"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "icourse", "outline.js"), []byte(`return {};`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := capability.Load(dir, &unavailableTabs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newGrantStore(nil, path, registry, nil, fixtureMachine(t))
+	// Authorizing with nothing ticked beneath is kept, in the file too.
+	if err := store.set(config.WebGrant{Site: "https://icourse163.org", Provide: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.set(config.WebGrant{Site: "https://hicancan.top", Use: true}); err != nil {
+		t.Fatal(err)
+	}
+	saved, _ := config.Load(path)
+	if len(saved.Capabilities.Web) != 2 {
+		t.Fatalf("switches without ticks were not kept: %+v", saved.Capabilities.Web)
+	}
+	lend := config.WebGrant{Site: "https://hicancan.top", Use: true, Capabilities: map[string]string{"icourse.outline": testCourse}}
+	if err := store.set(lend); err != nil {
+		t.Fatal(err)
+	}
+	// Turning providing off takes the lend back; lending again is refused until it is on.
+	if err := store.set(config.WebGrant{Site: "https://icourse163.org"}); err != nil {
+		t.Fatal(err)
+	}
+	if g, _ := store.get("https://studev.hicancan.top"); len(g.Capabilities) != 0 || !g.Use {
+		t.Fatalf("the lend outlived its provider: %+v", g)
+	}
+	if err := store.set(lend); err == nil {
+		t.Fatal("a page tool was lent from a site that does not provide")
+	}
+	if err := store.set(config.WebGrant{Site: "https://other.example", Tools: []string{"echo_read"}}); err == nil {
+		t.Fatal("tools were granted with the use switch off")
 	}
 }

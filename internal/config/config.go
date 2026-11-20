@@ -61,14 +61,21 @@ type Capabilities struct {
 type NativeCapabilityGrant struct {
 	Listen    string `yaml:"listen,omitempty"`
 	Key       string `yaml:"key,omitempty"`
-	Origin    string `yaml:"origin"`
+	Site      string `yaml:"site"`
 	BrowserID string `yaml:"browser_id,omitempty"`
 }
 
 // A web page selects a named capability, never a browser tab or target URL.
-// The owner fixes each target in this exact-origin grant.
+// The owner grants a site: its registrable domain with every subdomain under one scheme (https://chaoxing.com covers
+// https://mooc1.chaoxing.com), or one exact origin for a local address or a port (http://127.0.0.1:4321).
+//
+// Two switches are the owner's authorization, kept even when nothing is ticked beneath them: Use lets the site use
+// this computer (the models, page tools and machine tools listed below it, and nothing while it is off); Provide lets
+// the site's own page tools, today's and those an AI distils later, be lent to other sites.
 type WebGrant struct {
-	Origin       string            `yaml:"origin"`
+	Site         string            `yaml:"site"`
+	Use          bool              `yaml:"use,omitempty"`
+	Provide      bool              `yaml:"provide,omitempty"`
 	Models       []string          `yaml:"models,omitempty"`
 	Capabilities map[string]string `yaml:"capabilities,omitempty"`
 	// Tools names built-in machine tools (files, processes, desktop, browser) the owner lends this website.

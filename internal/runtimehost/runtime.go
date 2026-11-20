@@ -93,12 +93,10 @@ func Start(ctx context.Context, cfg *config.Config, localApps bool) (*Host, erro
 		return nil, err
 	}
 	grants := newGrantStore(cfg.Capabilities.Web, cfg.Path, registry, models.List(), machine)
-	for _, g := range cfg.Capabilities.Web {
-		if err := grants.check(g); err != nil {
-			cancel()
-			_ = bridge.Close(context.Background())
-			return nil, err
-		}
+	if err := grants.checkAll(grants.bySite); err != nil {
+		cancel()
+		_ = bridge.Close(context.Background())
+		return nil, err
 	}
 	bridge.SetWebHandler(webHandler(grants, registry, models))
 	bridge.SetGrantHandler(grants.handle)

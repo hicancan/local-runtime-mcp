@@ -7,7 +7,6 @@ import (
 	"errors"
 	"io"
 	"net/url"
-	"strings"
 
 	"github.com/hicancan/local-runtime-mcp/internal/browser"
 	"github.com/hicancan/local-runtime-mcp/internal/capability"
@@ -25,11 +24,10 @@ func validateWebConfig(cfg *config.Config) error {
 	}
 	seen := map[string]bool{}
 	for _, g := range cfg.Capabilities.Web {
-		u, err := url.Parse(g.Origin)
-		if err != nil || u.Host == "" || strings.ContainsAny(u.Host, "*\\") || u.User != nil || u.Scheme != "https" && u.Scheme != "http" || g.Origin != u.Scheme+"://"+u.Host || seen[g.Origin] {
-			return errors.New("web grants require unique exact HTTP(S) origins")
+		if !config.ValidSite(g.Site) || seen[g.Site] {
+			return errors.New("web grants require unique sites (https://example.com, or an exact local origin)")
 		}
-		seen[g.Origin] = true
+		seen[g.Site] = true
 		for _, target := range g.Capabilities {
 			u, err := url.Parse(target)
 			if err != nil || u.Host == "" || u.User != nil || u.Scheme != "https" && u.Scheme != "http" {
@@ -92,7 +90,7 @@ type capabilityRequest struct {
 func webHandler(grants *grantStore, registry *capability.Registry, models *modelapi.Service) browser.WebHandler {
 	return func(ctx context.Context, source browser.WebSource, request browser.WebRequest, emit func(browser.WebEvent) error) (any, error) {
 		grant, ok := grants.get(source.Origin)
-		if !ok {
+		if !ok || !grant.Use {
 			return nil, errors.New("this website has no local runtime grant")
 		}
 		switch request.Method {

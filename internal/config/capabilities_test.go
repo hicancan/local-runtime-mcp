@@ -43,7 +43,7 @@ func TestNativeCapabilityKeyEnvironmentNeedsAnExplicitGrant(t *testing.T) {
 	if err != nil || cfg.Capabilities.Native != nil {
 		t.Fatal("a credential alone must not enable the native listener", err)
 	}
-	if err := os.WriteFile(path, []byte("capabilities:\n  native:\n    origin: https://studev.example\n"), 0600); err != nil {
+	if err := os.WriteFile(path, []byte("capabilities:\n  native:\n    site: https://studev.example\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err = Resolve(path, Overrides{})

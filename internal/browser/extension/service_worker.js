@@ -220,7 +220,7 @@ async function refreshIcons() {
     // Grants are only asked for while the bridge is up; an absent lrmcp is simply grey.
     if (browserConnected) {
         try {
-            grantView = await grants('get');
+            grantView = await grants('get', '');
         }
         catch {
             grantView = null;

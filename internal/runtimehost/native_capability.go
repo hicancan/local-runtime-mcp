@@ -34,11 +34,11 @@ func nativeCapabilityGrant(cfg *config.Config) (*config.WebGrant, error) {
 		}
 	}
 	for _, grant := range cfg.Capabilities.Web {
-		if grant.Origin == native.Origin && len(grant.Capabilities) > 0 {
+		if grant.Site == native.Site && len(grant.Capabilities) > 0 {
 			return &grant, nil
 		}
 	}
-	return nil, errors.New("native capabilities require a configured web capability grant for their exact origin")
+	return nil, errors.New("native capabilities require a configured web capability grant for their site")
 }
 
 func nativeCapabilityHandler(grant config.WebGrant, ownerBrowser string, registry *capability.Registry, status func() browser.Status) http.Handler {

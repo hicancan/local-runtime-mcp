@@ -196,7 +196,7 @@ async function paintTab(tab: chrome.tabs.Tab) {
 }
 async function refreshIcons() {
   // Grants are only asked for while the bridge is up; an absent lrmcp is simply grey.
-  if (browserConnected) { try { grantView = await grants('get'); } catch { grantView = null; } } else grantView = null;
+  if (browserConnected) { try { grantView = await grants('get', ''); } catch { grantView = null; } } else grantView = null;
   iconsConnected = browserConnected && grantView !== null;
   try {
     await paintIcon(undefined, iconsConnected, false, false);

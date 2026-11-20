@@ -1,12 +1,25 @@
-import { grants } from './grants.js';
-// The owner's panel for the site in the current tab: what it may use of this computer (blue) and which of its own page
-// tools it offers to other sites (green). Every change goes to lrmcp at once and lands in its configuration file.
-const t = (key, ...subs) => chrome.i18n.getMessage(key, subs) || key;
+import { covers, grants } from './grants.js';
+let messages = {};
+let language = 'en';
+/** The owner's language: their choice in this panel, else Chinese whenever the system prefers it, else English. */
+async function loadLanguage() {
+    const saved = (await chrome.storage.local.get({ language: '' })).language;
+    language = saved || (navigator.languages.some(l => l.toLowerCase().startsWith('zh')) ? 'zh_CN' : 'en');
+    messages = await (await fetch(chrome.runtime.getURL(`_locales/${language}/messages.json`))).json();
+    document.documentElement.lang = language === 'zh_CN' ? 'zh-CN' : 'en';
+    for (const node of document.querySelectorAll('[data-i18n]'))
+        node.textContent = t(node.dataset.i18n);
+    $('language').textContent = language === 'zh_CN' ? 'EN' : '中文';
+}
+const t = (key, ...subs) => (messages[key]?.message ?? '').replace(/\$[A-Z]+\$/g, () => subs.shift() ?? '') || key;
 const $ = (id) => document.getElementById(id);
 const status = $('status'), panel = $('panel');
-for (const node of document.querySelectorAll('[data-i18n]'))
-    node.textContent = t(node.dataset.i18n);
-document.documentElement.lang = chrome.i18n.getUILanguage();
+$('language').addEventListener('click', async () => {
+    await chrome.storage.local.set({ language: language === 'zh_CN' ? 'en' : 'zh_CN' });
+    await loadLanguage();
+    paintConnection();
+    render();
+});
 $('settings').addEventListener('click', event => { event.preventDefault(); void chrome.runtime.openOptionsPage(); });
 function el(tag, props = {}, ...children) {
     const node = document.createElement(tag);
@@ -16,7 +29,7 @@ function el(tag, props = {}, ...children) {
 }
 /** A tool's name in the owner's language: the locale's translation of a built-in tool, else its own title. */
 function label(d) {
-    return chrome.i18n.getMessage(`tool_${d.name.replace(/\W/g, '_')}`) || d.title || d.name;
+    return messages[`tool_${d.name.replace(/\W/g, '_')}`]?.message || d.title || d.name;
 }
 function row(text, title, checked, change) {
     const box = el('input', { type: 'checkbox', checked });
@@ -26,20 +39,24 @@ function row(text, title, checked, change) {
 function group(title, rows) {
     return rows.length ? el('div', { className: 'group' }, el('h4', {}, title), ...rows) : null;
 }
+/** A section heads with its dot (lit when the direction is in use) and, where one switch means something, a switch. */
 function section(kind, title, on, toggle, hint, body) {
-    const master = el('input', { type: 'checkbox', checked: on });
-    master.addEventListener('change', () => toggle(master.checked));
-    const node = el('section', { className: kind }, el('label', {}, el('span', { className: 'dot' }), el('span', {}, title), master));
-    if (on)
+    const head = el('label', {}, el('span', { className: on ? 'dot on' : 'dot' }), el('span', {}, title));
+    if (toggle) {
+        const master = el('input', { type: 'checkbox', checked: on });
+        master.addEventListener('change', () => toggle(master.checked));
+        head.append(master);
+    }
+    const node = el('section', { className: kind }, head);
+    if (on || !toggle)
         node.append(el('p', { className: 'hint' }, hint), ...body.filter((n) => Boolean(n)));
     return node;
 }
 let view = null;
 let origin = '', page = '';
-let providesOpen = false;
 async function save(grant) {
     try {
-        view = await grants('set', grant);
+        view = await grants('set', origin, grant);
         status.textContent = t('saved');
         void chrome.runtime.sendMessage({ type: 'grants-changed' }).catch(() => { });
     }
@@ -49,8 +66,8 @@ async function save(grant) {
     render();
 }
 function own() {
-    const g = view.grants.find(g => g.Origin === origin);
-    return { Origin: origin, Models: [...(g?.Models ?? [])], Capabilities: { ...(g?.Capabilities ?? {}) }, Tools: [...(g?.Tools ?? [])] };
+    const g = view.grants.find(g => g.Site === view.site);
+    return { Site: view.site, Use: Boolean(g?.Use), Provide: Boolean(g?.Provide), Models: [...(g?.Models ?? [])], Capabilities: { ...(g?.Capabilities ?? {}) }, Tools: [...(g?.Tools ?? [])] };
 }
 function flip(list, item, on) {
     const rest = list.filter(x => x !== item);
@@ -58,12 +75,13 @@ function flip(list, item, on) {
 }
 function usesSection() {
     const g = own();
-    const on = (g.Models.length + Object.keys(g.Capabilities).length + g.Tools.length) > 0;
+    const on = Boolean(g.Use);
     const tool = (d) => row(label(d), d.description, g.Tools.includes(d.name), checked => save({ ...g, Tools: flip(g.Tools, d.name, checked) }));
     const reads = view.machine.filter(d => d.annotations.readOnlyHint);
     const changes = view.machine.filter(d => !d.annotations.readOnlyHint);
-    // Page tools another site offers, run on the page the owner chose when offering it.
-    const offered = view.pageTools.filter(d => !d.origins?.includes(origin));
+    // Page tools of the sites that provide theirs, run on the page the owner chose when offering it.
+    const providers = view.grants.filter(p => p.Provide && p.Site !== view.site);
+    const offered = view.pageTools.filter(d => d.origins?.some(o => providers.some(p => covers(p.Site, o))));
     const pages = offered.map(d => row(label(d), d.description, d.name in g.Capabilities, checked => {
         const capabilities = { ...g.Capabilities };
         if (checked)
@@ -74,8 +92,9 @@ function usesSection() {
     }));
     const models = view.models.map(m => row(m.title || m.id, m.id, g.Models.includes(m.id), checked => save({ ...g, Models: flip(g.Models, m.id, checked) })));
     return section('uses', t('usesTitle'), on, checked => {
-        // Turning it on lends what only reads; anything that changes the computer stays one tick away.
-        void save(checked ? { Origin: origin, Tools: reads.map(d => d.name), Models: [], Capabilities: {} } : { Origin: origin });
+        // The switch is the authorization. Turning it on also ticks what only reads; anything that changes the computer
+        // stays one tick away. Turning it off takes everything back but leaves providing as it is.
+        void save(checked ? { ...g, Use: true, Tools: reads.map(d => d.name) } : { ...g, Use: false, Tools: [], Models: [], Capabilities: {} });
     }, t('usesHint'), [
         group(t('groupRead'), reads.map(tool)),
         group(t('groupChange'), changes.map(tool)),
@@ -85,14 +104,15 @@ function usesSection() {
 }
 function providesSection() {
     const mine = view.pageTools.filter(d => d.origins?.includes(origin));
-    const consumers = view.grants.filter(g => g.Origin !== origin);
+    const consumers = view.grants.filter(g => g.Use && g.Site !== view.site);
     const offers = (g, d) => { try {
         return new URL(g.Capabilities?.[d.name] ?? '').origin === origin;
     }
     catch {
         return false;
     } };
-    const on = mine.some(d => consumers.some(g => offers(g, d)));
+    const self = own();
+    const on = Boolean(self.Provide);
     const body = [];
     if (!mine.length)
         body.push(el('p', { className: 'empty' }, t('noPageTools')));
@@ -100,7 +120,7 @@ function providesSection() {
         body.push(el('p', { className: 'empty' }, t('noConsumers')));
     else
         for (const d of mine) {
-            body.push(group(label(d), consumers.map(g => row(g.Origin.replace(/^https?:\/\//, ''), d.description, offers(g, d), checked => {
+            body.push(group(label(d), consumers.map(g => row(g.Site.replace(/^https?:\/\//, ''), d.description, offers(g, d), checked => {
                 const capabilities = { ...(g.Capabilities ?? {}) };
                 if (checked)
                     capabilities[d.name] = page;
@@ -109,21 +129,16 @@ function providesSection() {
                 void save({ ...g, Capabilities: capabilities });
             }))));
         }
-    return section('provides', t('providesTitle'), on || providesOpen, checked => {
-        providesOpen = checked;
-        if (checked) {
-            render();
-            return;
-        }
-        // Turning it off takes back every offer of this site's tools.
-        void (async () => {
-            for (const g of consumers) {
-                const capabilities = Object.fromEntries(Object.entries(g.Capabilities ?? {}).filter(([name]) => !mine.some(d => d.name === name && offers(g, d))));
-                if (Object.keys(capabilities).length !== Object.keys(g.Capabilities ?? {}).length)
-                    await save({ ...g, Capabilities: capabilities });
-            }
-        })();
-    }, t('providesHint'), body);
+    // The switch is the authorization, kept whether or not the site has tools yet; an AI may distil them later.
+    return section('provides', t('providesTitle'), on, checked => save({ ...self, Provide: checked }), t('providesHint'), body);
+}
+function paintConnection() {
+    const connection = $('connection');
+    connection.textContent = t(view ? 'connected' : 'disconnected');
+    connection.className = view ? '' : 'off';
+    // The grant covers the whole site; the page's own host is shown beneath it when they differ.
+    const host = origin.replace(/^https?:\/\//, ''), site = view?.site.replace(/^https?:\/\//, '') ?? host;
+    $('site').replaceChildren(site || '—', ...(site && host !== site ? [el('small', {}, ` · ${host}`)] : []));
 }
 function render() {
     panel.replaceChildren();
@@ -145,16 +160,14 @@ async function main() {
         }
     }
     catch { /* not a web page */ }
-    $('site').textContent = origin ? origin.replace(/^https?:\/\//, '') : '—';
-    const connection = $('connection');
+    await loadLanguage();
     try {
-        view = await grants('get');
-        connection.textContent = t('connected');
+        view = await grants('get', origin);
     }
     catch {
-        connection.textContent = t('disconnected');
-        connection.className = 'off';
+        view = null;
     }
+    paintConnection();
     render();
 }
 void main();

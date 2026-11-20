@@ -41,7 +41,7 @@ func TestNativeCapabilitiesExposeOnlyScopedReadOnlyBrowserCalls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	grant := config.WebGrant{Origin: "https://studev.example", Capabilities: map[string]string{
+	grant := config.WebGrant{Site: "https://studev.example", Use: true, Capabilities: map[string]string{
 		"icourse.outline": testCourse,
 		"deepseek.start":  "https://chat.deepseek.com/",
 	}}
@@ -115,16 +115,16 @@ func TestNativeCapabilityGrantRequiresIndependentCredentialAndExistingScope(t *t
 		t.Fatal("native capabilities must default to disabled")
 	}
 	const origin = "https://studev.example"
-	cfg.Capabilities.Web = []config.WebGrant{{Origin: origin, Capabilities: map[string]string{"icourse.outline": testCourse}}}
-	cfg.Capabilities.Native = &config.NativeCapabilityGrant{Origin: origin, Key: strings.Repeat("x", 32)}
-	if grant, err := nativeCapabilityGrant(cfg); err != nil || grant == nil || grant.Origin != origin {
+	cfg.Capabilities.Web = []config.WebGrant{{Site: origin, Use: true, Capabilities: map[string]string{"icourse.outline": testCourse}}}
+	cfg.Capabilities.Native = &config.NativeCapabilityGrant{Site: origin, Key: strings.Repeat("x", 32)}
+	if grant, err := nativeCapabilityGrant(cfg); err != nil || grant == nil || grant.Site != origin {
 		t.Fatalf("existing scoped grant not recognized: %v", err)
 	}
-	cfg.Capabilities.Native.Origin = "https://elsewhere.example"
+	cfg.Capabilities.Native.Site = "https://elsewhere.example"
 	if _, err := nativeCapabilityGrant(cfg); err == nil {
 		t.Fatal("unconfigured scope was accepted")
 	}
-	cfg.Capabilities.Native.Origin = origin
+	cfg.Capabilities.Native.Site = origin
 	for _, key := range []*string{&cfg.Models.Key, &cfg.Browser.Token, &cfg.HTTP.BearerToken, &cfg.HTTP.OAuth.OwnerToken} {
 		*key = cfg.Capabilities.Native.Key
 		if _, err := nativeCapabilityGrant(cfg); err == nil {
