@@ -185,11 +185,26 @@ func (s *grantStore) view(origin string) map[string]any {
 		"grants":    s.all(),
 		"pageTools": s.registry.List(),
 		"machine":   s.machine.list(),
+		"proposals": s.registry.Proposals(),
 		"models":    s.models,
 	}
 }
 
 func (s *grantStore) handle(method, origin string, body json.RawMessage) (any, error) {
+	if method == "approve" || method == "reject" {
+		var name string
+		if json.Unmarshal(body, &name) != nil {
+			return nil, errors.New("invalid proposal name")
+		}
+		// Only the owner, through the extension's credential, reaches this; the AI that proposed cannot approve.
+		act := s.registry.Approve
+		if method == "reject" {
+			act = s.registry.Reject
+		}
+		if err := act(name); err != nil {
+			return nil, err
+		}
+	}
 	if method == "set" {
 		var g config.WebGrant
 		if err := json.Unmarshal(body, &g); err != nil {

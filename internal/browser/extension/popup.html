@@ -30,6 +30,17 @@
       .row input { flex: none; }
       section.uses input { accent-color: var(--blue); } section.provides input { accent-color: var(--green); }
       .empty { padding: 8px 12px 10px; color: var(--muted); font-size: 12px; }
+      .proposal { padding: 8px 0 10px; border-top: 1px dashed var(--line); }
+      .proposal:first-of-type { border-top: 0; }
+      .proposal-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+      .proposal p { margin: 4px 0; color: var(--muted); font-size: 12px; }
+      .effect { padding: 0 5px; border-radius: 5px; background: var(--sunken); color: var(--muted); font-size: 11px; }
+      .effect.writes { color: #b45309; }
+      .code summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+      .code pre { max-height: 160px; overflow: auto; margin: 4px 0; padding: 6px; border-radius: 6px; background: var(--sunken); font-size: 11px; white-space: pre-wrap; }
+      .proposal-actions { display: flex; gap: 8px; margin-top: 6px; }
+      .proposal-actions button { padding: 4px 12px; border-radius: 7px; border: 1px solid var(--line); background: var(--paper); color: var(--ink); font: inherit; font-size: 12px; cursor: pointer; }
+      .proposal-actions .approve { background: var(--green); border-color: var(--green); color: #fff; }
       #status { min-height: 18px; margin: 4px 16px 12px; color: var(--muted); font-size: 12px; }
     </style>
   </head>

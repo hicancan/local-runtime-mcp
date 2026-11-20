@@ -5,38 +5,95 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/hicancan/local-runtime-mcp/internal/capability"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// registerCapabilityTools lists the catalog's page tools and follows it: when the owner approves a proposal the
+// catalog reloads, and tools are added, replaced or removed so connected clients see the new list.
 func registerCapabilityTools(server *mcp.Server, registry *capability.Registry) {
-	for _, definition := range registry.List() {
-		definition := definition
-		input := capabilityInputSchema(definition.InputSchema)
-		annotations := definition.Annotations
-		registered := tool(definition.Name, definition.Title, definition.Description,
-			annotations.ReadOnlyHint, annotations.DestructiveHint, annotations.IdempotentHint, annotations.OpenWorldHint)
-		registered.InputSchema = input
-		registered.OutputSchema = definition.OutputSchema
-		server.AddTool(registered, func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			var input struct {
-				BrowserID string         `json:"browser_id"`
-				TabID     string         `json:"tab_id"`
-				Arguments map[string]any `json:"arguments"`
+	var mu sync.Mutex
+	registered := map[string]string{}
+	follow := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		current := map[string]bool{}
+		for _, definition := range registry.List() {
+			current[definition.Name] = true
+			fingerprint, _ := json.Marshal(definition)
+			if registered[definition.Name] == string(fingerprint) {
+				continue
 			}
-			decoder := json.NewDecoder(strings.NewReader(string(request.Params.Arguments)))
-			decoder.DisallowUnknownFields()
-			if err := decoder.Decode(&input); err != nil || input.Arguments == nil {
-				return capabilityFailure(errors.New("capability input requires browser_id, tab_id and arguments")), nil
+			registered[definition.Name] = string(fingerprint)
+			addCapabilityTool(server, registry, definition)
+		}
+		var gone []string
+		for name := range registered {
+			if !current[name] {
+				gone = append(gone, name)
+				delete(registered, name)
 			}
-			result, err := registry.Call(ctx, definition.Name, input.BrowserID, input.TabID, input.Arguments)
-			if err != nil {
-				return capabilityFailure(err), nil
-			}
-			return capabilityResult(result), nil
-		})
+		}
+		if len(gone) > 0 {
+			server.RemoveTools(gone...)
+		}
 	}
+	follow()
+	registry.Watch(follow)
+}
+
+func addCapabilityTool(server *mcp.Server, registry *capability.Registry, definition capability.Definition) {
+	input := capabilityInputSchema(definition.InputSchema)
+	annotations := definition.Annotations
+	registered := tool(definition.Name, definition.Title, definition.Description,
+		annotations.ReadOnlyHint, annotations.DestructiveHint, annotations.IdempotentHint, annotations.OpenWorldHint)
+	registered.InputSchema = input
+	registered.OutputSchema = definition.OutputSchema
+	server.AddTool(registered, func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		var input struct {
+			BrowserID string         `json:"browser_id"`
+			TabID     string         `json:"tab_id"`
+			Arguments map[string]any `json:"arguments"`
+		}
+		decoder := json.NewDecoder(strings.NewReader(string(request.Params.Arguments)))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&input); err != nil || input.Arguments == nil {
+			return capabilityFailure(errors.New("capability input requires browser_id, tab_id and arguments")), nil
+		}
+		result, err := registry.Call(ctx, definition.Name, input.BrowserID, input.TabID, input.Arguments)
+		if err != nil {
+			return capabilityFailure(err), nil
+		}
+		return capabilityResult(result), nil
+	})
+}
+
+type proposeInput struct {
+	Name       string         `json:"name" jsonschema:"page tool name namespace.action, the namespace naming the site, e.g. chaoxing.course_outline"`
+	Definition map[string]any `json:"definition" jsonschema:"the tool definition: title, description, origins (exact https origins), inputSchema, outputSchema and all four annotations"`
+	Script     string         `json:"script" jsonschema:"a JavaScript function expression run in the page: function (args) { ... return result }"`
+}
+
+// registerProposeTool lets an AI that explored a site write down a page tool for the owner to approve.
+func registerProposeTool(server *mcp.Server, registry *capability.Registry) {
+	propose := inputTool[proposeInput](tool("capability_propose", "Propose page tool",
+		"After exploring a website with browser_snapshot and browser_action, write down how to do one task there as a page tool: a definition (title, description, exact origins, input and output JSON schemas, all four annotations) and a page-side JavaScript function. It is validated and stored as a proposal; nothing runs until the owner approves it in the browser extension's panel for that site. Prefer read-only tools that observe a loaded page; declare readOnlyHint false for anything that changes the site. Proposing the same name again replaces the earlier draft.",
+		false, false, true, false), func(*jsonschema.Schema) {})
+	mcp.AddTool(server, propose, func(_ context.Context, _ *mcp.CallToolRequest, in proposeInput) (*mcp.CallToolResult, any, error) {
+		definition, err := json.Marshal(in.Definition)
+		if err != nil {
+			return capabilityFailure(errors.New("definition must be a JSON object")), nil, nil
+		}
+		proposal, err := registry.Propose(in.Name, definition, in.Script)
+		if err != nil {
+			return capabilityFailure(err), nil, nil
+		}
+		status := "awaiting the owner's approval in the extension panel for " + strings.Join(proposal.Definition.Origins, ", ")
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: proposal.Definition.Name + ": " + status}}}, map[string]any{"name": proposal.Definition.Name, "status": status, "replaces": proposal.Replaces}, nil
+	})
 }
 
 func registerLocalAppTools(server *mcp.Server, registry *capability.Registry) {

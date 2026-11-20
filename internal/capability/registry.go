@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/hicancan/local-runtime-mcp/internal/browser"
@@ -57,8 +58,22 @@ type entry struct {
 }
 
 type Registry struct {
+	mu      sync.RWMutex
 	entries map[string]entry
 	browser Browser
+	// root is the catalog directory, so approved proposals can be reloaded from it; empty when disabled.
+	root     string
+	watchers []func()
+}
+
+// Watch calls changed after every reload, so the catalog's consumers (the MCP tool list) follow it.
+func (r *Registry) Watch(changed func()) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.watchers = append(r.watchers, changed)
+	r.mu.Unlock()
 }
 
 var (
@@ -90,9 +105,23 @@ func Load(directory string, executor Browser) (*Registry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve capability directory: %w", err)
 	}
-	err = filepath.WalkDir(root, func(path string, item fs.DirEntry, walkErr error) error {
+	entries, err := scan(root)
+	if err != nil {
+		return nil, err
+	}
+	r.root, r.entries = root, entries
+	return r, nil
+}
+
+// scan reads the whole tree. Directories whose names start with a dot (.proposed drafts, .git) are not the catalog.
+func scan(root string) (map[string]entry, error) {
+	entries := make(map[string]entry)
+	err := filepath.WalkDir(root, func(path string, item fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
+		}
+		if item.IsDir() && path != root && strings.HasPrefix(item.Name(), ".") {
+			return filepath.SkipDir
 		}
 		if item.IsDir() || filepath.Ext(path) != ".json" {
 			return nil
@@ -105,20 +134,40 @@ func Load(directory string, executor Browser) (*Registry, error) {
 		if filepath.Dir(relative) == "." || len(name) > 128 || !validName.MatchString(name) {
 			return fmt.Errorf("capability %s: use a namespace/action file path with a valid tool name", relative)
 		}
-		if _, exists := r.entries[name]; exists {
+		if _, exists := entries[name]; exists {
 			return fmt.Errorf("capability %s: duplicate tool name", relative)
 		}
 		loaded, err := loadEntry(path, name)
 		if err != nil {
 			return fmt.Errorf("capability %s: %w", relative, err)
 		}
-		r.entries[name] = loaded
+		entries[name] = loaded
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return r, nil
+	return entries, nil
+}
+
+// Reload rereads the catalog after the owner approves a proposal. A tree that fails validation leaves the current
+// catalog in place.
+func (r *Registry) Reload() error {
+	if r == nil || r.root == "" {
+		return errors.New("capabilities are disabled")
+	}
+	entries, err := scan(r.root)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.entries = entries
+	watchers := append([]func(){}, r.watchers...)
+	r.mu.Unlock()
+	for _, changed := range watchers {
+		changed()
+	}
+	return nil
 }
 
 func loadEntry(path, name string) (entry, error) {
@@ -248,6 +297,8 @@ func (r *Registry) definitions(apps bool) []Definition {
 	if r == nil {
 		return result
 	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	for _, e := range r.entries {
 		if (e.command != nil) != apps {
 			continue
@@ -285,7 +336,9 @@ func (r *Registry) call(ctx context.Context, name, browserID, tabID, targetURL s
 	if r == nil {
 		return nil, errors.New("capability is not registered")
 	}
+	r.mu.RLock()
 	e, ok := r.entries[name]
+	r.mu.RUnlock()
 	if !ok || e.command != nil {
 		return nil, errors.New("capability is not registered")
 	}

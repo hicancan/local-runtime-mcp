@@ -171,3 +171,23 @@ compose `start`, `read`, and `stop` rather than keep one browser evaluation open
 through a long response. Cancellation reaches the execution channel; it does not
 undo page side effects or prove a website has stopped generating. A stop
 capability must observe the page and report whether stopping was confirmed.
+
+## Tools an AI distils
+
+An AI that explores a website with `browser_snapshot` and `browser_action` can
+write down how to do one task there with `capability_propose`: a definition and
+a page-side function, validated exactly as this catalog validates its files.
+The draft waits in `.proposed/` beside the catalog (directories starting with a
+dot are never loaded) and runs nothing.
+
+The owner sees the drafts for a site in the extension's panel (click the
+toolbar L, under "Offer this site's tools"), can read the code, and approves or
+rejects each one. Approval moves the files into the catalog and reloads it;
+connected MCP clients receive the new tool list at once. When this directory is
+a Git repository, each approval is one commit, so every version of a distilled
+tool can be read back and restored. Proposing an approved name again offers a
+replacement, for when the site changes and the old tool stops working.
+
+`capability_propose` is listed only when a capability directory is configured.
+Only the extension, holding the bridge credential, can approve; the AI that
+proposed cannot.

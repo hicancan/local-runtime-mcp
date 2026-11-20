@@ -4,15 +4,17 @@ import { packagedConfig } from './runtime_config.js';
 // only this extension holds. No web page reaches this path.
 export type Definition = { name: string; title?: string; description: string; annotations: { readOnlyHint: boolean; destructiveHint: boolean }; origins?: string[] };
 export type Grant = { Site: string; Use?: boolean; Provide?: boolean; Models?: string[]; Capabilities?: Record<string, string>; Tools?: string[] };
-export type View = { site: string; grants: Grant[]; pageTools: Definition[]; machine: Definition[]; models: { id: string; title?: string }[] };
+/** A page tool an AI wrote down after exploring a site, waiting for the owner. */
+export type Proposal = { definition: Definition; script: string; replaces: boolean };
+export type View = { site: string; grants: Grant[]; pageTools: Definition[]; machine: Definition[]; models: { id: string; title?: string }[]; proposals: Proposal[] };
 
 /** Asks lrmcp for every grant, opened on one page origin so the answer names that page's site. */
-export async function grants(method: 'get' | 'set', origin: string, grant?: Grant): Promise<View> {
+export async function grants(method: 'get' | 'set' | 'approve' | 'reject', origin: string, grant?: Grant, name?: string): Promise<View> {
   const settings = await chrome.storage.local.get({ address: packagedConfig.address || '127.0.0.1:9315', token: packagedConfig.token || '' });
   if (!settings.token) throw new Error('not configured');
   const response = await fetch(`http://${settings.address}/v1/grants`, {
     method: 'POST', headers: { Authorization: `Bearer ${settings.token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ method, origin, ...(grant ? { grant } : {}) }),
+    body: JSON.stringify({ method, origin, ...(grant ? { grant } : {}), ...(name ? { name } : {}) }),
   });
   const body = await response.json().catch(() => null);
   if (!response.ok) throw new Error(body?.error || `lrmcp ${response.status}`);

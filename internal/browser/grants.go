@@ -11,6 +11,9 @@ import (
 // bridge credential, reaches it; no web page does.
 type GrantHandler func(method, origin string, grant json.RawMessage) (any, error)
 
+// The panel reads and sets grants, and approves or rejects page tools an AI proposed.
+var validGrantMethod = map[string]bool{"get": true, "set": true, "approve": true, "reject": true}
+
 func (b *Bridge) SetGrantHandler(handler GrantHandler) {
 	b.mu.Lock()
 	b.grants = handler
@@ -37,13 +40,18 @@ func (b *Bridge) receiveGrants(writer http.ResponseWriter, request *http.Request
 		Method string          `json:"method"`
 		Origin string          `json:"origin"`
 		Grant  json.RawMessage `json:"grant"`
+		Name   string          `json:"name"`
 	}
 	data, err := io.ReadAll(io.LimitReader(request.Body, 256*1024))
-	if err != nil || json.Unmarshal(data, &envelope) != nil || envelope.Method != "get" && envelope.Method != "set" {
+	if err != nil || json.Unmarshal(data, &envelope) != nil || !validGrantMethod[envelope.Method] {
 		http.Error(writer, "invalid grant request", http.StatusBadRequest)
 		return
 	}
-	result, err := handler(envelope.Method, envelope.Origin, envelope.Grant)
+	body := envelope.Grant
+	if envelope.Method == "approve" || envelope.Method == "reject" {
+		body, _ = json.Marshal(envelope.Name)
+	}
+	result, err := handler(envelope.Method, envelope.Origin, body)
 	writer.Header().Set("Content-Type", "application/json")
 	if err != nil {
 		writer.WriteHeader(http.StatusUnprocessableEntity)

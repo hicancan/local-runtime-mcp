@@ -123,5 +123,26 @@
   },
   "tool_computer_action": {
     "message": "在桌面上操作"
+  },
+  "groupProposals": {
+    "message": "AI 提议 · 等你审批"
+  },
+  "showCode": {
+    "message": "查看代码"
+  },
+  "approve": {
+    "message": "批准"
+  },
+  "reject": {
+    "message": "拒绝"
+  },
+  "approved": {
+    "message": "已批准，工具已生效"
+  },
+  "rejected": {
+    "message": "已拒绝"
+  },
+  "replaces": {
+    "message": "将替换现有版本"
   }
 }

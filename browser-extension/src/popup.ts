@@ -1,4 +1,4 @@
-import { covers, grants, type Definition, type Grant, type View } from './grants.js';
+import { covers, grants, type Definition, type Grant, type Proposal, type View } from './grants.js';
 
 // The owner's panel for the site in the current tab: what it may use of this computer (blue) and which of its own page
 // tools it offers to other sites (green). Every change goes to lrmcp at once and lands in its configuration file.
@@ -126,8 +126,35 @@ function providesSection() {
       void save({ ...g, Capabilities: capabilities });
     }))));
   }
+  // Drafts an AI wrote after exploring this site wait here; nothing runs until the owner approves one.
+  const drafts = view!.proposals.filter(p => p.definition.origins?.some(o => covers(view!.site, o)));
+  if (drafts.length) body.unshift(el('div', { className: 'group' }, el('h4', {}, t('groupProposals')), ...drafts.map(proposalRow)));
   // The switch is the authorization, kept whether or not the site has tools yet; an AI may distil them later.
   return section('provides', t('providesTitle'), on, checked => save({ ...self, Provide: checked }), t('providesHint'), body);
+}
+
+function proposalRow(p: Proposal) {
+  const d = p.definition;
+  const act = (method: 'approve' | 'reject') => async () => {
+    try {
+      view = await grants(method, origin, undefined, d.name);
+      status.textContent = t(method === 'approve' ? 'approved' : 'rejected');
+      void chrome.runtime.sendMessage({ type: 'grants-changed' }).catch(() => {});
+    } catch (error) {
+      status.textContent = t('failed', error instanceof Error ? error.message : String(error));
+    }
+    render();
+  };
+  const code = el('details', { className: 'code' }, el('summary', {}, t('showCode')), el('pre', {}, p.script));
+  return el('div', { className: 'proposal' },
+    el('div', { className: 'proposal-head' },
+      el('b', {}, d.title || d.name),
+      el('small', { className: d.annotations.readOnlyHint ? 'effect' : 'effect writes' }, t(d.annotations.readOnlyHint ? 'groupRead' : 'groupChange')),
+      ...(p.replaces ? [el('small', { className: 'effect' }, t('replaces'))] : [])),
+    el('p', {}, d.description), code,
+    el('div', { className: 'proposal-actions' },
+      Object.assign(el('button', { type: 'button', className: 'approve' }, t('approve')), { onclick: act('approve') }),
+      Object.assign(el('button', { type: 'button' }, t('reject')), { onclick: act('reject') })));
 }
 
 function paintConnection() {

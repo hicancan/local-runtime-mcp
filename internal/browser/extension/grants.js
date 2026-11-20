@@ -1,12 +1,12 @@
 import { packagedConfig } from './runtime_config.js';
 /** Asks lrmcp for every grant, opened on one page origin so the answer names that page's site. */
-export async function grants(method, origin, grant) {
+export async function grants(method, origin, grant, name) {
     const settings = await chrome.storage.local.get({ address: packagedConfig.address || '127.0.0.1:9315', token: packagedConfig.token || '' });
     if (!settings.token)
         throw new Error('not configured');
     const response = await fetch(`http://${settings.address}/v1/grants`, {
         method: 'POST', headers: { Authorization: `Bearer ${settings.token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ method, origin, ...(grant ? { grant } : {}) }),
+        body: JSON.stringify({ method, origin, ...(grant ? { grant } : {}), ...(name ? { name } : {}) }),
     });
     const body = await response.json().catch(() => null);
     if (!response.ok)

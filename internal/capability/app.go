@@ -71,7 +71,9 @@ func (r *Registry) CallApp(ctx context.Context, name string, args map[string]any
 	if r == nil {
 		return nil, errors.New("local app capability is not registered")
 	}
+	r.mu.RLock()
 	e, ok := r.entries[name]
+	r.mu.RUnlock()
 	if !ok || e.command == nil {
 		return nil, errors.New("local app capability is not registered")
 	}

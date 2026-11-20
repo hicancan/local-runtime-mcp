@@ -123,5 +123,26 @@
   },
   "tool_computer_action": {
     "message": "Act on the desktop"
+  },
+  "groupProposals": {
+    "message": "Proposed by AI · awaiting you"
+  },
+  "showCode": {
+    "message": "Show the code"
+  },
+  "approve": {
+    "message": "Approve"
+  },
+  "reject": {
+    "message": "Reject"
+  },
+  "approved": {
+    "message": "Approved — the tool is live"
+  },
+  "rejected": {
+    "message": "Rejected"
+  },
+  "replaces": {
+    "message": "replaces the current version"
   }
 }

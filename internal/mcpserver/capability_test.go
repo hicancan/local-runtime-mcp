@@ -133,7 +133,8 @@ func TestFileCapabilityIsDiscoverableAndCallableThroughRealMCP(t *testing.T) {
 			found = registered
 		}
 	}
-	if found == nil || len(listed.Tools) != 23 || found.Title != "Read an example page" || !found.Annotations.ReadOnlyHint || !*found.Annotations.OpenWorldHint {
+	// The built-in tools, the file capability, and capability_propose (a catalog exists to hold drafts).
+	if found == nil || len(listed.Tools) != 24 || found.Title != "Read an example page" || !found.Annotations.ReadOnlyHint || !*found.Annotations.OpenWorldHint {
 		t.Fatal("file capability was not registered alongside the existing tools")
 	}
 	// The actual advertised schema, including the routing envelope, must retain
@@ -162,6 +163,31 @@ func TestFileCapabilityIsDiscoverableAndCallableThroughRealMCP(t *testing.T) {
 	}
 	if len(result.Content) != 1 || result.Content[0].(*mcp.TextContent).Text != `{"text":"page result"}` {
 		t.Fatal("MCP structured output lost its text representation")
+	}
+	// An AI proposes a tool over MCP; it is not listed until the owner approves it, then connected clients see it.
+	proposed, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "capability_propose", Arguments: map[string]any{
+		"name": "example.again", "script": "async function(input) { return {text:input.text}; }",
+		"definition": json.RawMessage(definition),
+	}})
+	if err != nil || proposed.IsError {
+		t.Fatalf("proposal failed: %v %+v", err, proposed)
+	}
+	listedNames := func() map[string]bool {
+		names := map[string]bool{}
+		again, _ := session.ListTools(ctx, nil)
+		for _, registered := range again.Tools {
+			names[registered.Name] = true
+		}
+		return names
+	}
+	if listedNames()["example.again"] {
+		t.Fatal("a proposal was listed before approval")
+	}
+	if err := registry.Approve("example.again"); err != nil {
+		t.Fatal(err)
+	}
+	if !listedNames()["example.again"] {
+		t.Fatal("an approved tool did not reach the connected client")
 	}
 	for _, invalid := range []map[string]any{
 		{"browser_id": "profile", "tab_id": "tab", "arguments": map[string]any{"text": 7}},

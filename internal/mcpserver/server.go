@@ -55,6 +55,9 @@ func New(deps Dependencies) *mcp.Server {
 	registerBrowserTools(server, deps.Browser)
 	registerComputerTools(server, deps.Computer)
 	registerCapabilityTools(server, deps.Capabilities)
+	if deps.Capabilities.Proposes() {
+		registerProposeTool(server, deps.Capabilities)
+	}
 	if deps.LocalApps {
 		registerLocalAppTools(server, deps.Capabilities)
 	}
