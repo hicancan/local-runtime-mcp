@@ -13,12 +13,12 @@ import (
 )
 
 func TestExplicitTransportAndProviderSelection(t *testing.T) {
-	for _, value := range []Options{{Transport: "stdio"}, {Transport: "http"}, {Transport: "http", Tunnels: []string{"openai"}}, {Transport: "http", Tunnels: []string{"cloudflare"}}, {Transport: "http", Tunnels: []string{"openai", "cloudflare"}}} {
+	for _, value := range []Options{{Transport: "stdio"}, {Transport: "local"}, {Transport: "http"}, {Transport: "http", Tunnels: []string{"openai"}}, {Transport: "http", Tunnels: []string{"cloudflare"}}, {Transport: "http", Tunnels: []string{"openai", "cloudflare"}}} {
 		if err := value.Validate(); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, value := range []Options{{}, {Transport: "sse"}, {Transport: "stdio", Tunnels: []string{"openai"}}, {Transport: "http", Tunnels: []string{"unknown"}}, {Transport: "http", Tunnels: []string{"openai", "openai"}}} {
+	for _, value := range []Options{{}, {Transport: "sse"}, {Transport: "stdio", Tunnels: []string{"openai"}}, {Transport: "local", Tunnels: []string{"cloudflare"}}, {Transport: "http", Tunnels: []string{"unknown"}}, {Transport: "http", Tunnels: []string{"openai", "openai"}}} {
 		if value.Validate() == nil {
 			t.Fatalf("invalid selection accepted: %+v", value)
 		}

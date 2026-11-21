@@ -78,25 +78,30 @@ Host 只创建一套 Process Manager、Filesystem Service、Browser Bridge 和 C
 ```text
 lrmcp
 ├── serve
-│   ├── --transport stdio|http
+│   ├── --transport stdio|local|http
 │   └── --tunnel openai|cloudflare   （HTTP 下可重复）
 ├── setup
 │   ├── browser
+│   ├── local
+│   ├── client
 │   └── oauth
 ├── version
 └── help
 ```
 
-`serve` 启动一个 Host。用 `--transport stdio` 选择本地进程管道，用 `--transport http` 选择 HTTP；HTTP 下重复传入 `--tunnel` 即可启用两种 Provider。保存的凭据用于配置 Provider，命令行决定本次是否启动它。
+`serve` 启动唯一 Host（或在已有本机 Daemon 时让 `stdio` 自动退化为透明薄代理附着复用）。`--transport local` 只启动本机专属面（`127.0.0.1:9317`）与扩展桥（`127.0.0.1:9315`）；`--transport http` 同时开放公网/隧道面（`127.0.0.1:9316`，仅承载远端 `/mcp` 与 OAuth，不暴露 `/v1` 与 `LocalApps`）。
 
 | 命令 | 链路与凭据 |
 | --- | --- |
-| `lrmcp serve --transport stdio` | 标准 MCP 进程管道，由父进程提供访问权限。 |
-| `lrmcp serve --transport http` | 直接访问 loopback Streamable HTTP，使用配置的公开客户端认证模式。 |
+| `lrmcp serve --transport stdio` | 标准 MCP 进程管道；若 `127.0.0.1:9317` 已有 Daemon，则自动作为薄代理附着共享（支持多个 Codex 并发共享与实时 `tools/list_changed`）。 |
+| `lrmcp serve --transport local` | 纯本机常驻 Daemon：只监听本机专属面 `127.0.0.1:9317`（`/mcp`、`/v1`、`/capabilities`）与扩展桥 `127.0.0.1:9315`，不开放任何公网端口。 |
+| `lrmcp serve --transport http` | 同时启动本机专属面（若已配置）与公网 loopback HTTP（`127.0.0.1:9316/mcp`）。 |
 | `lrmcp serve --transport http --tunnel openai` | 官方 OpenAI 转发连接私有 loopback MCP 端点，配置 Tunnel ID 与 API key。 |
-| `lrmcp serve --transport http --tunnel cloudflare` | 官方 `cloudflared` 转发到经过认证的 loopback HTTP。 |
-| `lrmcp serve --transport http --tunnel openai --tunnel cloudflare` | 两种 Provider 访问同一个 Host 和资源。 |
+| `lrmcp serve --transport http --tunnel cloudflare` | 官方 `cloudflared` 转发到公网 loopback HTTP（`127.0.0.1:9316`）。 |
+| `lrmcp serve --transport http --tunnel openai --tunnel cloudflare` | 两种远端 Provider 与全部本机客户端共享同一个 Host 和资源。 |
 | `lrmcp setup browser` | 生成 Bridge 凭据，释放和配置扩展。 |
+| `lrmcp setup local` | 生成本机专属面 `local.token`，开启多 `stdio` 客户端共享。 |
+| `lrmcp setup client --id NAME [--model ID]` | 在 `grants.clients` 中注册同机受控应用并生成独立 Scoped Token（`--show` 查看）。 |
 | `lrmcp setup oauth --client-name NAME --redirect-uri URI` | 用准确回调地址注册 OAuth 客户端并生成凭据。 |
 | `lrmcp setup oauth --show` | 在本地终端明确查看已有 OAuth 凭据。 |
 | `lrmcp version` | 输出可执行文件版本。 |
@@ -441,6 +446,9 @@ OAuth 授权开放此运行时的完整机器控制工具。每个客户端使�
 | --- | --- |
 | `LOCAL_RUNTIME_MCP_BROWSER_LISTEN` | `browser.listen` |
 | `LOCAL_RUNTIME_MCP_BROWSER_TOKEN` | `browser.token` |
+| `LOCAL_RUNTIME_MCP_LOCAL_LISTEN` | `local.listen` |
+| `LOCAL_RUNTIME_MCP_LOCAL_TOKEN` | `local.token` |
+| `LOCAL_RUNTIME_MCP_CLIENT_TOKEN` / `LOCAL_RUNTIME_MCP_CLIENT_TOKEN_<ID>` | `grants.clients[].token` |
 | `LOCAL_RUNTIME_MCP_OPENAI_TUNNEL_ID` | `openai.tunnel_id` |
 | `LOCAL_RUNTIME_MCP_OPENAI_API_KEY` | `openai.api_key` |
 | `LOCAL_RUNTIME_MCP_HTTP_LISTEN` | `http.listen` |

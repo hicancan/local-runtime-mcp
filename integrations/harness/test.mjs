@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { LlmAdapter, attributionHeaders } from '@deepseek-ai/dsh-llm';
 import { LocalRuntimeAdapter, apply } from './index.mjs';
 
-const config = { provider: 'local-runtime', baseURL: 'http://127.0.0.1:9316/v1', apiKeyEnv: 'LOCAL_RUNTIME_MCP_MODEL_KEY', models: [{ id: 'web-test' }] };
+const config = { provider: 'local-runtime', baseURL: 'http://127.0.0.1:9317/v1', apiKeyEnv: 'LOCAL_RUNTIME_MCP_CLIENT_TOKEN', models: [{ id: 'web-test' }] };
 const options = () => ({ provider: 'local-runtime', model: 'web-test', sessionId:'session-a', messages: [{ role: 'user', content: [{ type: 'text', text: 'question' }] }] });
 const frame = (delta = {}, finish = null, conversation = 'session-a') => `data: ${JSON.stringify({ conversation_id: conversation, choices: [{ index: 0, delta, finish_reason: finish }] })}\r\n\r\n`;
 function response(data) { return new Response(data, { headers: { 'Content-Type': 'text/event-stream' } }); }
@@ -125,7 +125,7 @@ test('known provider states produce helpful fixed messages rather than raw page 
 
 test('plugin mounts through the official registry and resolves only its credential reference', async () => {
   let registration;
-  apply({ llm: { registerAdapter(routes, adapter) { registration = { routes, adapter }; } }, get() { return { resolve: async ref => { assert.equal(ref, 'LOCAL_RUNTIME_MCP_MODEL_KEY'); return { value: 'fixture-model-key' }; } }; } }, { models: [{ id: 'web-test' }] });
+  apply({ llm: { registerAdapter(routes, adapter) { registration = { routes, adapter }; } }, get() { return { resolve: async ref => { assert.equal(ref, 'LOCAL_RUNTIME_MCP_CLIENT_TOKEN'); return { value: 'fixture-model-key' }; } }; } }, { models: [{ id: 'web-test' }] });
   assert.deepEqual(registration.routes, ['local-runtime']);
   assert.equal(registration.adapter instanceof LlmAdapter, true);
   assert.equal(await registration.adapter.resolveKey(), 'fixture-model-key');

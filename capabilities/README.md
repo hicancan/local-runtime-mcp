@@ -102,28 +102,32 @@ unknown outcome does not automatically repeat an action.
 
 ## Same-computer native clients
 
-With `lrmcp serve --transport http`, the owner can enable `capabilities.native`
-in `local-runtime-mcp.yaml`. It reuses the fixed capability targets of the
-web grant named by `origin`. Use a separate `key` or supply it to the process
-with `LOCAL_RUNTIME_MCP_NATIVE_CAPABILITY_KEY`. Connect through
-`127.0.0.1:9317` by default. If multiple browser profiles are connected, set
-`browser_id` in this configuration. The configured browser must have exactly
-one tab open at the exact configured target URL, including any fragment.
+With `lrmcp serve --transport local` or `lrmcp serve --transport http`, the owner
+can configure scoped clients under `grants.clients` in `local-runtime-mcp.yaml`
+(or create one with `lrmcp setup client --id studev-win`). Each client holds its
+own independent token (or receives `LOCAL_RUNTIME_MCP_CLIENT_TOKEN` /
+`LOCAL_RUNTIME_MCP_CLIENT_TOKEN_<CLIENT_ID>` in a single child process) and connects
+through the local-only plane at `127.0.0.1:9317` by default. If multiple browser
+profiles are connected, set `browser_id` on that client grant. The configured
+browser must have exactly one tab open at the exact configured target URL,
+including any fragment.
 
-Send `Authorization: Bearer <native capability key>` on both requests:
+Send `Authorization: Bearer <client token>` on both requests:
 
-- `GET /capabilities` returns the granted read-only browser tool definitions.
+- `GET /capabilities` returns that client's granted read-only browser tool definitions.
 - `POST /capabilities/invoke` takes `{"name":"icourse.outline","input":{}}`
   as `application/json` and returns the validated tool result as JSON.
 
-The dedicated listener serves no model, machine or tunnel routes. Errors from
-the capability API carry an `error` object with a `code` and `message`.
+The local-only plane rejects browser `Origin` headers and reverse-proxy forwarding
+headers, and is never exposed through tunnels. A client token cannot authenticate
+machine MCP control (`/mcp`). Errors from the capability API carry an `error`
+object with a `code` and `message`.
 
 ## Local app tools
 
-Local app tools are opt-in on `lrmcp serve --transport stdio`. This catalog
-is visible to the same-host MCP client that starts the runtime. HTTP, tunnels,
-web grants and model sources publish the browser catalog separately.
+Local app tools are exposed on the same-host MCP server (`lrmcp serve --transport stdio`
+and the local-only `/mcp` plane on `127.0.0.1:9317`). Public HTTP (`127.0.0.1:9316`),
+tunnels, web grants and client tokens never expose local app command bindings.
 
 To expose the read-only StuDev Windows query, add `studev/next-class.json`
 under the configured capability directory and point it at your installed

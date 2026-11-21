@@ -2,20 +2,30 @@ package modelapi
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 )
 
-// HTTP authenticates only model requests, never MCP or machine control.
+// ClientScope identifies one authorized local client and the models it may call.
+type ClientScope struct {
+	ID        string
+	BrowserID string
+	Models    []string
+}
+
+// Authorizer resolves a bearer token to one local client's model scope.
+type Authorizer func(bearer string) (ClientScope, bool)
+
+// HTTP authenticates only scoped local client model requests, never MCP or machine control.
 type HTTP struct {
-	Service *Service
-	Key     string
+	Service   *Service
+	Authorize Authorizer
 }
 
 func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -26,17 +36,30 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	provided, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if len(h.Key) < 32 || !ok || len(provided) != len(h.Key) || subtle.ConstantTimeCompare([]byte(provided), []byte(h.Key)) != 1 {
+	if !ok || h.Authorize == nil {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="local-runtime-models"`)
-		writeError(w, failure("invalid_api_key", "A valid local model API key is required.", 401))
+		writeError(w, failure("invalid_api_key", "A valid local client token is required.", 401))
+		return
+	}
+	client, authorized := h.Authorize(provided)
+	if !authorized || client.ID == "" {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="local-runtime-models"`)
+		writeError(w, failure("invalid_api_key", "A valid local client token is required.", 401))
 		return
 	}
 	if h.Service == nil {
 		writeError(w, failure("model_unavailable", "Local model sources are unavailable.", 503))
 		return
 	}
+	scope := "client:" + client.ID
 	if r.URL.Path == "/v1/models" && r.Method == http.MethodGet {
-		writeJSON(w, map[string]any{"object": "list", "data": h.Service.List()})
+		granted := make([]map[string]any, 0, len(client.Models))
+		for _, item := range h.Service.List() {
+			if id, _ := item["id"].(string); slices.Contains(client.Models, id) {
+				granted = append(granted, item)
+			}
+		}
+		writeJSON(w, map[string]any{"object": "list", "data": granted})
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/v1/conversations/") {
@@ -45,7 +68,12 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		id := strings.TrimPrefix(r.URL.Path, "/v1/conversations/")
-		if err := h.Service.CloseConversation(r.Context(), "api", r.URL.Query().Get("model"), id); err != nil {
+		model := r.URL.Query().Get("model")
+		if model != "" && !slices.Contains(client.Models, model) {
+			writeError(w, failure("model_not_granted", "This model is not granted to this client.", 403))
+			return
+		}
+		if err := h.Service.CloseConversation(r.Context(), scope, model, id); err != nil {
 			writeError(w, err)
 			return
 		}
@@ -74,8 +102,12 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	if !slices.Contains(client.Models, request.Model) {
+		writeError(w, failure("model_not_granted", "This model is not granted to this client.", 403))
+		return
+	}
 	if !request.Stream {
-		answer, err := h.Service.Generate(r.Context(), request, "", "api", nil)
+		answer, err := h.Service.Generate(r.Context(), request, client.BrowserID, scope, nil)
 		if err != nil {
 			writeError(w, err)
 			return
@@ -101,7 +133,7 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	lastWrite := time.Now()
 	roleSent := false
-	answer, err := h.Service.Generate(r.Context(), request, "", "api", func(delta Delta) error {
+	answer, err := h.Service.Generate(r.Context(), request, client.BrowserID, scope, func(delta Delta) error {
 		if delta.Stage != "" {
 			if _, err := fmt.Fprintf(w, ": stage %s\n\n", delta.Stage); err != nil {
 				return err

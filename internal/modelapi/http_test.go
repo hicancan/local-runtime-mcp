@@ -16,6 +16,13 @@ import (
 
 const testKey = "model-api-fixture-key-0123456789abcdef"
 
+func testAuth(bearer string) (ClientScope, bool) {
+	if bearer != testKey {
+		return ClientScope{}, false
+	}
+	return ClientScope{ID: "fixture-client", Models: []string{"web-test"}}, true
+}
+
 func postRequest(t *testing.T, server *httptest.Server, ctx context.Context, request Request) *http.Response {
 	t.Helper()
 	data, _ := json.Marshal(request)
@@ -68,7 +75,7 @@ func firstChoice(t *testing.T, event map[string]any) map[string]any {
 
 func TestHTTPAuthenticatesAndValidatesBeforeAnySSEOrBrowserWork(t *testing.T) {
 	s, _, b := newFixture(t)
-	h := &HTTP{Service: s, Key: testKey}
+	h := &HTTP{Service: s, Authorize: testAuth}
 	for _, tc := range []struct {
 		name, body, authorization, origin string
 		status                            int
@@ -101,7 +108,7 @@ func TestHTTPAuthenticatesAndValidatesBeforeAnySSEOrBrowserWork(t *testing.T) {
 
 func TestHTTPModelDiscoveryAndNonStreamingCompletion(t *testing.T) {
 	s, _, _ := newFixture(t)
-	server := httptest.NewServer(&HTTP{Service: s, Key: testKey})
+	server := httptest.NewServer(&HTTP{Service: s, Authorize: testAuth})
 	defer server.Close()
 	r, _ := http.NewRequest(http.MethodGet, server.URL+"/v1/models", nil)
 	r.Header.Set("Authorization", "Bearer "+testKey)
@@ -159,7 +166,7 @@ func TestSSEFlushesActualIncrementalTextBeforeTheSourceCompletes(t *testing.T) {
 		}
 		return f.defaultCall(ctx, call)
 	}
-	server := httptest.NewServer(&HTTP{Service: s, Key: testKey})
+	server := httptest.NewServer(&HTTP{Service: s, Authorize: testAuth})
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -217,7 +224,7 @@ func TestSSEExposesSourceProgressWithoutDeclaringAnAssistantOnTimeout(t *testing
 		}
 		return f.defaultCall(ctx, call)
 	}
-	server := httptest.NewServer(&HTTP{Service: s, Key: testKey})
+	server := httptest.NewServer(&HTTP{Service: s, Authorize: testAuth})
 	defer server.Close()
 	r := request()
 	r.Stream = true
@@ -241,7 +248,7 @@ func TestSSEToolCallsUseIndexedArgumentsAndToolFinishWithoutProtocolText(t *test
 		}
 		return f.defaultCall(ctx, call)
 	}
-	server := httptest.NewServer(&HTTP{Service: s, Key: testKey})
+	server := httptest.NewServer(&HTTP{Service: s, Authorize: testAuth})
 	defer server.Close()
 	r := request()
 	r.Stream, r.Tools = true, []Tool{functionTool("lookup")}
@@ -287,7 +294,7 @@ func TestSSEMidstreamFailureIsSanitizedAndNeverReportsSuccessfulDone(t *testing.
 		}
 		return f.defaultCall(ctx, call)
 	}
-	server := httptest.NewServer(&HTTP{Service: s, Key: testKey})
+	server := httptest.NewServer(&HTTP{Service: s, Authorize: testAuth})
 	defer server.Close()
 	r := request()
 	r.Stream = true
@@ -328,7 +335,7 @@ func TestHTTPClientDisconnectCancelsSourceAndCleansUp(t *testing.T) {
 		close(closed)
 		return nil
 	}
-	server := httptest.NewServer(&HTTP{Service: s, Key: testKey})
+	server := httptest.NewServer(&HTTP{Service: s, Authorize: testAuth})
 	defer server.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	r := request()
@@ -367,7 +374,7 @@ func TestHTTPClientDisconnectCancelsSourceAndCleansUp(t *testing.T) {
 
 func TestHTTPCachedRetryAndScopedDeletePreserveConversationIdentity(t *testing.T) {
 	s, f, b := newFixture(t)
-	server := httptest.NewServer(&HTTP{Service: s, Key: testKey})
+	server := httptest.NewServer(&HTTP{Service: s, Authorize: testAuth})
 	defer server.Close()
 	r := request()
 	first := postRequest(t, server, context.Background(), r)
@@ -389,7 +396,7 @@ func TestHTTPCachedRetryAndScopedDeletePreserveConversationIdentity(t *testing.T
 	for _, tc := range []struct {
 		model  string
 		status int
-	}{{"not-owned", 204}, {r.Model, 204}, {r.Model, 204}} {
+	}{{"not-owned", 403}, {r.Model, 204}, {r.Model, 204}} {
 		req, _ := http.NewRequest(http.MethodDelete, server.URL+"/v1/conversations/"+r.ConversationID+"?model="+tc.model, nil)
 		req.Header.Set("Authorization", "Bearer "+testKey)
 		res, err := server.Client().Do(req)

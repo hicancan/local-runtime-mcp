@@ -1,15 +1,22 @@
 ## Copy this file to local-runtime-mcp.yaml beside lrmcp.
 ## Choose entry points explicitly, for example:
-## lrmcp serve --transport http --tunnel openai --tunnel cloudflare
+##   lrmcp serve --transport local
+##   lrmcp serve --transport http --tunnel openai --tunnel cloudflare
+##   lrmcp serve --transport stdio   # auto-attaches to running local daemon on 127.0.0.1:9317
 
+# Surface B: Browser extension bridge (loopback only, chrome-extension:// Origin only)
 browser:
   listen: 127.0.0.1:9315
   token: "replace-with-a-random-token-of-at-least-32-characters"
 
-openai:
-  tunnel_id: "replace-with-your-openai-tunnel-id"
-  api_key: "replace-with-your-openai-tunnel-api-key"
+# Surface A: Local-only plane (loopback only, never tunneled, rejects Origin & proxy headers)
+# Serves same-host /mcp (with LocalApps & stdio thin-proxy attach), /v1/*, and /capabilities/*
+local:
+  listen: 127.0.0.1:9317
+  # Generate with: lrmcp setup local
+  token: "replace-with-a-different-random-local-token-at-least-32-characters"
 
+# Surface C: Public / tunnel-facing MCP gateway (never serves /v1 or LocalApps)
 http:
   listen: 127.0.0.1:9316
   public_host: mcp.example.com
@@ -26,35 +33,21 @@ http:
   #       redirect_uris:
   #         - "https://client.example.com/callback"
 
+openai:
+  tunnel_id: "replace-with-your-openai-tunnel-id"
+  api_key: "replace-with-your-openai-tunnel-api-key"
+
 cloudflare:
   tunnel_token: "replace-with-your-cloudflare-managed-tunnel-token"
 
-# Registered tools are same-named JSON + JS pairs in this file tree.
+# Registered tools are same-named JSON + JS pairs (page tools) or JSON command bindings (local apps).
 # Relative paths resolve beside this configuration, not the launch directory.
 capabilities:
   directory: capabilities
-  # Each grant names a site: https://hicancan.top covers every https subdomain of it. A local address or an
-  # explicit port stays exact (http://127.0.0.1:4321). The extension's L panel edits this list for you.
-  web:
-    - site: https://hicancan.top
-      models: [deepseek-web]
-      # Generic page tools can be granted separately, at owner-fixed target URLs:
-      # capabilities:
-      #   example.read: https://example.com/account
-      #   icourse.outline: "https://www.icourse163.org/learn/COURSE#/learn/content"
-  # Opt in when serving HTTP, for a native app on the same computer only.
-  # Grant targets come from the site above. Only read-only tools are listed.
-  # native:
-  #   listen: 127.0.0.1:9317
-  #   key: "replace-with-a-separate-random-key-of-at-least-32-characters"
-  #        # Or set LOCAL_RUNTIME_MCP_NATIVE_CAPABILITY_KEY when starting lrmcp.
-  #   site: https://hicancan.top
-  #   browser_id: "owner-selected-profile-id" # Optional if one profile is online.
 
-# Only enable models you want to serve. This key grants model use only, never MCP.
-# LOCAL_RUNTIME_MCP_MODEL_KEY can supply it to one child process instead of YAML.
+# Registered browser-backed models projected from start/read/stop page capabilities.
+# Access is granted per website (grants.web) or per local client (grants.clients).
 models:
-  key: "replace-with-a-different-random-model-key-at-least-32-characters"
   items:
     - id: deepseek-web
       title: DeepSeek 网页
@@ -63,3 +56,26 @@ models:
       read: deepseek.read
       stop: deepseek.stop
       timeout_seconds: 300
+
+# Unified owner grants across websites and same-computer native clients.
+grants:
+  # Browser websites authenticate through the extension's real top-level Origin (zero page secrets).
+  # The extension's toolbar L panel edits this list live.
+  web:
+    - site: https://hicancan.top
+      use: true
+      models: [deepseek-web]
+      # capabilities:
+      #   icourse.outline: "https://www.icourse163.org/learn/COURSE#/learn/content"
+  # Same-computer native clients authenticate on 127.0.0.1:9317 with one scoped token each.
+  # Generate with: lrmcp setup client --id studev-win --model deepseek-web
+  # clients:
+  #   - id: studev-win
+  #     token: "replace-with-a-separate-random-token-of-at-least-32-characters"
+  #     browser_id: "owner-selected-profile-id" # Optional when one profile is online.
+  #     models: [deepseek-web]
+  #     capabilities:
+  #       icourse.outline: "https://www.icourse163.org/learn/COURSE#/learn/content"
+  #   - id: harness
+  #     token: "replace-with-another-random-token-of-at-least-32-characters"
+  #     models: [deepseek-web]

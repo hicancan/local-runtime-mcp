@@ -13,8 +13,8 @@ dependencies, then mount its absolute `index.mjs` path in the existing profile:
       name: /absolute/path/to/local-runtime-plugin/index.mjs
       config:
         provider: local-runtime
-        baseURL: http://127.0.0.1:9316/v1
-        apiKeyEnv: LOCAL_RUNTIME_MCP_MODEL_KEY
+        baseURL: http://127.0.0.1:9317/v1
+        apiKeyEnv: LOCAL_RUNTIME_MCP_CLIENT_TOKEN
         models:
           - id: deepseek-web
             name: DeepSeek browser session

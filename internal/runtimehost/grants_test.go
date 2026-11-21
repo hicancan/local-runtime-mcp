@@ -35,7 +35,7 @@ func fixtureMachine(t *testing.T) *machineTools {
 
 func TestGrantChangesGoBackToTheFileAndNothingElse(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "local-runtime-mcp.yaml")
-	original := "browser:\n  token: \"kept-browser-token-0123456789abcdefghij\"\ncapabilities:\n  web:\n    - site: https://old.example\n      models: []\n"
+	original := "browser:\n  token: \"kept-browser-token-0123456789abcdefghij\"\ngrants:\n  web:\n    - site: https://old.example\n      models: []\n"
 	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -57,8 +57,8 @@ func TestGrantChangesGoBackToTheFileAndNothingElse(t *testing.T) {
 	if saved.Browser.Token != "kept-browser-token-0123456789abcdefghij" {
 		t.Fatalf("the rest of the file changed: token %q", saved.Browser.Token)
 	}
-	if len(saved.Capabilities.Web) != 1 || saved.Capabilities.Web[0].Site != "https://studev.example" || saved.Capabilities.Web[0].Tools[0] != "echo_read" {
-		t.Fatalf("grants not written back: %+v", saved.Capabilities.Web)
+	if len(saved.Grants.Web) != 1 || saved.Grants.Web[0].Site != "https://studev.example" || saved.Grants.Web[0].Tools[0] != "echo_read" {
+		t.Fatalf("grants not written back: %+v", saved.Grants.Web)
 	}
 	if err := store.set(config.WebGrant{Site: "https://studev.example"}); err != nil {
 		t.Fatal(err)
@@ -107,7 +107,7 @@ func TestLentMachineToolsAreListedWithAnnotationsAndRun(t *testing.T) {
 
 func TestSwitchesAreKeptWithNothingTickedAndProvidingGuardsPageTools(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "local-runtime-mcp.yaml")
-	if err := os.WriteFile(path, []byte("capabilities:\n  web: []\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("grants:\n  web: []\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
@@ -133,8 +133,8 @@ func TestSwitchesAreKeptWithNothingTickedAndProvidingGuardsPageTools(t *testing.
 		t.Fatal(err)
 	}
 	saved, _ := config.Load(path)
-	if len(saved.Capabilities.Web) != 2 {
-		t.Fatalf("switches without ticks were not kept: %+v", saved.Capabilities.Web)
+	if len(saved.Grants.Web) != 2 {
+		t.Fatalf("switches without ticks were not kept: %+v", saved.Grants.Web)
 	}
 	lend := config.WebGrant{Site: "https://hicancan.top", Use: true, Capabilities: map[string]string{"icourse.outline": testCourse}}
 	if err := store.set(lend); err != nil {

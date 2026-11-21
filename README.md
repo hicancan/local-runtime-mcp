@@ -78,25 +78,30 @@ The Host creates one Process Manager, Filesystem Service, Browser Bridge, and Co
 ```text
 lrmcp
 ├── serve
-│   ├── --transport stdio|http
+│   ├── --transport stdio|local|http
 │   └── --tunnel openai|cloudflare   (repeatable with HTTP)
 ├── setup
 │   ├── browser
+│   ├── local
+│   ├── client
 │   └── oauth
 ├── version
 └── help
 ```
 
-`serve` starts one Host. Select `--transport stdio` for local process pipes or `--transport http` for HTTP connectivity. With HTTP, repeat `--tunnel` to enable both providers. Saved credentials configure a provider; the command selects whether it runs.
+`serve` starts one Host (or attaches `stdio` as a stateless thin proxy when a local daemon is already listening on `127.0.0.1:9317`). Select `--transport local` for the local-only daemon (`9317` + `9315`), `--transport stdio` for local MCP clients, or `--transport http` to also open the public/tunnel-facing gateway (`9316`, remote `/mcp` and OAuth only—never `/v1` or `LocalApps`).
 
 | Command | Connection and credentials |
 | --- | --- |
-| `lrmcp serve --transport stdio` | Standard MCP process pipes; the parent process supplies access. |
-| `lrmcp serve --transport http` | Direct loopback Streamable HTTP using the configured public-client authentication mode. |
+| `lrmcp serve --transport stdio` | Standard MCP process pipes; automatically attaches as a thin proxy when the local daemon on `127.0.0.1:9317` is running (shares browser, desktop gate, `LocalApps`, and live `tools/list_changed`). |
+| `lrmcp serve --transport local` | Local-only daemon serving `127.0.0.1:9317` (`/mcp`, `/v1`, `/capabilities`) and `127.0.0.1:9315` (browser bridge), with no public port. |
+| `lrmcp serve --transport http` | Serves the local-only plane (when configured) alongside the public loopback HTTP gateway (`127.0.0.1:9316/mcp`). |
 | `lrmcp serve --transport http --tunnel openai` | Official OpenAI forwarding to a private loopback MCP endpoint; configure the tunnel ID and API key. |
-| `lrmcp serve --transport http --tunnel cloudflare` | Official `cloudflared` companion forwards to authenticated loopback HTTP. |
-| `lrmcp serve --transport http --tunnel openai --tunnel cloudflare` | Both providers reach the same Host and resources. |
+| `lrmcp serve --transport http --tunnel cloudflare` | Official `cloudflared` companion forwards to public loopback HTTP (`127.0.0.1:9316`). |
+| `lrmcp serve --transport http --tunnel openai --tunnel cloudflare` | Both remote providers and all local clients share one Host and its resources. |
 | `lrmcp setup browser` | Generate bridge credentials and extract/configure the extension. |
+| `lrmcp setup local` | Generate `local.token` for multi-client `stdio` sharing on `127.0.0.1:9317`. |
+| `lrmcp setup client --id NAME [--model ID]` | Register a scoped local native client in `grants.clients` (`--show` displays credentials). |
 | `lrmcp setup oauth --client-name NAME --redirect-uri URI` | Register an OAuth client with its exact callback URI and generate credentials. |
 | `lrmcp setup oauth --show` | Display existing OAuth credentials deliberately in the local terminal. |
 | `lrmcp version` | Print the executable version. |
@@ -441,6 +446,9 @@ See [the connection guide](docs/connections.md) for the complete setup sequence,
 | --- | --- |
 | `LOCAL_RUNTIME_MCP_BROWSER_LISTEN` | `browser.listen` |
 | `LOCAL_RUNTIME_MCP_BROWSER_TOKEN` | `browser.token` |
+| `LOCAL_RUNTIME_MCP_LOCAL_LISTEN` | `local.listen` |
+| `LOCAL_RUNTIME_MCP_LOCAL_TOKEN` | `local.token` |
+| `LOCAL_RUNTIME_MCP_CLIENT_TOKEN` / `LOCAL_RUNTIME_MCP_CLIENT_TOKEN_<ID>` | `grants.clients[].token` |
 | `LOCAL_RUNTIME_MCP_OPENAI_TUNNEL_ID` | `openai.tunnel_id` |
 | `LOCAL_RUNTIME_MCP_OPENAI_API_KEY` | `openai.api_key` |
 | `LOCAL_RUNTIME_MCP_HTTP_LISTEN` | `http.listen` |

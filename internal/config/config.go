@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/hicancan/local-runtime-mcp/internal/oauth"
@@ -17,13 +18,16 @@ const (
 	FileName          = "local-runtime-mcp.yaml"
 	DefaultBrowser    = "127.0.0.1:9315"
 	DefaultHTTP       = "127.0.0.1:9316"
-	DefaultNativeHTTP = "127.0.0.1:9317"
+	DefaultLocal      = "127.0.0.1:9317"
 	EnvironmentPrefix = "LOCAL_RUNTIME_MCP_"
 )
 
 const (
 	EnvBrowserListen         = EnvironmentPrefix + "BROWSER_LISTEN"
 	EnvBrowserToken          = EnvironmentPrefix + "BROWSER_TOKEN"
+	EnvLocalListen           = EnvironmentPrefix + "LOCAL_LISTEN"
+	EnvLocalToken            = EnvironmentPrefix + "LOCAL_TOKEN"
+	EnvClientToken           = EnvironmentPrefix + "CLIENT_TOKEN"
 	EnvOpenAITunnelID        = EnvironmentPrefix + "OPENAI_TUNNEL_ID"
 	EnvOpenAIAPIKey          = EnvironmentPrefix + "OPENAI_API_KEY"
 	EnvHTTPListen            = EnvironmentPrefix + "HTTP_LISTEN"
@@ -33,36 +37,60 @@ const (
 	EnvOAuthOwnerToken       = EnvironmentPrefix + "OAUTH_OWNER_TOKEN"
 	EnvCloudflareTunnelToken = EnvironmentPrefix + "CLOUDFLARE_TUNNEL_TOKEN"
 	EnvCloudflared           = EnvironmentPrefix + "CLOUDFLARED"
-	EnvModelKey              = EnvironmentPrefix + "MODEL_KEY"
-	EnvNativeCapabilityKey   = EnvironmentPrefix + "NATIVE_CAPABILITY_KEY"
 )
+
+var validClientIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+
+// ValidClientID reports whether id is a valid local client identifier.
+func ValidClientID(id string) bool {
+	return validClientIDPattern.MatchString(id)
+}
+
+// ClientTokenEnvVar returns the per-client environment variable name for id.
+func ClientTokenEnvVar(id string) string {
+	normalized := strings.ToUpper(strings.ReplaceAll(id, "-", "_"))
+	return EnvClientToken + "_" + normalized
+}
 
 // Config is the complete persistent configuration for one portable runtime.
 // It lives beside the executable as local-runtime-mcp.yaml.
 type Config struct {
 	Browser      Browser      `yaml:"browser,omitempty"`
+	Local        Local        `yaml:"local,omitempty"`
 	OpenAI       OpenAI       `yaml:"openai,omitempty"`
 	HTTP         HTTP         `yaml:"http,omitempty"`
 	Cloudflare   Cloudflare   `yaml:"cloudflare,omitempty"`
 	Capabilities Capabilities `yaml:"capabilities,omitempty"`
 	Models       Models       `yaml:"models,omitempty"`
+	Grants       Grants       `yaml:"grants,omitempty"`
 	// Path is where this configuration was read from, so owner edits made while running (web grants) go back there.
 	Path string `yaml:"-"`
 }
 
-type Capabilities struct {
-	Directory string                 `yaml:"directory,omitempty"`
-	Web       []WebGrant             `yaml:"web,omitempty"`
-	Native    *NativeCapabilityGrant `yaml:"native,omitempty"`
+// Local configures the local-only control and client plane (never exposed through tunnels).
+type Local struct {
+	Listen string `yaml:"listen,omitempty"`
+	Token  string `yaml:"token,omitempty"`
 }
 
-// NativeCapabilityGrant reuses the fixed targets of one configured web grant.
-// The native listener accepts only read-only browser capabilities.
-type NativeCapabilityGrant struct {
-	Listen    string `yaml:"listen,omitempty"`
-	Key       string `yaml:"key,omitempty"`
-	Site      string `yaml:"site"`
-	BrowserID string `yaml:"browser_id,omitempty"`
+type Capabilities struct {
+	Directory string `yaml:"directory,omitempty"`
+}
+
+// Grants defines owner authorization across both browser websites and local native clients.
+type Grants struct {
+	Web     []WebGrant    `yaml:"web,omitempty"`
+	Clients []ClientGrant `yaml:"clients,omitempty"`
+}
+
+// ClientGrant authorizes one same-computer native client (such as StuDev Windows or Harness)
+// on the local-only plane with its own scoped token. It never grants machine MCP control.
+type ClientGrant struct {
+	ID           string            `yaml:"id"`
+	Token        string            `yaml:"token,omitempty"`
+	BrowserID    string            `yaml:"browser_id,omitempty"`
+	Models       []string          `yaml:"models,omitempty"`
+	Capabilities map[string]string `yaml:"capabilities,omitempty"`
 }
 
 // A web page selects a named capability, never a browser tab or target URL.
@@ -84,7 +112,6 @@ type WebGrant struct {
 }
 
 type Models struct {
-	Key   string         `yaml:"key,omitempty"`
 	Items []BrowserModel `yaml:"items,omitempty"`
 }
 
@@ -127,6 +154,8 @@ type Cloudflare struct {
 type Overrides struct {
 	BrowserListen         string
 	BrowserToken          string
+	LocalListen           string
+	LocalToken            string
 	OpenAITunnelID        string
 	OpenAIAPIKey          string
 	HTTPListen            string
@@ -141,6 +170,7 @@ type Overrides struct {
 func Default() *Config {
 	return &Config{
 		Browser: Browser{Listen: DefaultBrowser},
+		Local:   Local{Listen: DefaultLocal},
 		HTTP:    HTTP{Listen: DefaultHTTP, Auth: "bearer"},
 	}
 }
@@ -273,6 +303,8 @@ func applyEnvironment(cfg *Config, lookup func(string) (string, bool)) {
 	}
 	assign(EnvBrowserListen, &cfg.Browser.Listen)
 	assign(EnvBrowserToken, &cfg.Browser.Token)
+	assign(EnvLocalListen, &cfg.Local.Listen)
+	assign(EnvLocalToken, &cfg.Local.Token)
 	assign(EnvOpenAITunnelID, &cfg.OpenAI.TunnelID)
 	assign(EnvOpenAIAPIKey, &cfg.OpenAI.APIKey)
 	assign(EnvHTTPListen, &cfg.HTTP.Listen)
@@ -282,9 +314,13 @@ func applyEnvironment(cfg *Config, lookup func(string) (string, bool)) {
 	assign(EnvOAuthOwnerToken, &cfg.HTTP.OAuth.OwnerToken)
 	assign(EnvCloudflareTunnelToken, &cfg.Cloudflare.TunnelToken)
 	assign(EnvCloudflared, &cfg.Cloudflare.Binary)
-	assign(EnvModelKey, &cfg.Models.Key)
-	if cfg.Capabilities.Native != nil {
-		assign(EnvNativeCapabilityKey, &cfg.Capabilities.Native.Key)
+	for i := range cfg.Grants.Clients {
+		if len(cfg.Grants.Clients) == 1 {
+			assign(EnvClientToken, &cfg.Grants.Clients[i].Token)
+		}
+		if cfg.Grants.Clients[i].ID != "" {
+			assign(ClientTokenEnvVar(cfg.Grants.Clients[i].ID), &cfg.Grants.Clients[i].Token)
+		}
 	}
 }
 
@@ -296,6 +332,8 @@ func applyOverrides(cfg *Config, overrides Overrides) {
 	}
 	assign(overrides.BrowserListen, &cfg.Browser.Listen)
 	assign(overrides.BrowserToken, &cfg.Browser.Token)
+	assign(overrides.LocalListen, &cfg.Local.Listen)
+	assign(overrides.LocalToken, &cfg.Local.Token)
 	assign(overrides.OpenAITunnelID, &cfg.OpenAI.TunnelID)
 	assign(overrides.OpenAIAPIKey, &cfg.OpenAI.APIKey)
 	assign(overrides.HTTPListen, &cfg.HTTP.Listen)
@@ -311,6 +349,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Browser.Listen == "" {
 		cfg.Browser.Listen = DefaultBrowser
 	}
+	if cfg.Local.Listen == "" {
+		cfg.Local.Listen = DefaultLocal
+	}
 	if cfg.HTTP.Listen == "" {
 		cfg.HTTP.Listen = DefaultHTTP
 	}
@@ -319,8 +360,7 @@ func applyDefaults(cfg *Config) {
 	}
 }
 
-// ValidateBrowser validates the machine component when it is started. Optional
-// connection settings are validated by the selected connection, not by parsing.
+// ValidateBrowser validates the browser bridge configuration when active.
 func ValidateBrowser(cfg Browser) error {
 	if cfg.Token == "" {
 		return nil
@@ -331,8 +371,25 @@ func ValidateBrowser(cfg Browser) error {
 	if err := validateLoopback("browser", cfg.Listen); err != nil {
 		return err
 	}
-	if cfg.Token != "" && len(cfg.Token) < 32 {
+	if len(cfg.Token) < 32 {
 		return errors.New("browser token must contain at least 32 characters")
+	}
+	return nil
+}
+
+// ValidateLocal validates the local-only plane configuration when active.
+func ValidateLocal(cfg Local, hasClients bool) error {
+	if cfg.Token == "" && !hasClients {
+		return nil
+	}
+	if cfg.Listen == "" {
+		cfg.Listen = DefaultLocal
+	}
+	if err := validateLoopback("local", cfg.Listen); err != nil {
+		return err
+	}
+	if cfg.Token != "" && (len(cfg.Token) < 32 || strings.ContainsAny(cfg.Token, " \t\r\n")) {
+		return errors.New("local token must contain at least 32 characters without whitespace")
 	}
 	return nil
 }

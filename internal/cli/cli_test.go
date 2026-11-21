@@ -31,7 +31,8 @@ func TestHelpDescribesConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, value := range []string{
-		"serve --transport stdio", "serve --transport http", "--tunnel openai", "--tunnel cloudflare", "setup browser", "setup oauth", config.FileName,
+		"serve --transport stdio", "serve --transport local", "serve --transport http", "--tunnel openai", "--tunnel cloudflare",
+		"setup browser", "setup local", "setup client", "setup oauth", config.FileName,
 		"command line > LOCAL_RUNTIME_MCP_* environment > YAML > defaults",
 		"https://github.com/hicancan/local-runtime-mcp", "GNU AGPL v3.0 only",
 	} {

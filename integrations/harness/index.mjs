@@ -7,8 +7,8 @@ export const name = 'llm-local-runtime';
 export const inject = ['llm'];
 export const Config = z.object({
   provider: z.string().default('local-runtime'),
-  baseURL: z.string().default('http://127.0.0.1:9316/v1'),
-  apiKeyEnv: z.string().role('credential-ref').default('LOCAL_RUNTIME_MCP_MODEL_KEY'),
+  baseURL: z.string().default('http://127.0.0.1:9317/v1'),
+  apiKeyEnv: z.string().role('credential-ref').default('LOCAL_RUNTIME_MCP_CLIENT_TOKEN'),
   models: z.array(z.object({ id: z.string().required(), name: z.string() })).min(1).required(),
 });
 const noReplay = resolveRetryPolicy({ mode: 'normal', maxRetries: 0 }, 'local-runtime');

@@ -164,11 +164,11 @@ func (s *grantStore) set(g config.WebGrant) error {
 		if err != nil {
 			return err
 		}
-		raw.Capabilities.Web = make([]config.WebGrant, 0, len(next))
+		raw.Grants.Web = make([]config.WebGrant, 0, len(next))
 		for _, kept := range next {
-			raw.Capabilities.Web = append(raw.Capabilities.Web, kept)
+			raw.Grants.Web = append(raw.Grants.Web, kept)
 		}
-		sort.Slice(raw.Capabilities.Web, func(i, j int) bool { return raw.Capabilities.Web[i].Site < raw.Capabilities.Web[j].Site })
+		sort.Slice(raw.Grants.Web, func(i, j int) bool { return raw.Grants.Web[i].Site < raw.Grants.Web[j].Site })
 		if _, err := config.Save(s.path, raw); err != nil {
 			return fmt.Errorf("save grants: %w", err)
 		}

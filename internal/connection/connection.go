@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/hicancan/local-runtime-mcp/internal/config"
+	"github.com/hicancan/local-runtime-mcp/internal/mcpserver"
 	"github.com/hicancan/local-runtime-mcp/internal/runtimehost"
 	"github.com/hicancan/local-runtime-mcp/internal/transport"
 	cloudflaretunnel "github.com/hicancan/local-runtime-mcp/internal/tunnel/cloudflare"
@@ -24,10 +25,10 @@ type Options struct {
 }
 
 func (o Options) Validate() error {
-	if o.Transport != "stdio" && o.Transport != "http" {
-		return errors.New("--transport must be stdio or http")
+	if o.Transport != "stdio" && o.Transport != "local" && o.Transport != "http" {
+		return errors.New("--transport must be stdio, local, or http")
 	}
-	if o.Transport == "stdio" && len(o.Tunnels) != 0 {
+	if o.Transport != "http" && len(o.Tunnels) != 0 {
 		return errors.New("tunnels require --transport http")
 	}
 	seen := make(map[string]bool)
@@ -57,7 +58,8 @@ type component struct {
 	run  func(context.Context) error
 }
 
-// Run creates the resource owner once; credentials never implicitly enable an entrance.
+// Run creates the resource owner once (or attaches stdio as a thin proxy to an
+// already-running local daemon); credentials never implicitly enable public tunnels.
 func Run(ctx context.Context, cfg *config.Config, options Options, stdin io.Reader, stdout, stderr io.Writer) (result error) {
 	if err := options.Validate(); err != nil {
 		return err
@@ -81,63 +83,121 @@ func Run(ctx context.Context, cfg *config.Config, options Options, stdin io.Read
 			return err
 		}
 	}
-	host, err := runtimehost.Start(ctx, cfg, options.Transport == "stdio")
+
+	hasLocal := cfg.Local.Token != "" || len(cfg.Grants.Clients) > 0
+	if options.Transport == "local" && !hasLocal {
+		return errors.New("local transport requires local.token or grants.clients; run lrmcp setup local")
+	}
+
+	// In stdio mode, if a local daemon is already running and accepts our local
+	// owner token, attach cleanly as a stateless thin proxy instead of spawning a
+	// competing Host or contending for the browser bridge port.
+	if options.Transport == "stdio" && cfg.Local.Token != "" {
+		if err := config.ValidateLocal(cfg.Local, len(cfg.Grants.Clients) > 0); err != nil {
+			return err
+		}
+		if transport.ProbeLocal(ctx, cfg.Local.Listen, cfg.Local.Token) {
+			fmt.Fprintf(stderr, "[stdio] attached to running local runtime at http://%s/mcp\n", cfg.Local.Listen)
+			return normalizeCancellation(transport.ProxyStdioToLocal(ctx, cfg.Local.Listen, cfg.Local.Token, stdin, stdout))
+		}
+	}
+
+	host, err := runtimehost.Start(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	defer func() {
+	closeHost := func() error {
 		shutdown, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		result = errors.Join(result, host.Close(shutdown))
-	}()
-	if options.Transport == "stdio" {
-		return normalizeCancellation(transport.ServeStdio(ctx, host.Server(), stdin, stdout))
+		return host.Close(shutdown)
 	}
+	closed := false
+	defer func() {
+		if !closed {
+			result = errors.Join(result, closeHost())
+		}
+	}()
+
+	if options.Transport == "stdio" {
+		if hasLocal {
+			localServer, localErr := newLocalHTTP(host, cfg)
+			if localErr != nil {
+				// If another stdio instance won the cold-start race at the same instant,
+				// release this Host and attach as a thin proxy to the winner.
+				if cfg.Local.Token != "" && transport.ProbeLocal(ctx, cfg.Local.Listen, cfg.Local.Token) {
+					closed = true
+					_ = closeHost()
+					fmt.Fprintf(stderr, "[stdio] attached to running local runtime at http://%s/mcp\n", cfg.Local.Listen)
+					return normalizeCancellation(transport.ProxyStdioToLocal(ctx, cfg.Local.Listen, cfg.Local.Token, stdin, stdout))
+				}
+				return localErr
+			}
+			localCtx, stopLocal := context.WithCancel(ctx)
+			localDone := make(chan error, 1)
+			go func() { localDone <- normalizeCancellation(localServer.Run(localCtx)) }()
+			stdioErr := normalizeCancellation(transport.ServeStdio(ctx, host.LocalServer(), stdin, stdout))
+			stopLocal()
+			return errors.Join(stdioErr, <-localDone)
+		}
+		return normalizeCancellation(transport.ServeStdio(ctx, host.LocalServer(), stdin, stdout))
+	}
+
 	log := &lockedWriter{writer: stderr}
 	var components []component
-	// OpenAI owns its private HTTP hop. Direct HTTP and Cloudflare use the
-	// public-auth listener. Every entrance uses the same host.Server().
-	if len(options.Tunnels) == 0 || options.has("cloudflare") {
-		httpConfig, err := publicHTTPConfig(cfg)
+
+	if hasLocal {
+		localServer, err := newLocalHTTP(host, cfg)
 		if err != nil {
 			return err
 		}
-		httpConfig.Models = host.ModelsHandler()
-		server, err := transport.NewHTTP(host.Server(), httpConfig)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(log, "[http] Streamable HTTP listening on http://%s/mcp (auth=%s)\n", server.Address(), cfg.HTTP.Auth)
-		components = append(components, component{"http", server.Run})
+		fmt.Fprintf(log, "[local] listening on http://%s (mcp=%t, clients=%d)\n", localServer.Address(), cfg.Local.Token != "", len(cfg.Grants.Clients))
+		components = append(components, component{"local", localServer.Run})
 	}
-	if native := cfg.Capabilities.Native; native != nil {
-		components = append(components, component{"native-capabilities", func(ctx context.Context) error {
-			address := native.Listen
-			if address == "" {
-				address = config.DefaultNativeHTTP
-			}
-			server, err := transport.NewNativeCapabilityHTTP(address, native.Key, host.NativeCapabilitiesHandler())
+
+	if options.Transport == "http" {
+		// OpenAI owns its private HTTP hop. Direct HTTP and Cloudflare use the
+		// public-auth listener on host.Server() (remote-safe: no LocalApps, no /v1).
+		if len(options.Tunnels) == 0 || options.has("cloudflare") {
+			httpConfig, err := publicHTTPConfig(cfg)
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(log, "[native-capabilities] listening locally on http://%s/capabilities\n", server.Address())
-			return server.Run(ctx)
-		}})
-	}
-	if options.has("openai") {
-		components = append(components, component{"openai", func(ctx context.Context) error {
-			return openaitunnel.Run(ctx, host.Server(), openaitunnel.Config{TunnelID: cfg.OpenAI.TunnelID, APIKey: cfg.OpenAI.APIKey})
-		}})
-	}
-	if options.has("cloudflare") {
-		components = append(components, component{"cloudflare", func(ctx context.Context) error {
-			return cloudflaretunnel.Run(ctx, cloudflaretunnel.Config{
-				Binary: cfg.Cloudflare.Binary, Token: cfg.Cloudflare.TunnelToken,
-				Stdout: log, Stderr: log,
-			})
-		}})
+			server, err := transport.NewHTTP(host.Server(), httpConfig)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(log, "[http] Streamable HTTP listening on http://%s/mcp (auth=%s)\n", server.Address(), cfg.HTTP.Auth)
+			components = append(components, component{"http", server.Run})
+		}
+		if options.has("openai") {
+			components = append(components, component{"openai", func(ctx context.Context) error {
+				return openaitunnel.Run(ctx, host.Server(), openaitunnel.Config{TunnelID: cfg.OpenAI.TunnelID, APIKey: cfg.OpenAI.APIKey})
+			}})
+		}
+		if options.has("cloudflare") {
+			components = append(components, component{"cloudflare", func(ctx context.Context) error {
+				return cloudflaretunnel.Run(ctx, cloudflaretunnel.Config{
+					Binary: cfg.Cloudflare.Binary, Token: cfg.Cloudflare.TunnelToken,
+					Stdout: log, Stderr: log,
+				})
+			}})
+		}
 	}
 	return runComponents(ctx, components, log)
+}
+
+func newLocalHTTP(host *runtimehost.Host, cfg *config.Config) (*transport.HTTPServer, error) {
+	address := cfg.Local.Listen
+	if address == "" {
+		address = config.DefaultLocal
+	}
+	return transport.NewLocalHTTP(host.LocalServer(), transport.LocalConfig{
+		Listen:       address,
+		Token:        cfg.Local.Token,
+		Version:      mcpserver.Version,
+		Models:       host.LocalModelsHandler(),
+		Capabilities: host.LocalCapabilitiesHandler(),
+	})
 }
 
 func publicHTTPConfig(cfg *config.Config) (transport.HTTPConfig, error) {

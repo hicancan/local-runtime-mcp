@@ -17,22 +17,23 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// Host owns the machine-local dependencies shared by every connection mode.
-// Connections only determine how MCP messages reach this one runtime.
+// Host owns the machine-local dependencies shared by every connection plane.
+// Connections only determine how requests reach this one runtime.
 type Host struct {
-	server             *mcp.Server
-	bridge             *browser.Bridge
-	controller         computer.Controller
-	processes          *runtimeprocess.Manager
-	models             http.Handler
-	modelService       *modelapi.Service
-	nativeCapabilities http.Handler
-	cancel             context.CancelFunc
-	closeOnce          sync.Once
-	closeErr           error
+	publicServer      *mcp.Server
+	localServer       *mcp.Server
+	bridge            *browser.Bridge
+	controller        computer.Controller
+	processes         *runtimeprocess.Manager
+	localModels       http.Handler
+	modelService      *modelapi.Service
+	localCapabilities http.Handler
+	cancel            context.CancelFunc
+	closeOnce         sync.Once
+	closeErr          error
 }
 
-func Start(ctx context.Context, cfg *config.Config, localApps bool) (*Host, error) {
+func Start(ctx context.Context, cfg *config.Config) (*Host, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -42,11 +43,10 @@ func Start(ctx context.Context, cfg *config.Config, localApps bool) (*Host, erro
 	if err := config.ValidateBrowser(cfg.Browser); err != nil {
 		return nil, err
 	}
-	if err := validateWebConfig(cfg); err != nil {
+	if err := config.ValidateLocal(cfg.Local, len(cfg.Grants.Clients) > 0); err != nil {
 		return nil, err
 	}
-	nativeGrant, err := nativeCapabilityGrant(cfg)
-	if err != nil {
+	if err := validateGrantsAndCredentials(cfg); err != nil {
 		return nil, err
 	}
 	// The Host keeps resource transport alive until its ordered Close, so a
@@ -77,22 +77,28 @@ func Start(ctx context.Context, cfg *config.Config, localApps bool) (*Host, erro
 		return nil, err
 	}
 
-	var nativeCapabilities http.Handler
-	if nativeGrant != nil {
-		nativeCapabilities = nativeCapabilityHandler(*nativeGrant, cfg.Capabilities.Native.BrowserID, registry, bridge.Status)
+	var localModels, localCapabilities http.Handler
+	if len(cfg.Grants.Clients) > 0 {
+		localModels = &modelapi.HTTP{Service: models, Authorize: localModelAuthorizer(cfg.Grants.Clients)}
+		localCapabilities = localCapabilitiesHandler(cfg.Grants.Clients, registry, bridge.Status)
 	}
+
 	controller := computer.New(ctx)
 	bridge.SetDesktopGate(controller.BeginDesktopOperation)
 	processes := runtimeprocess.NewManager(ctx)
-	server := mcpserver.New(mcpserver.Dependencies{Process: processes, Filesystem: filesystem.New(), Browser: bridge, Computer: controller, Capabilities: registry, LocalApps: localApps})
-	// Websites the owner lends machine tools to reach them through this same Server.
-	machine, err := connectMachineTools(ctx, server)
+	fs := filesystem.New()
+	publicServer := mcpserver.New(mcpserver.Dependencies{Process: processes, Filesystem: fs, Browser: bridge, Computer: controller, Capabilities: registry, LocalApps: false})
+	localServer := mcpserver.New(mcpserver.Dependencies{Process: processes, Filesystem: fs, Browser: bridge, Computer: controller, Capabilities: registry, LocalApps: true})
+
+	// Websites the owner lends machine tools to reach them through the public Server
+	// (built-in machine tools only, never local app bindings).
+	machine, err := connectMachineTools(ctx, publicServer)
 	if err != nil {
 		cancel()
 		_ = bridge.Close(context.Background())
 		return nil, err
 	}
-	grants := newGrantStore(cfg.Capabilities.Web, cfg.Path, registry, models.List(), machine)
+	grants := newGrantStore(cfg.Grants.Web, cfg.Path, registry, models.List(), machine)
 	if err := grants.checkAll(grants.bySite); err != nil {
 		cancel()
 		_ = bridge.Close(context.Background())
@@ -101,24 +107,29 @@ func Start(ctx context.Context, cfg *config.Config, localApps bool) (*Host, erro
 	bridge.SetWebHandler(webHandler(grants, registry, models))
 	bridge.SetGrantHandler(grants.handle)
 	return &Host{
-		server:             server,
-		bridge:             bridge,
-		controller:         controller,
-		processes:          processes,
-		models:             &modelapi.HTTP{Service: models, Key: cfg.Models.Key},
-		modelService:       models,
-		nativeCapabilities: nativeCapabilities,
-		cancel:             cancel,
+		publicServer:      publicServer,
+		localServer:       localServer,
+		bridge:            bridge,
+		controller:        controller,
+		processes:         processes,
+		localModels:       localModels,
+		modelService:      models,
+		localCapabilities: localCapabilities,
+		cancel:            cancel,
 	}, nil
 }
 
-func (h *Host) Server() *mcp.Server { return h.server }
+// Server returns the remote-safe MCP Server (excludes LocalApps).
+func (h *Host) Server() *mcp.Server { return h.publicServer }
 
-// ModelsHandler uses its own model-only key and is never the private MCP hop.
-func (h *Host) ModelsHandler() http.Handler { return h.models }
+// LocalServer returns the same-host MCP Server (includes LocalApps).
+func (h *Host) LocalServer() *mcp.Server { return h.localServer }
 
-// NativeCapabilitiesHandler is mounted only on the dedicated local listener.
-func (h *Host) NativeCapabilitiesHandler() http.Handler { return h.nativeCapabilities }
+// LocalModelsHandler serves /v1/* only on the dedicated local-only listener.
+func (h *Host) LocalModelsHandler() http.Handler { return h.localModels }
+
+// LocalCapabilitiesHandler serves /capabilities/* only on the dedicated local-only listener.
+func (h *Host) LocalCapabilitiesHandler() http.Handler { return h.localCapabilities }
 
 func (h *Host) Close(ctx context.Context) error {
 	h.closeOnce.Do(func() {

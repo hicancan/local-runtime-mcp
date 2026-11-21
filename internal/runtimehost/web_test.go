@@ -64,20 +64,26 @@ func TestWebOriginAndModelGrants(t *testing.T) {
 func TestValidateExactOriginsAndCredentialSeparation(t *testing.T) {
 	for _, origin := range []string{"https://example.com/", "https://example.com/path", "https://example.com#fragment", "https://user@example.com", "https://*.example.com"} {
 		cfg := config.Default()
-		cfg.Capabilities.Web = []config.WebGrant{{Site: origin}}
-		if err := validateWebConfig(cfg); err == nil {
+		cfg.Grants.Web = []config.WebGrant{{Site: origin}}
+		if err := validateGrantsAndCredentials(cfg); err == nil {
 			t.Fatalf("accepted non-exact origin %s", origin)
 		}
 	}
 	cfg := config.Default()
-	cfg.Models.Key = strings.Repeat("x", 32)
-	cfg.HTTP.BearerToken = cfg.Models.Key
-	if validateWebConfig(cfg) == nil {
-		t.Fatal("machine credential accepted as model credential")
+	shared := strings.Repeat("x", 32)
+	cfg.Grants.Clients = []config.ClientGrant{{ID: "studev-win", Token: shared}}
+	cfg.HTTP.BearerToken = shared
+	if validateGrantsAndCredentials(cfg) == nil {
+		t.Fatal("machine credential accepted as client credential")
 	}
-	cfg.Models.Key = strings.Repeat("y", 32)
-	cfg.Capabilities.Web = []config.WebGrant{{Site: "http://127.0.0.1:4321"}}
-	if err := validateWebConfig(cfg); err != nil {
+	cfg.HTTP.BearerToken = ""
+	cfg.Local.Token = shared
+	if validateGrantsAndCredentials(cfg) == nil {
+		t.Fatal("local owner token accepted as client credential")
+	}
+	cfg.Local.Token = strings.Repeat("y", 32)
+	cfg.Grants.Web = []config.WebGrant{{Site: "http://127.0.0.1:4321"}}
+	if err := validateGrantsAndCredentials(cfg); err != nil {
 		t.Fatal(err)
 	}
 }

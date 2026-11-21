@@ -67,7 +67,7 @@ func sharedHTTPTestClients(t *testing.T, transportA, transportB http.RoundTrippe
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
-	host, err := Start(ctx, &config.Config{}, false)
+	host, err := Start(ctx, &config.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}

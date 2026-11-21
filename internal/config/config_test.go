@@ -24,7 +24,7 @@ func TestLoadMissingReturnsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Browser.Listen != DefaultBrowser || cfg.HTTP.Listen != DefaultHTTP {
+	if cfg.Browser.Listen != DefaultBrowser || cfg.Local.Listen != DefaultLocal || cfg.HTTP.Listen != DefaultHTTP {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
 }
@@ -123,9 +123,10 @@ func TestSaveRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "portable", FileName)
 	want := &Config{
 		Browser: Browser{Listen: "localhost:9315", Token: "0123456789abcdef0123456789abcdef"},
+		Local:   Local{Listen: "127.0.0.1:9317", Token: "fedcba9876543210fedcba9876543210"},
 		OpenAI:  OpenAI{TunnelID: "tunnel", APIKey: "key"},
 		HTTP: HTTP{
-			Listen: "127.0.0.1:9316", PublicHost: "mcp.example.com",
+			Listen: "127.0.0.1:9316", PublicHost: "mcp.example.com", Auth: "bearer",
 			BearerToken: "abcdef0123456789abcdef0123456789",
 		},
 		Cloudflare: Cloudflare{TunnelToken: "cloudflare"},

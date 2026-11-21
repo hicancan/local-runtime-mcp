@@ -14,30 +14,6 @@ import (
 	"github.com/hicancan/local-runtime-mcp/internal/modelapi"
 )
 
-func validateWebConfig(cfg *config.Config) error {
-	if cfg.Models.Key != "" && len(cfg.Models.Key) < 32 {
-		return errors.New("model key must contain at least 32 characters")
-	}
-	// A model-only key must not accidentally grant machine control.
-	if cfg.Models.Key != "" && (cfg.Models.Key == cfg.HTTP.BearerToken || cfg.Models.Key == cfg.Browser.Token || cfg.Models.Key == cfg.HTTP.OAuth.OwnerToken) {
-		return errors.New("model key must differ from machine and browser credentials")
-	}
-	seen := map[string]bool{}
-	for _, g := range cfg.Capabilities.Web {
-		if !config.ValidSite(g.Site) || seen[g.Site] {
-			return errors.New("web grants require unique sites (https://example.com, or an exact local origin)")
-		}
-		seen[g.Site] = true
-		for _, target := range g.Capabilities {
-			u, err := url.Parse(target)
-			if err != nil || u.Host == "" || u.User != nil || u.Scheme != "https" && u.Scheme != "http" {
-				return errors.New("web capability targets must be absolute HTTP(S) URLs without credentials")
-			}
-		}
-	}
-	return nil
-}
-
 func validateCapabilities(cfg *config.Config, registry *capability.Registry) error {
 	definitions := map[string]capability.Definition{}
 	for _, d := range registry.List() {
@@ -53,7 +29,7 @@ func validateCapabilities(cfg *config.Config, registry *capability.Registry) err
 			}
 		}
 	}
-	for _, g := range cfg.Capabilities.Web {
+	for _, g := range cfg.Grants.Web {
 		for _, id := range g.Models {
 			if !models[id] {
 				return errors.New("web grant refers to an unregistered model")
@@ -63,6 +39,19 @@ func validateCapabilities(cfg *config.Config, registry *capability.Registry) err
 			d, ok := definitions[name]
 			if !ok || !allowsTarget(d, target) {
 				return errors.New("web grant capability is missing or does not allow its target origin")
+			}
+		}
+	}
+	for _, c := range cfg.Grants.Clients {
+		for _, id := range c.Models {
+			if !models[id] {
+				return errors.New("local client grant refers to an unregistered model")
+			}
+		}
+		for name, target := range c.Capabilities {
+			d, ok := definitions[name]
+			if !ok || !allowsTarget(d, target) {
+				return errors.New("local client grant capability is missing or does not allow its target origin")
 			}
 		}
 	}

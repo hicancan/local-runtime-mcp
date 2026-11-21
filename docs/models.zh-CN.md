@@ -22,18 +22,18 @@ flowchart TB
 
 ## 配置与启动
 
-参照 [配置示例](../config.example.yaml) 配置 `capabilities` 和 `models`。目录相对配置文件解析；发布包附带能力文件。只有 `capabilities.web` 中列出的精确来源可以使用网页桥；网页只能指定能力名和输入。目标网址由本机配置确定，网页不能指定其他标签页、浏览器或任意脚本。
+参照 [配置示例](../config.example.yaml) 配置 `capabilities`、`models` 和 `grants`。目录相对配置文件解析；发布包附带能力文件。只有 `grants.web` 中启用了 `use: true` 的站点可以使用网页桥；网页只能指定能力名和输入。目标网址由本机配置确定，网页不能指定其他标签页、浏览器或任意脚本。
 
-`models.key` 与浏览器连接凭据、MCP 凭据必须不同。也可在单次子进程中提供 `LOCAL_RUNTIME_MCP_MODEL_KEY`。不要把模型 Key 放入网站代码；网站通过扩展 SDK 访问。
+本机原生程序（如 Harness、StuDev Windows）通过 `grants.clients` 各自持有独立的受限凭据（可用 `lrmcp setup client --id harness --model deepseek-web` 生成，也可在单次子进程中提供 `LOCAL_RUNTIME_MCP_CLIENT_TOKEN` 或 `LOCAL_RUNTIME_MCP_CLIENT_TOKEN_<ID>`）。该凭据与浏览器连接凭据、本机/公网 MCP 凭据严格隔离，绝不能调用机控工具。不要把任何客户端凭据放入网站代码；网站通过扩展 SDK 访问。
 
 ```text
-lrmcp serve --transport http
-GET  http://127.0.0.1:9316/v1/models
-POST http://127.0.0.1:9316/v1/chat/completions
-Authorization: Bearer <model-only-key>
+lrmcp serve --transport local
+GET  http://127.0.0.1:9317/v1/models
+POST http://127.0.0.1:9317/v1/chat/completions
+Authorization: Bearer <client-scoped-token>
 ```
 
-MCP 仍位于同一监听器的 `/mcp`，沿用原有独立认证。没有新增常驻服务、云项目或域名。默认只监听回环地址；已有 HTTPS 隧道可以显式承载远程客户端。
+本机专属面（默认 `127.0.0.1:9317`）永不接入公网隧道，强制拒绝浏览器 `Origin` 与反代转发头，统一承载本机 `/mcp`、`stdio` 薄代理附着、`/v1/*` 与 `/capabilities/*`。公网隧道口（默认 `127.0.0.1:9316`）仅保留远端 `/mcp` 与 OAuth，不再暴露 `/v1/*` 与 `LocalApps`。
 
 ## 模型与工具闭环
 

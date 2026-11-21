@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/hicancan/local-runtime-mcp/internal/browser"
@@ -41,15 +42,19 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return serve(ctx, args[1:], stdin, stdout, stderr, configPath)
 	case "setup":
 		if len(args) < 2 {
-			return errors.New("setup requires browser or oauth")
+			return errors.New("setup requires browser, local, client, or oauth")
 		}
 		switch args[1] {
 		case "browser":
 			return setupBrowser(args[2:], stdout, stderr, executable, configPath)
+		case "local":
+			return setupLocal(args[2:], stdout, stderr, configPath)
+		case "client":
+			return setupClient(args[2:], stdout, stderr, configPath)
 		case "oauth":
 			return setupOAuth(args[2:], stdout, stderr, configPath)
 		default:
-			return errors.New("setup requires browser or oauth")
+			return errors.New("setup requires browser, local, client, or oauth")
 		}
 	case "version":
 		if len(args) != 1 {
@@ -78,10 +83,11 @@ func (v *stringList) Set(value string) error {
 
 func serve(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, configPath string) error {
 	flags := flagSet("lrmcp serve", stderr)
-	protocol := flags.String("transport", "", "MCP transport: stdio or http (required)")
+	protocol := flags.String("transport", "", "MCP transport: stdio, local, or http (required)")
 	var tunnels stringList
 	flags.Var(&tunnels, "tunnel", "HTTP tunnel provider: openai or cloudflare; repeat to enable both")
 	browserFlags := addBrowserFlags(flags)
+	localFlags := addLocalFlags(flags)
 	httpFlags := addHTTPFlags(flags)
 	openaiID := flags.String("tunnel-id", "", "OpenAI tunnel ID")
 	openaiKey := flags.String("api-key", "", "OpenAI tunnel API key")
@@ -98,6 +104,7 @@ func serve(ctx context.Context, args []string, stdin io.Reader, stdout, stderr i
 		return err
 	}
 	overrides := browserFlags.overrides()
+	localFlags.apply(&overrides)
 	httpFlags.apply(&overrides)
 	overrides.OpenAITunnelID, overrides.OpenAIAPIKey = *openaiID, *openaiKey
 	overrides.CloudflareTunnelToken, overrides.Cloudflared = *cloudflareToken, *cloudflared
@@ -154,6 +161,123 @@ func setupBrowser(args []string, stdout, stderr io.Writer, executable, configPat
 		NextStep  string `json:"next_step"`
 	}{installed, resolvedConfig, cfg.Browser.Listen,
 		"Load or reload the extension directory at edge://extensions or chrome://extensions."})
+}
+
+func setupLocal(args []string, stdout, stderr io.Writer, configPath string) error {
+	flags := flagSet("lrmcp setup local", stderr)
+	localFlags := addLocalFlags(flags)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	stored, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	overrides := config.Overrides{}
+	localFlags.apply(&overrides)
+	cfg, err := config.Resolve(configPath, overrides)
+	if err != nil {
+		return err
+	}
+	if cfg.Local.Token == "" {
+		cfg.Local.Token, err = secret()
+		if err != nil {
+			return err
+		}
+	}
+	if err := config.ValidateLocal(cfg.Local, false); err != nil {
+		return err
+	}
+	stored.Local = cfg.Local
+	resolvedConfig, err := config.Save(configPath, stored)
+	if err != nil {
+		return err
+	}
+	return writeJSON(stdout, struct {
+		Config   string `json:"config"`
+		Address  string `json:"address"`
+		NextStep string `json:"next_step"`
+	}{resolvedConfig, cfg.Local.Listen,
+		"Run lrmcp serve --transport local (or --transport http ...) once, and point local MCP clients at lrmcp serve --transport stdio to share one runtime."})
+}
+
+func setupClient(args []string, stdout, stderr io.Writer, configPath string) error {
+	flags := flagSet("lrmcp setup client", stderr)
+	id := flags.String("id", "", "local client ID (lowercase letters, digits, - or _)")
+	show := flags.Bool("show", false, "show existing client credentials locally without changing configuration")
+	browserID := flags.String("browser-id", "", "optional browser profile ID bound to this client")
+	var models stringList
+	flags.Var(&models, "model", "registered model ID granted to this client; may be repeated")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	if !config.ValidClientID(*id) {
+		return errors.New("setup client requires a valid lowercase --id, such as studev-win or harness")
+	}
+	if *show && (len(models) != 0 || *browserID != "") {
+		return errors.New("--show does not accept --model or --browser-id")
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	index := -1
+	for i, client := range cfg.Grants.Clients {
+		if client.ID == *id {
+			index = i
+			break
+		}
+	}
+	if !*show {
+		if index < 0 {
+			tok, err := secret()
+			if err != nil {
+				return err
+			}
+			cfg.Grants.Clients = append(cfg.Grants.Clients, config.ClientGrant{ID: *id, Token: tok})
+			index = len(cfg.Grants.Clients) - 1
+		}
+		client := &cfg.Grants.Clients[index]
+		if client.Token == "" {
+			tok, err := secret()
+			if err != nil {
+				return err
+			}
+			client.Token = tok
+		}
+		for _, m := range models {
+			if !slices.Contains(client.Models, m) {
+				client.Models = append(client.Models, m)
+			}
+		}
+		slices.Sort(client.Models)
+		if *browserID != "" {
+			client.BrowserID = *browserID
+		}
+		if _, err := config.Save(configPath, cfg); err != nil {
+			return err
+		}
+	}
+	if index < 0 {
+		return errors.New("local client is not configured; run lrmcp setup client --id NAME first")
+	}
+	client := cfg.Grants.Clients[index]
+	return writeJSON(stdout, struct {
+		ClientID     string            `json:"client_id"`
+		Token        string            `json:"token"`
+		LocalURL     string            `json:"local_url"`
+		Models       []string          `json:"models,omitempty"`
+		Capabilities map[string]string `json:"capabilities,omitempty"`
+		BrowserID    string            `json:"browser_id,omitempty"`
+		NextStep     string            `json:"next_step"`
+	}{client.ID, client.Token, "http://" + cfg.Local.Listen, client.Models, client.Capabilities, client.BrowserID,
+		"Use this scoped token against http://" + cfg.Local.Listen + "/v1 and /capabilities. Keep credentials private."})
 }
 
 func setupOAuth(args []string, stdout, stderr io.Writer, configPath string) error {
@@ -256,6 +380,16 @@ func (v browserFlagValues) overrides() config.Overrides {
 	return config.Overrides{BrowserListen: *v.listen, BrowserToken: *v.token}
 }
 
+type localFlagValues struct{ listen, token *string }
+
+func addLocalFlags(flags *flag.FlagSet) localFlagValues {
+	return localFlagValues{flags.String("local-listen", "", "local-only loopback address (default 127.0.0.1:9317)"), flags.String("local-token", "", "local owner token for same-host MCP and stdio attach")}
+}
+func (v localFlagValues) apply(o *config.Overrides) {
+	o.LocalListen = *v.listen
+	o.LocalToken = *v.token
+}
+
 type httpFlagValues struct{ listen, hostname, token, auth *string }
 
 func addHTTPFlags(flags *flag.FlagSet) httpFlagValues {
@@ -284,11 +418,15 @@ func usage(writer io.Writer) {
 
 Usage:
   lrmcp serve --transport stdio [flags]
+  lrmcp serve --transport local [flags]
   lrmcp serve --transport http [flags]
   lrmcp serve --transport http --tunnel openai [flags]
   lrmcp serve --transport http --tunnel cloudflare [flags]
   lrmcp serve --transport http --tunnel openai --tunnel cloudflare [flags]
   lrmcp setup browser [flags]
+  lrmcp setup local [flags]
+  lrmcp setup client --id NAME [--model ID] [--browser-id ID]
+  lrmcp setup client --show --id NAME
   lrmcp setup oauth --client-name gemini --redirect-uri URI [flags]
   lrmcp setup oauth --show [--client-name NAME]
   lrmcp version
@@ -299,20 +437,23 @@ Configuration:
   precedence: command line > LOCAL_RUNTIME_MCP_* environment > YAML > defaults
 
 Serve flags:
-  --transport stdio|http              Required MCP transport
-  --tunnel openai|cloudflare          Repeat to attach both providers to one Host
+  --transport stdio|local|http        Required MCP transport
+  --tunnel openai|cloudflare          Repeat with --transport http to attach both providers
   --browser-listen ADDRESS
   --browser-token TOKEN
-  --listen ADDRESS                   Public-auth HTTP listener
+  --local-listen ADDRESS              Local-only plane (default 127.0.0.1:9317; never tunneled)
+  --local-token TOKEN                 Local owner token for /mcp and stdio thin-proxy attach
+  --listen ADDRESS                    Public-auth HTTP listener (default 127.0.0.1:9316)
   --hostname HOSTNAME
-  --token TOKEN                      Static Bearer authentication
+  --token TOKEN                       Static public HTTP Bearer authentication
   --http-auth bearer|oauth
   --tunnel-id ID                      OpenAI provider
   --api-key KEY                       OpenAI provider
   --tunnel-token TOKEN                Cloudflare provider
   --cloudflared PATH                  Cloudflare companion
 
-OAuth setup stores client credentials and an owner approval key beside the executable.
+Local clients share one daemon on 127.0.0.1:9317 (/mcp, /v1, /capabilities).
+Public HTTP (127.0.0.1:9316) serves remote /mcp and OAuth only, never /v1 or LocalApps.
 OpenAI retains its independently authenticated private HTTP hop.
 
 Project: https://github.com/hicancan/local-runtime-mcp
