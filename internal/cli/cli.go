@@ -9,16 +9,20 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/hicancan/local-runtime-mcp/internal/browser"
 	"github.com/hicancan/local-runtime-mcp/internal/config"
 	"github.com/hicancan/local-runtime-mcp/internal/connection"
 	"github.com/hicancan/local-runtime-mcp/internal/mcpserver"
 	"github.com/hicancan/local-runtime-mcp/internal/oauth"
+	"github.com/hicancan/local-runtime-mcp/internal/runtimehost"
+	"github.com/hicancan/local-runtime-mcp/internal/transport"
 )
 
 func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -38,8 +42,20 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return errors.New("command required; run lrmcp help")
 	}
 	switch args[0] {
+	case "daemon":
+		return daemonCmd(ctx, args[1:], stdin, stdout, stderr, executable, configPath)
+	case "start":
+		return startCmd(ctx, args[1:], stdout, stderr, executable, configPath)
+	case "stop":
+		return stopCmd(ctx, args[1:], stdout, stderr, configPath)
+	case "status":
+		return statusCmd(ctx, args[1:], stdout, stderr, configPath)
+	case "tunnel":
+		return tunnelCmd(ctx, args[1:], stdout, stderr, executable, configPath)
+	case "grant":
+		return grantCmd(ctx, args[1:], stdout, stderr, configPath)
 	case "serve":
-		return serve(ctx, args[1:], stdin, stdout, stderr, configPath)
+		return serveCmd(ctx, args[1:], stdin, stdout, stderr, executable, configPath)
 	case "setup":
 		if len(args) < 2 {
 			return errors.New("setup requires browser, local, client, or oauth")
@@ -81,11 +97,11 @@ func (v *stringList) Set(value string) error {
 	return nil
 }
 
-func serve(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, configPath string) error {
-	flags := flagSet("lrmcp serve", stderr)
-	protocol := flags.String("transport", "", "MCP transport: stdio, local, or http (required)")
+func daemonCmd(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, executable, configPath string) error {
+	flags := flagSet("lrmcp daemon", stderr)
+	enableHTTP := flags.Bool("http", false, "also open public loopback HTTP listener on startup")
 	var tunnels stringList
-	flags.Var(&tunnels, "tunnel", "HTTP tunnel provider: openai or cloudflare; repeat to enable both")
+	flags.Var(&tunnels, "tunnel", "initial remote wire: openai or cloudflare; repeat to attach both")
 	browserFlags := addBrowserFlags(flags)
 	localFlags := addLocalFlags(flags)
 	httpFlags := addHTTPFlags(flags)
@@ -99,10 +115,6 @@ func serve(ctx context.Context, args []string, stdin io.Reader, stdout, stderr i
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
 	}
-	options := connection.Options{Transport: *protocol, Tunnels: tunnels}
-	if err := options.Validate(); err != nil {
-		return err
-	}
 	overrides := browserFlags.overrides()
 	localFlags.apply(&overrides)
 	httpFlags.apply(&overrides)
@@ -111,6 +123,303 @@ func serve(ctx context.Context, args []string, stdin io.Reader, stdout, stderr i
 	cfg, err := config.Resolve(configPath, overrides)
 	if err != nil {
 		return err
+	}
+	options := connection.Options{
+		Transport:  "daemon",
+		HTTP:       *enableHTTP,
+		Tunnels:    tunnels,
+		Executable: executable,
+		Overrides:  overrides,
+	}
+	return connection.Run(ctx, cfg, options, stdin, stdout, stderr)
+}
+
+func startCmd(ctx context.Context, args []string, stdout, stderr io.Writer, executable, configPath string) error {
+	flags := flagSet("lrmcp start", stderr)
+	enableHTTP := flags.Bool("http", false, "attach public loopback HTTP wire after ensuring daemon is running")
+	var tunnels stringList
+	flags.Var(&tunnels, "tunnel", "remote wire to attach: openai or cloudflare; may be repeated")
+	ttl := flags.Duration("ttl", 0, "optional automatic expiry lease for attached wires (e.g. 2h)")
+	browserFlags := addBrowserFlags(flags)
+	localFlags := addLocalFlags(flags)
+	httpFlags := addHTTPFlags(flags)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	if *ttl < 0 {
+		return errors.New("--ttl cannot be negative")
+	}
+	overrides := browserFlags.overrides()
+	localFlags.apply(&overrides)
+	httpFlags.apply(&overrides)
+	cfg, err := config.Resolve(configPath, overrides)
+	if err != nil {
+		return err
+	}
+	spawned, err := connection.EnsureDaemon(ctx, executable, cfg, overrides)
+	if err != nil {
+		return err
+	}
+	ttlSeconds := int64(ttl.Seconds())
+	if *enableHTTP {
+		if err := transport.AdminRequest(ctx, cfg.Local.Listen, cfg.Local.Token, http.MethodPost, "/admin/tunnels/up", map[string]any{"name": "http", "ttl_seconds": ttlSeconds}, nil); err != nil {
+			return err
+		}
+	}
+	for _, name := range tunnels {
+		if err := transport.AdminRequest(ctx, cfg.Local.Listen, cfg.Local.Token, http.MethodPost, "/admin/tunnels/up", map[string]any{"name": name, "ttl_seconds": ttlSeconds}, nil); err != nil {
+			return err
+		}
+	}
+	var st connection.DaemonStatus
+	if err := transport.AdminRequest(ctx, cfg.Local.Listen, cfg.Local.Token, http.MethodGet, "/admin/status", nil, &st); err != nil {
+		return err
+	}
+	return writeJSON(stdout, map[string]any{"started": spawned, "daemon": st})
+}
+
+func stopCmd(ctx context.Context, args []string, stdout, stderr io.Writer, configPath string) error {
+	flags := flagSet("lrmcp stop", stderr)
+	localFlags := addLocalFlags(flags)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	var overrides config.Overrides
+	localFlags.apply(&overrides)
+	cfg, err := config.Resolve(configPath, overrides)
+	if err != nil {
+		return err
+	}
+	if !transport.ProbeLocal(ctx, cfg.Local.Listen, cfg.Local.Token) {
+		return writeJSON(stdout, map[string]any{"stopped": true, "was_running": false})
+	}
+	if err := transport.AdminRequest(ctx, cfg.Local.Listen, cfg.Local.Token, http.MethodPost, "/admin/shutdown", nil, nil); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if !transport.ProbeLocal(ctx, cfg.Local.Listen, cfg.Local.Token) {
+			break
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	return writeJSON(stdout, map[string]any{"stopped": true, "was_running": true})
+}
+
+func statusCmd(ctx context.Context, args []string, stdout, stderr io.Writer, configPath string) error {
+	flags := flagSet("lrmcp status", stderr)
+	localFlags := addLocalFlags(flags)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	var overrides config.Overrides
+	localFlags.apply(&overrides)
+	cfg, err := config.Resolve(configPath, overrides)
+	if err != nil {
+		return err
+	}
+	if cfg.Local.Token == "" {
+		return errors.New("local.token is not configured; run lrmcp setup local")
+	}
+	if !transport.ProbeLocal(ctx, cfg.Local.Listen, cfg.Local.Token) {
+		return writeJSON(stdout, map[string]any{"running": false, "local_listen": cfg.Local.Listen})
+	}
+	var st connection.DaemonStatus
+	if err := transport.AdminRequest(ctx, cfg.Local.Listen, cfg.Local.Token, http.MethodGet, "/admin/status", nil, &st); err != nil {
+		return err
+	}
+	return writeJSON(stdout, map[string]any{"running": true, "daemon": st})
+}
+
+func tunnelCmd(ctx context.Context, args []string, stdout, stderr io.Writer, executable, configPath string) error {
+	if len(args) < 1 {
+		return errors.New("tunnel requires up, down, or status")
+	}
+	switch args[0] {
+	case "up":
+		if len(args) < 2 || strings.HasPrefix(args[1], "-") {
+			return errors.New("tunnel up requires a wire name: openai, cloudflare, or http")
+		}
+		name := args[1]
+		flags := flagSet("lrmcp tunnel up", stderr)
+		ttl := flags.Duration("ttl", 0, "optional automatic expiry lease (e.g. 2h, 30m)")
+		localFlags := addLocalFlags(flags)
+		if err := flags.Parse(args[2:]); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 {
+			return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+		}
+		if *ttl < 0 {
+			return errors.New("--ttl cannot be negative")
+		}
+		var overrides config.Overrides
+		localFlags.apply(&overrides)
+		cfg, err := config.Resolve(configPath, overrides)
+		if err != nil {
+			return err
+		}
+		if _, err := connection.EnsureDaemon(ctx, executable, cfg, overrides); err != nil {
+			return err
+		}
+		var resp struct {
+			Tunnels []runtimehost.TunnelStatus `json:"tunnels"`
+		}
+		err = transport.AdminRequest(ctx, cfg.Local.Listen, cfg.Local.Token, http.MethodPost, "/admin/tunnels/up", map[string]any{
+			"name":        name,
+			"ttl_seconds": int64(ttl.Seconds()),
+		}, &resp)
+		if err != nil {
+			return err
+		}
+		return writeJSON(stdout, resp)
+
+	case "down":
+		if len(args) < 2 || strings.HasPrefix(args[1], "-") {
+			return errors.New("tunnel down requires a wire name: openai, cloudflare, http, or all")
+		}
+		name := args[1]
+		flags := flagSet("lrmcp tunnel down", stderr)
+		localFlags := addLocalFlags(flags)
+		if err := flags.Parse(args[2:]); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 {
+			return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+		}
+		var overrides config.Overrides
+		localFlags.apply(&overrides)
+		cfg, err := config.Resolve(configPath, overrides)
+		if err != nil {
+			return err
+		}
+		var resp struct {
+			Tunnels []runtimehost.TunnelStatus `json:"tunnels"`
+		}
+		err = transport.AdminRequest(ctx, cfg.Local.Listen, cfg.Local.Token, http.MethodPost, "/admin/tunnels/down", map[string]any{"name": name}, &resp)
+		if err != nil {
+			return err
+		}
+		return writeJSON(stdout, resp)
+
+	case "status":
+		flags := flagSet("lrmcp tunnel status", stderr)
+		localFlags := addLocalFlags(flags)
+		if err := flags.Parse(args[1:]); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 {
+			return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+		}
+		var overrides config.Overrides
+		localFlags.apply(&overrides)
+		cfg, err := config.Resolve(configPath, overrides)
+		if err != nil {
+			return err
+		}
+		var st connection.DaemonStatus
+		if err := transport.AdminRequest(ctx, cfg.Local.Listen, cfg.Local.Token, http.MethodGet, "/admin/status", nil, &st); err != nil {
+			return err
+		}
+		return writeJSON(stdout, map[string]any{"tunnels": st.Tunnels, "remote_grants": st.RemoteGrants})
+
+	default:
+		return errors.New("tunnel requires up, down, or status")
+	}
+}
+
+func grantCmd(ctx context.Context, args []string, stdout, stderr io.Writer, configPath string) error {
+	if len(args) < 2 || args[0] != "remote" {
+		return errors.New("grant requires: lrmcp grant remote <openai|http> [--read-only] [--tool NAME]")
+	}
+	target := args[1]
+	if target != "openai" && target != "http" {
+		return fmt.Errorf("unknown remote target %q; choose openai or http", target)
+	}
+	flags := flagSet("lrmcp grant remote", stderr)
+	readOnly := flags.Bool("read-only", false, "restrict this remote wire to read-only tools only")
+	var tools stringList
+	flags.Var(&tools, "tool", "allowlisted tool name (repeatable; empty allows all non-excluded tools)")
+	localFlags := addLocalFlags(flags)
+	if err := flags.Parse(args[2:]); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	var overrides config.Overrides
+	localFlags.apply(&overrides)
+	cfg, err := config.Resolve(configPath, overrides)
+	if err != nil {
+		return err
+	}
+	grant := config.RemoteGrant{ReadOnly: *readOnly, Tools: tools}
+	slices.Sort(grant.Tools)
+	grant.Tools = slices.Compact(grant.Tools)
+
+	if cfg.Local.Token != "" && transport.ProbeLocal(ctx, cfg.Local.Listen, cfg.Local.Token) {
+		var resp struct {
+			RemoteGrants config.RemoteGrants `json:"remote_grants"`
+		}
+		err := transport.AdminRequest(ctx, cfg.Local.Listen, cfg.Local.Token, http.MethodPost, "/admin/remote-grants", map[string]any{
+			"target": target,
+			"grant":  grant,
+		}, &resp)
+		if err != nil {
+			return err
+		}
+		return writeJSON(stdout, map[string]any{"live": true, "remote_grants": resp.RemoteGrants})
+	}
+
+	stored, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	if target == "openai" {
+		stored.Grants.Remote.OpenAI = grant
+	} else {
+		stored.Grants.Remote.HTTP = grant
+	}
+	if _, err := config.Save(configPath, stored); err != nil {
+		return err
+	}
+	return writeJSON(stdout, map[string]any{"live": false, "remote_grants": stored.Grants.Remote})
+}
+
+func serveCmd(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, executable, configPath string) error {
+	flags := flagSet("lrmcp serve", stderr)
+	protocol := flags.String("transport", "", "MCP transport: stdio (required)")
+	browserFlags := addBrowserFlags(flags)
+	localFlags := addLocalFlags(flags)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	if *protocol != "stdio" {
+		return errors.New("serve only accepts --transport stdio; use lrmcp daemon / lrmcp start / lrmcp tunnel up for background & remote wires")
+	}
+	overrides := browserFlags.overrides()
+	localFlags.apply(&overrides)
+	cfg, err := config.Resolve(configPath, overrides)
+	if err != nil {
+		return err
+	}
+	options := connection.Options{
+		Transport:       "stdio",
+		Executable:      executable,
+		Overrides:       overrides,
+		AutoSpawnDaemon: true,
 	}
 	return connection.Run(ctx, cfg, options, stdin, stdout, stderr)
 }
@@ -201,7 +510,7 @@ func setupLocal(args []string, stdout, stderr io.Writer, configPath string) erro
 		Address  string `json:"address"`
 		NextStep string `json:"next_step"`
 	}{resolvedConfig, cfg.Local.Listen,
-		"Run lrmcp serve --transport local (or --transport http ...) once, and point local MCP clients at lrmcp serve --transport stdio to share one runtime."})
+		"Point local MCP clients at `lrmcp serve --transport stdio` (auto-starts the detached daemon) or run `lrmcp start` / `lrmcp tunnel up openai`."})
 }
 
 func setupClient(args []string, stdout, stderr io.Writer, configPath string) error {
@@ -209,8 +518,6 @@ func setupClient(args []string, stdout, stderr io.Writer, configPath string) err
 	id := flags.String("id", "", "local client ID (lowercase letters, digits, - or _)")
 	show := flags.Bool("show", false, "show existing client credentials locally without changing configuration")
 	browserID := flags.String("browser-id", "", "optional browser profile ID bound to this client")
-	var models stringList
-	flags.Var(&models, "model", "registered model ID granted to this client; may be repeated")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -218,10 +525,10 @@ func setupClient(args []string, stdout, stderr io.Writer, configPath string) err
 		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
 	}
 	if !config.ValidClientID(*id) {
-		return errors.New("setup client requires a valid lowercase --id, such as studev-win or harness")
+		return errors.New("setup client requires a valid lowercase --id, such as studev-win")
 	}
-	if *show && (len(models) != 0 || *browserID != "") {
-		return errors.New("--show does not accept --model or --browser-id")
+	if *show && *browserID != "" {
+		return errors.New("--show does not accept --browser-id")
 	}
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -251,12 +558,6 @@ func setupClient(args []string, stdout, stderr io.Writer, configPath string) err
 			}
 			client.Token = tok
 		}
-		for _, m := range models {
-			if !slices.Contains(client.Models, m) {
-				client.Models = append(client.Models, m)
-			}
-		}
-		slices.Sort(client.Models)
 		if *browserID != "" {
 			client.BrowserID = *browserID
 		}
@@ -272,12 +573,11 @@ func setupClient(args []string, stdout, stderr io.Writer, configPath string) err
 		ClientID     string            `json:"client_id"`
 		Token        string            `json:"token"`
 		LocalURL     string            `json:"local_url"`
-		Models       []string          `json:"models,omitempty"`
 		Capabilities map[string]string `json:"capabilities,omitempty"`
 		BrowserID    string            `json:"browser_id,omitempty"`
 		NextStep     string            `json:"next_step"`
-	}{client.ID, client.Token, "http://" + cfg.Local.Listen, client.Models, client.Capabilities, client.BrowserID,
-		"Use this scoped token against http://" + cfg.Local.Listen + "/v1 and /capabilities. Keep credentials private."})
+	}{client.ID, client.Token, "http://" + cfg.Local.Listen, client.Capabilities, client.BrowserID,
+		"Use this scoped token against http://" + cfg.Local.Listen + "/capabilities. Keep credentials private."})
 }
 
 func setupOAuth(args []string, stdout, stderr io.Writer, configPath string) error {
@@ -360,7 +660,7 @@ func setupOAuth(args []string, stdout, stderr io.Writer, configPath string) erro
 		RedirectURIs []string `json:"redirect_uris"`
 		NextStep     string   `json:"next_step"`
 	}{"https://" + cfg.HTTP.PublicHost + "/mcp", client.ID, client.Secret, cfg.HTTP.OAuth.OwnerToken, client.RedirectURIs,
-		"Enter client_id and client_secret in the client. On the consent page, enter owner_token to approve full machine access. Keep these credentials private."})
+		"Enter client_id and client_secret in the client. On the consent page, enter owner_token to approve access. Keep these credentials private."})
 }
 
 func secret() (string, error) {
@@ -383,7 +683,7 @@ func (v browserFlagValues) overrides() config.Overrides {
 type localFlagValues struct{ listen, token *string }
 
 func addLocalFlags(flags *flag.FlagSet) localFlagValues {
-	return localFlagValues{flags.String("local-listen", "", "local-only loopback address (default 127.0.0.1:9317)"), flags.String("local-token", "", "local owner token for same-host MCP and stdio attach")}
+	return localFlagValues{flags.String("local-listen", "", "local-only loopback address (default 127.0.0.1:9317)"), flags.String("local-token", "", "local owner token for same-host MCP, stdio attach, and admin control")}
 }
 func (v localFlagValues) apply(o *config.Overrides) {
 	o.LocalListen = *v.listen
@@ -417,15 +717,18 @@ func usage(writer io.Writer) {
 	fmt.Fprint(writer, `Local Runtime MCP (lrmcp)
 
 Usage:
-  lrmcp serve --transport stdio [flags]
-  lrmcp serve --transport local [flags]
-  lrmcp serve --transport http [flags]
-  lrmcp serve --transport http --tunnel openai [flags]
-  lrmcp serve --transport http --tunnel cloudflare [flags]
-  lrmcp serve --transport http --tunnel openai --tunnel cloudflare [flags]
+  lrmcp serve --transport stdio [flags]              Pure stdio MCP proxy (auto-starts detached daemon)
+  lrmcp start [--http] [--tunnel openai|cloudflare] [--ttl 2h]
+  lrmcp stop                                         Gracefully stop the running daemon
+  lrmcp status                                       Inspect live daemon, browser profiles, and tunnels
+  lrmcp daemon [--http] [--tunnel openai|cloudflare] Run unified daemon in foreground
+  lrmcp tunnel up <openai|cloudflare|http> [--ttl 2h]
+  lrmcp tunnel down <openai|cloudflare|http|all>
+  lrmcp tunnel status
+  lrmcp grant remote <openai|http> [--read-only] [--tool NAME]
   lrmcp setup browser [flags]
   lrmcp setup local [flags]
-  lrmcp setup client --id NAME [--model ID] [--browser-id ID]
+  lrmcp setup client --id NAME [--browser-id ID]
   lrmcp setup client --show --id NAME
   lrmcp setup oauth --client-name gemini --redirect-uri URI [flags]
   lrmcp setup oauth --show [--client-name NAME]
@@ -436,25 +739,12 @@ Configuration:
   local-runtime-mcp.yaml beside lrmcp
   precedence: command line > LOCAL_RUNTIME_MCP_* environment > YAML > defaults
 
-Serve flags:
-  --transport stdio|local|http        Required MCP transport
-  --tunnel openai|cloudflare          Repeat with --transport http to attach both providers
-  --browser-listen ADDRESS
-  --browser-token TOKEN
-  --local-listen ADDRESS              Local-only plane (default 127.0.0.1:9317; never tunneled)
-  --local-token TOKEN                 Local owner token for /mcp and stdio thin-proxy attach
-  --listen ADDRESS                    Public-auth HTTP listener (default 127.0.0.1:9316)
-  --hostname HOSTNAME
-  --token TOKEN                       Static public HTTP Bearer authentication
-  --http-auth bearer|oauth
-  --tunnel-id ID                      OpenAI provider
-  --api-key KEY                       OpenAI provider
-  --tunnel-token TOKEN                Cloudflare provider
-  --cloudflared PATH                  Cloudflare companion
-
-Local clients share one daemon on 127.0.0.1:9317 (/mcp, /v1, /capabilities).
-Public HTTP (127.0.0.1:9316) serves remote /mcp and OAuth only, never /v1 or LocalApps.
-OpenAI retains its independently authenticated private HTTP hop.
+Unified architecture:
+  One detached user-session daemon owns the OS runtime (127.0.0.1:9317) and the
+  bidirectional browser extension bridge (127.0.0.1:9315). All local MCP clients
+  attach concurrently as stateless thin proxies; closing any IDE never stops the
+  daemon. Remote wires (openai, cloudflare, http) plug and unplug live without
+  restarting the daemon and obey per-wire grants.remote boundaries.
 
 Project: https://github.com/hicancan/local-runtime-mcp
 License: GNU AGPL v3.0 only

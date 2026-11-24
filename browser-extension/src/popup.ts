@@ -1,10 +1,12 @@
-import { covers, grants, type Definition, type Grant, type Proposal, type View } from './grants.js';
+import { covers, grants, setRemoteGrant, stopDesktop, toggleTunnel, type Definition, type Grant, type Proposal, type TunnelStatus, type View } from './grants.js';
 
-// The owner's panel for the site in the current tab: what it may use of this computer (blue) and which of its own page
-// tools it offers to other sites (green). Every change goes to lrmcp at once and lands in its configuration file.
+// The owner's sovereign panel: live remote wire toggles (OpenAI / Cloudflare / HTTP),
+// emergency desktop stop, plus the current tab's site grants (Use / Provide) and
+// pending webpage capability proposals. Every change takes effect immediately.
 type Messages = Record<string, { message: string }>;
 let messages: Messages = {};
 let language = 'en';
+
 /** The owner's language: their choice in this panel, else Chinese whenever the system prefers it, else English. */
 async function loadLanguage() {
   const saved = (await chrome.storage.local.get({ language: '' })).language as string;
@@ -47,7 +49,7 @@ function group(title: string, rows: HTMLElement[]) {
 }
 
 /** A section heads with its dot (lit when the direction is in use) and, where one switch means something, a switch. */
-function section(kind: 'uses' | 'provides', title: string, on: boolean, toggle: ((on: boolean) => void) | null, hint: string, body: (HTMLElement | null)[]) {
+function section(kind: 'uses' | 'provides' | 'tunnels', title: string, on: boolean, toggle: ((on: boolean) => void) | null, hint: string, body: (HTMLElement | null)[]) {
   const head = el('label', {}, el('span', { className: on ? 'dot on' : 'dot' }), el('span', {}, title));
   if (toggle) {
     const master = el('input', { type: 'checkbox', checked: on });
@@ -62,25 +64,75 @@ function section(kind: 'uses' | 'provides', title: string, on: boolean, toggle: 
 let view: View | null = null;
 let origin = '', page = '';
 
-async function save(grant: Grant) {
+async function mutate(run: () => Promise<View>, okKey: string) {
   try {
-    view = await grants('set', origin, grant);
-    status.textContent = t('saved');
+    view = await run();
+    status.textContent = t(okKey);
     void chrome.runtime.sendMessage({ type: 'grants-changed' }).catch(() => {});
   } catch (error) {
     status.textContent = t('failed', error instanceof Error ? error.message : String(error));
   }
+  paintConnection();
   render();
+}
+
+async function save(grant: Grant) {
+  await mutate(() => grants('set', origin, grant), 'saved');
 }
 
 function own(): Grant {
   const g = view!.grants.find(g => g.Site === view!.site);
-  return { Site: view!.site, Use: Boolean(g?.Use), Provide: Boolean(g?.Provide), Models: [...(g?.Models ?? [])], Capabilities: { ...(g?.Capabilities ?? {}) }, Tools: [...(g?.Tools ?? [])] };
+  return { Site: view!.site, Use: Boolean(g?.Use), Provide: Boolean(g?.Provide), Capabilities: { ...(g?.Capabilities ?? {}) }, Tools: [...(g?.Tools ?? [])] };
 }
 
 function flip(list: string[], item: string, on: boolean) {
   const rest = list.filter(x => x !== item);
   return on ? [...rest, item] : rest;
+}
+
+function tunnelNameLabel(name: string) {
+  if (name === 'openai') return t('wireOpenAI');
+  if (name === 'cloudflare') return t('wireCloudflare');
+  if (name === 'http') return t('wireHTTP');
+  return name;
+}
+
+function tunnelsSection(): HTMLElement | null {
+  const configured = (view?.tunnels ?? []).filter(w => w.configured || w.state === 'active' || w.state === 'error');
+  if (!configured.length) return null;
+  const anyActive = configured.some(w => w.state === 'active');
+  const remote = view?.remoteGrants ?? { openai: {}, http: {} };
+
+  const rows = configured.map((w: TunnelStatus) => {
+    const active = w.state === 'active';
+    const isErr = w.state === 'error';
+    const dot = el('span', { className: `wire-dot ${active ? 'active' : isErr ? 'err' : ''}` });
+    const switchBox = el('input', { type: 'checkbox', checked: active });
+    switchBox.addEventListener('change', () => {
+      switchBox.disabled = true;
+      void mutate(() => toggleTunnel(origin, w.name, switchBox.checked), switchBox.checked ? 'tunnelAttached' : 'tunnelDetached');
+    });
+    const top = el('label', { className: 'wire-row' }, dot, el('span', { className: 'wire-name' }, tunnelNameLabel(w.name)), switchBox);
+
+    const meta: HTMLElement[] = [top];
+    const grantTarget = w.name === 'openai' ? 'openai' : 'http';
+    const currentGrant = grantTarget === 'openai' ? remote.openai : remote.http;
+    if (w.name === 'openai' || w.name === 'cloudflare' || w.name === 'http') {
+      const roBox = el('input', { type: 'checkbox', checked: Boolean(currentGrant?.read_only) });
+      roBox.addEventListener('change', () => {
+        void mutate(() => setRemoteGrant(origin, grantTarget, { ...currentGrant, read_only: roBox.checked }), 'saved');
+      });
+      meta.push(el('label', { className: 'wire-sub' }, roBox, el('span', {}, t('remoteReadOnly'))));
+    }
+    if (isErr && w.last_error) {
+      meta.push(el('div', { className: 'wire-err' }, w.last_error));
+    }
+    return el('div', { className: 'wire-item' }, ...meta);
+  });
+
+  return section('tunnels', t('tunnelsTitle'), anyActive, null, t('tunnelsHint'), [
+    el('div', { className: 'group' }, ...rows),
+  ]);
 }
 
 function usesSection() {
@@ -97,16 +149,14 @@ function usesSection() {
     if (checked) capabilities[d.name] = d.origins?.[0] ? `${d.origins[0]}/` : ''; else delete capabilities[d.name];
     void save({ ...g, Capabilities: capabilities });
   }));
-  const models = view!.models.map(m => row(m.title || m.id, m.id, g.Models!.includes(m.id), checked => save({ ...g, Models: flip(g.Models!, m.id, checked) })));
   return section('uses', t('usesTitle'), on, checked => {
     // The switch is the authorization. Turning it on also ticks what only reads; anything that changes the computer
     // stays one tick away. Turning it off takes everything back but leaves providing as it is.
-    void save(checked ? { ...g, Use: true, Tools: reads.map(d => d.name) } : { ...g, Use: false, Tools: [], Models: [], Capabilities: {} });
+    void save(checked ? { ...g, Use: true, Tools: reads.map(d => d.name) } : { ...g, Use: false, Tools: [], Capabilities: {} });
   }, t('usesHint'), [
     group(t('groupRead'), reads.map(tool)),
     group(t('groupChange'), changes.map(tool)),
     group(t('groupPage'), pages),
-    group(t('groupModels'), models),
   ]);
 }
 
@@ -136,14 +186,7 @@ function providesSection() {
 function proposalRow(p: Proposal) {
   const d = p.definition;
   const act = (method: 'approve' | 'reject') => async () => {
-    try {
-      view = await grants(method, origin, undefined, d.name);
-      status.textContent = t(method === 'approve' ? 'approved' : 'rejected');
-      void chrome.runtime.sendMessage({ type: 'grants-changed' }).catch(() => {});
-    } catch (error) {
-      status.textContent = t('failed', error instanceof Error ? error.message : String(error));
-    }
-    render();
+    await mutate(() => grants(method, origin, undefined, d.name), method === 'approve' ? 'approved' : 'rejected');
   };
   const code = el('details', { className: 'code' }, el('summary', {}, t('showCode')), el('pre', {}, p.script));
   return el('div', { className: 'proposal' },
@@ -159,8 +202,14 @@ function proposalRow(p: Proposal) {
 
 function paintConnection() {
   const connection = $('connection');
-  connection.textContent = t(view ? 'connected' : 'disconnected');
-  connection.className = view ? '' : 'off';
+  if (view) {
+    const n = view.runtime?.attached_clients ?? 0;
+    connection.textContent = n > 0 ? t('connectedSessions', String(n)) : t('connected');
+    connection.className = '';
+  } else {
+    connection.textContent = t('disconnected');
+    connection.className = 'off';
+  }
   // The grant covers the whole site; the page's own host is shown beneath it when they differ.
   const host = origin.replace(/^https?:\/\//, ''), site = view?.site.replace(/^https?:\/\//, '') ?? host;
   $('site').replaceChildren(site || '—', ...(site && host !== site ? [el('small', {}, ` · ${host}`)] : []));
@@ -169,6 +218,13 @@ function paintConnection() {
 function render() {
   panel.replaceChildren();
   if (!view) return;
+  if (view.runtime?.desktop_owned) {
+    const stopBtn = el('button', { type: 'button', className: 'stop-desktop' }, t('stopDesktop'));
+    stopBtn.addEventListener('click', () => { void mutate(() => stopDesktop(origin), 'desktopStopped'); });
+    panel.append(stopBtn);
+  }
+  const tunnels = tunnelsSection();
+  if (tunnels) panel.append(tunnels);
   if (!origin) { panel.append(el('p', { className: 'empty' }, t('notAWebsite'))); return; }
   panel.append(usesSection(), providesSection());
 }

@@ -7,11 +7,11 @@
 
 [English](README.md) · **简体中文**
 
-让 AI 客户端使用运行 `lrmcp` 的机器上的程序、文件、图像、浏览器配置文件和桌面。Local Runtime MCP 是一个便携的本地运行时，提供 **22 个内建 MCP 工具**，并从文件树注册可复用网页能力。
+让 AI 客户端使用运行 `lrmcp` 的机器上的程序、文件、图像、浏览器配置文件和桌面。Local Runtime MCP 是一个统一常驻的本机能力内核，提供 **22 个核心内建 MCP 工具**、用于沉淀可复用网页工具（Web MCP）的 `capability_propose`，以及本机原生软件绑定（App MCP）。
 
-同一个运行时还提供按网站来源授权的网页 SDK，以及使用独立 Key 的本地模型 API。浏览器里的模型通过 `start / read / stop` 能力成为模型来源，Harness 和 StuDev 保留自己的工具循环。见 [工具、网页与模型](docs/models.zh-CN.md)。
+`lrmcp` 与配套 Chromium 扩展抽象上是同一个双向双核运行时：唯一的用户会话常驻守护进程（`127.0.0.1:9317`）负责操作系统能力与主权边界，扩展桥（`127.0.0.1:9315`）接入多 Profile 浏览器环境并提供网页互联与 `L` 主权控制面板。所有本地 AI 客户端均作为无状态 `stdio` 薄代理并发接入；云端 AI 客户端通过 OpenAI Secure MCP Tunnel / Cloudflare Tunnel 像热插拔网线一样随时接入或断开，无需重启守护进程，并受独立 `grants.remote` 约束。见 [v16.0.0 发布说明](docs/releases/v16.0.0.md)。
 
-本地客户端可以使用 stdio 或 Streamable HTTP；远端客户端可以通过 OpenAI Secure MCP Tunnel 和 Cloudflare Tunnel 接入。同一个运行实例可以同时开启两条隧道，共享一套进程会话、浏览器实例和桌面控制。不同进程会话和浏览器标签页可以并发执行，共享文件和桌面输入则按照明确的资源规则协调。
+不同进程会话、文件路径和浏览器标签页均可并发执行，共享文件和桌面物理输入遵循明确的资源协调规则。
 
 - **原生多模态结果**：文件、网页和桌面观察直接返回文本与 MCP 图像内容。
 - **明确的浏览器目标**：连接多个 Chromium Profile，选择有名称的浏览器实例，通过不透明标签页句柄操作。
@@ -77,9 +77,16 @@ Host 只创建一套 Process Manager、Filesystem Service、Browser Bridge 和 C
 
 ```text
 lrmcp
-├── serve
-│   ├── --transport stdio|local|http
-│   └── --tunnel openai|cloudflare   （HTTP 下可重复）
+├── serve --transport stdio              纯 stdio 薄代理（未运行时自动拉起独立后台 Daemon）
+├── start [--http] [--tunnel ...]        确保后台用户会话 Daemon 已启动
+├── stop                                 优雅关闭运行中的 Daemon
+├── status                               查看 Daemon、在线浏览器与远端网线状态
+├── daemon [--http] [--tunnel ...]       在前台运行统一 Daemon
+├── tunnel
+│   ├── up <openai|cloudflare|http> [--ttl 2h]
+│   ├── down <openai|cloudflare|http|all>
+│   └── status
+├── grant remote <openai|http> [--read-only] [--tool NAME]
 ├── setup
 │   ├── browser
 │   ├── local
@@ -89,19 +96,22 @@ lrmcp
 └── help
 ```
 
-`serve` 启动唯一 Host（或在已有本机 Daemon 时让 `stdio` 自动退化为透明薄代理附着复用）。`--transport local` 只启动本机专属面（`127.0.0.1:9317`）与扩展桥（`127.0.0.1:9315`）；`--transport http` 同时开放公网/隧道面（`127.0.0.1:9316`，仅承载远端 `/mcp` 与 OAuth，不暴露 `/v1` 与 `LocalApps`）。
+唯一的用户会话常驻 Daemon 持有本机总线（`127.0.0.1:9317`）与双向扩展桥（`127.0.0.1:9315`）。完成 `lrmcp setup local` 后，所有配置为 `lrmcp serve --transport stdio` 的本地客户端都会在后台自动拉起并附着到同一独立 Daemon——关闭任何 IDE 窗口都不会让宿主机或其他客户端掉线。远端网线（`openai`、`cloudflare`、`http`）随时热插拔，零重启、零中断。
 
-| 命令 | 链路与凭据 |
+| 命令 | 链路与行为 |
 | --- | --- |
-| `lrmcp serve --transport stdio` | 标准 MCP 进程管道；若 `127.0.0.1:9317` 已有 Daemon，则自动作为薄代理附着共享（支持多个 Codex 并发共享与实时 `tools/list_changed`）。 |
-| `lrmcp serve --transport local` | 纯本机常驻 Daemon：只监听本机专属面 `127.0.0.1:9317`（`/mcp`、`/v1`、`/capabilities`）与扩展桥 `127.0.0.1:9315`，不开放任何公网端口。 |
-| `lrmcp serve --transport http` | 同时启动本机专属面（若已配置）与公网 loopback HTTP（`127.0.0.1:9316/mcp`）。 |
-| `lrmcp serve --transport http --tunnel openai` | 官方 OpenAI 转发连接私有 loopback MCP 端点，配置 Tunnel ID 与 API key。 |
-| `lrmcp serve --transport http --tunnel cloudflare` | 官方 `cloudflared` 转发到公网 loopback HTTP（`127.0.0.1:9316`）。 |
-| `lrmcp serve --transport http --tunnel openai --tunnel cloudflare` | 两种远端 Provider 与全部本机客户端共享同一个 Host 和资源。 |
+| `lrmcp serve --transport stdio` | 纯无状态 MCP stdio 薄代理；若 Daemon 尚未运行则自动在后台拉起独立进程并附着到 `127.0.0.1:9317/mcp/attach`（未配置 `local.token` 时退化为隔离单次进程）。 |
+| `lrmcp start [--http] [--tunnel openai\|cloudflare] [--ttl 2h]` | 幂等确保后台用户会话 Daemon 运行，并可按需挂载远端网线。 |
+| `lrmcp stop` | 通过 `127.0.0.1:9317/admin/shutdown` 优雅关闭运行中的 Daemon。 |
+| `lrmcp status` | 输出 Daemon PID、附着的本地会话数、浏览器实例、桌面锁状态、能力计数与各远端网线状态。 |
+| `lrmcp daemon [--http] [--tunnel ...]` | 在前台运行统一 Daemon（便于日志排查或登录计划任务）。 |
+| `lrmcp tunnel up openai [--ttl 2h]` | 确保 Daemon 在线并实时热插 OpenAI Secure MCP Tunnel（独立私跳端口，可选到期自动断开）。 |
+| `lrmcp tunnel up cloudflare [--ttl 2h]` | 实时热插公网回环 HTTP（`127.0.0.1:9316`）与 `cloudflared`（不重启 Daemon）。 |
+| `lrmcp tunnel down openai\|cloudflare\|http\|all` | 实时拔掉单条或全部远端网线；本地客户端与浏览器会话不受任何影响。 |
+| `lrmcp grant remote openai\|http [--read-only] [--tool NAME]` | 实时配置远端网线权限边界（如限制为仅只读工具）并立即广播 `tools/list_changed`。 |
 | `lrmcp setup browser` | 生成 Bridge 凭据，释放和配置扩展。 |
-| `lrmcp setup local` | 生成本机专属面 `local.token`，开启多 `stdio` 客户端共享。 |
-| `lrmcp setup client --id NAME [--model ID]` | 在 `grants.clients` 中注册同机受控应用并生成独立 Scoped Token（`--show` 查看）。 |
+| `lrmcp setup local` | 生成本机专属面 `local.token`，开启多 `stdio` 客户端共享与热插拔控制面。 |
+| `lrmcp setup client --id NAME [--browser-id ID]` | 在 `grants.clients` 中注册同机受控应用并生成独立 Scoped Token（`--show` 查看）。 |
 | `lrmcp setup oauth --client-name NAME --redirect-uri URI` | 用准确回调地址注册 OAuth 客户端并生成凭据。 |
 | `lrmcp setup oauth --show` | 在本地终端明确查看已有 OAuth 凭据。 |
 | `lrmcp version` | 输出可执行文件版本。 |
@@ -387,43 +397,45 @@ cloudflare:
 
 ### OpenAI Tunnel
 
-填写 `openai` 段后运行：
+填写 `openai` 段并初始化本机面（`./lrmcp.exe setup local`）后，按需热插拔（或在浏览器 `L` 扩展面板中一键开关）：
 
 ```powershell
-./lrmcp.exe serve --transport http --tunnel openai
+./lrmcp.exe tunnel up openai --ttl 2h
+./lrmcp.exe tunnel down openai
 ```
 
 Provider 设置和受支持的客户端见 [OpenAI Secure MCP Tunnel 指南](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)。私有 HTTP 源站自动创建，端口与私有链路凭据只在本次运行中保留。
 
 ### Streamable HTTP
 
-直接通过 HTTP 访问时，设置 `http.auth: bearer`，填写 `http.bearer_token` 后运行：
+直接通过回环 HTTP 访问时，设置 `http.auth: bearer`、填写 `http.bearer_token` 并热插 HTTP 网线：
 
 ```powershell
-./lrmcp.exe serve --transport http
+./lrmcp.exe tunnel up http
 ```
 
 默认端点为 `http://127.0.0.1:9316/mcp`。loopback 监听器使用配置的 Bearer token，也可以作为反向代理源站。启用 OAuth 后，还会在公开 HTTPS 地址下提供发现、授权和 token 端点。
 
 ### Cloudflare Tunnel
 
-创建远程管理的 Cloudflare Tunnel，将域名路由到 `http://127.0.0.1:9316`，填写 `http.public_host`、`cloudflare.tunnel_token` 并配置 HTTP 认证后运行：
+创建远程管理的 Cloudflare Tunnel，将域名路由到 `http://127.0.0.1:9316`，填写 `http.public_host`、`cloudflare.tunnel_token` 并配置 HTTP 认证后热插 Cloudflare：
 
 ```powershell
-./lrmcp.exe serve --transport http --tunnel cloudflare
+./lrmcp.exe tunnel up cloudflare
 ```
 
 发布包附带固定版本的 `cloudflared`。远端 MCP 客户端使用 `https://<public_host>/mcp`。Bearer 模式在客户端 token 设置中填写 MCP Bearer token；OAuth 模式则注册该客户端的回调地址并使用对应客户端凭据。Cloudflare token 验证隧道程序，HTTP 凭据授权 MCP 客户端。
 
 ### 同时开启两条隧道
 
-填写两种 Provider 的配置，在一个进程中运行：
+填写两种 Provider 的配置后，直接在同一个常驻 Daemon 上挂载两条远端网线：
 
 ```powershell
-./lrmcp.exe serve --transport http --tunnel openai --tunnel cloudflare
+./lrmcp.exe tunnel up openai
+./lrmcp.exe tunnel up cloudflare
 ```
 
-两个连接共享一个 Browser Bridge、进程会话注册表、文件提交协调服务和桌面控制器。Provider 退出会在本地报告，其他在线入口继续服务。保持终端运行，按 `Ctrl+C` 关闭整个运行时。日志区分入口降级和其他入口仍然可用的状态。
+两个连接与全部本地 `stdio` 客户端共享同一个 Browser Bridge、进程会话注册表、文件提交协调服务和桌面控制器；随时插拔单条网线均不重启守护进程。使用 `lrmcp grant remote openai --read-only`（或在 `L` 扩展面板勾选“仅只读”）可实时收窄远端权限。
 
 ### Gemini 与其他客户端的 OAuth
 

@@ -8,6 +8,44 @@
   "connected": {
     "message": "Connected to lrmcp"
   },
+  "connectedSessions": {
+    "message": "Connected · $COUNT$ local sessions",
+    "placeholders": {
+      "count": {
+        "content": "$1"
+      }
+    }
+  },
+  "tunnelsTitle": {
+    "message": "Remote wires (hot-plug)"
+  },
+  "tunnelsHint": {
+    "message": "Plug or unplug cloud access live without restarting the daemon. Tick Read-only to restrict that wire to read-only tools."
+  },
+  "wireOpenAI": {
+    "message": "OpenAI Tunnel"
+  },
+  "wireCloudflare": {
+    "message": "Cloudflare Tunnel"
+  },
+  "wireHTTP": {
+    "message": "Public HTTP (9316)"
+  },
+  "remoteReadOnly": {
+    "message": "Read-only tools only"
+  },
+  "tunnelAttached": {
+    "message": "Remote wire attached"
+  },
+  "tunnelDetached": {
+    "message": "Remote wire detached"
+  },
+  "stopDesktop": {
+    "message": "Stop desktop control now"
+  },
+  "desktopStopped": {
+    "message": "Desktop control revoked"
+  },
   "disconnected": {
     "message": "lrmcp is not running or not set up"
   },
@@ -43,9 +81,6 @@
   },
   "groupPage": {
     "message": "Page tools"
-  },
-  "groupModels": {
-    "message": "Browser models · experimental"
   },
   "saved": {
     "message": "Saved"

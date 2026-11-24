@@ -20,7 +20,7 @@ func (testWebCodedError) ErrorCode() string { return "provider_unavailable" }
 func webFixture() webEnvelope {
 	return webEnvelope{InstanceID: "web-profile", BootID: "web-boot", Source: WebSource{
 		TabID: "web-boot.sender", Origin: "https://owner.example", URL: "https://owner.example/app", FrameID: 0, DocumentID: "document-one",
-	}, Request: WebRequest{ID: "request-one", Method: "models.list", Params: json.RawMessage(`{}`)}}
+	}, Request: WebRequest{ID: "request-one", Method: "capabilities.list", Params: json.RawMessage(`{}`)}}
 }
 
 func TestWebBridgeBindsLiveBrowserAndExactDocumentOrigin(t *testing.T) {

@@ -10,44 +10,74 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-func registerBrowserTools(server *mcp.Server, bridge *browser.Bridge) {
-	mcp.AddTool(server, tool("browser_status", "Get browser instances", "List named browser instances and their connection status on the authenticated loopback bridge.", true, false, true, false), browserStatus(bridge))
-	mcp.AddTool(server, tool("browser_tabs", "List browser tabs", "List controllable tabs in one browser instance selected from browser_status.", true, false, true, false), browserTabs(bridge))
-	mcp.AddTool(server, tool("browser_open", "Open browser tab", "Open a URL in a new browser tab.", false, false, false, true), browserOpen(bridge))
-	mcp.AddTool(server, tool("browser_close", "Close browser tab", "Close a browser tab by its opaque tab ID.", false, true, true, false), browserClose(bridge))
+func browserToolSpecs(bridge *browser.Bridge) []toolSpec {
 	navigationTool := inputTool[browser.Navigation](tool("browser_navigate", "Navigate browser tab", "Navigate an existing tab to a URL, through history, or by reloading, then wait until loading finishes.", false, false, false, true), func(schema *jsonschema.Schema) {
 		schema.Properties["kind"].Enum = enum("url", "back", "forward", "reload")
 	})
-	mcp.AddTool(server, navigationTool, browserNavigate(bridge))
-	mcp.AddTool(server, tool("browser_snapshot", "Read browser page", "Return bounded accessibility text and versioned references for interactive elements across the main document and cross-origin child frames.", true, false, true, true), browserSnapshot(bridge))
-	mcp.AddTool(server, tool("browser_screenshot", "Capture browser page", "Return a viewport, full-page, or clipped native PNG. Viewport screenshots yield IDs for coordinate actions.", true, false, true, true), browserScreenshot(bridge))
 	browserActionTool := inputTool[browser.Action](tool("browser_action", "Act on browser page", "Use one accessibility-tree ref or one versioned viewport screenshot coordinate; also supports keys, scrolling, files, dialogs, and explicit JavaScript escape-hatch evaluation.", false, true, false, true), func(schema *jsonschema.Schema) {
 		schema.Properties["kind"].Enum = enum("click", "double_click", "hover", "drag", "type_text", "set_value", "press_key", "scroll", "select", "check", "upload_files", "handle_dialog", "evaluate")
 		schema.Properties["button"].Enum = enum("left", "middle", "right")
 	})
-	mcp.AddTool(server, browserActionTool, browserAction(bridge))
+	return []toolSpec{
+		{name: "browser_status", readOnly: true, register: func(s *mcp.Server) {
+			mcp.AddTool(s, tool("browser_status", "Get browser instances", "List named browser instances and their connection status on the authenticated loopback bridge.", true, false, true, false), browserStatus(bridge))
+		}},
+		{name: "browser_tabs", readOnly: true, register: func(s *mcp.Server) {
+			mcp.AddTool(s, tool("browser_tabs", "List browser tabs", "List controllable tabs in one browser instance selected from browser_status.", true, false, true, false), browserTabs(bridge))
+		}},
+		{name: "browser_open", register: func(s *mcp.Server) {
+			mcp.AddTool(s, tool("browser_open", "Open browser tab", "Open a URL in a new browser tab.", false, false, false, true), browserOpen(bridge))
+		}},
+		{name: "browser_close", destructive: true, register: func(s *mcp.Server) {
+			mcp.AddTool(s, tool("browser_close", "Close browser tab", "Close a browser tab by its opaque tab ID.", false, true, true, false), browserClose(bridge))
+		}},
+		{name: "browser_navigate", register: func(s *mcp.Server) {
+			mcp.AddTool(s, navigationTool, browserNavigate(bridge))
+		}},
+		{name: "browser_snapshot", readOnly: true, register: func(s *mcp.Server) {
+			mcp.AddTool(s, tool("browser_snapshot", "Read browser page", "Return bounded accessibility text and versioned references for interactive elements across the main document and cross-origin child frames.", true, false, true, true), browserSnapshot(bridge))
+		}},
+		{name: "browser_screenshot", readOnly: true, register: func(s *mcp.Server) {
+			mcp.AddTool(s, tool("browser_screenshot", "Capture browser page", "Return a viewport, full-page, or clipped native PNG. Viewport screenshots yield IDs for coordinate actions.", true, false, true, true), browserScreenshot(bridge))
+		}},
+		{name: "browser_action", destructive: true, register: func(s *mcp.Server) {
+			mcp.AddTool(s, browserActionTool, browserAction(bridge))
+		}},
+	}
 }
 
-func registerComputerTools(server *mcp.Server, controller computer.Controller) {
+func computerToolSpecs(controller computer.Controller) []toolSpec {
 	controlTool := inputTool[computer.ControlOptions](tool("computer_control", "Manage desktop control", "Acquire, inspect or release the shared pointer and keyboard. Only physical input needs it; observing, waiting, semantic actions and place work without it. While held, a small pill at the bottom of the display shows that AI is operating and stops it when clicked.", false, false, false, false), func(schema *jsonschema.Schema) {
 		schema.Properties["kind"].Enum = enum("acquire", "status", "release")
 	})
-	mcp.AddTool(server, controlTool, computerControl(controller))
-	mcp.AddTool(server, tool("computer_targets", "List displays and windows", "Return every display (ID, bounds, work area, scale, primary) and the visible top-level windows (opaque target ID, process, title, class, visible frame, normal/minimized/maximized, display). Filter by pid, title or process.", true, false, true, false), computerTargets(controller))
 	stateTool := inputTool[computer.StateOptions](tool("computer_state", "Observe desktop", "Observe one window, one display or every display: PNG pixels (windows are captured even when covered) and, for a window, its UI Automation tree with text, names, AutomationIds, values, states and supported patterns. Filter and page elements, crop a region, or skip pixels. Element ref_ids drive semantic actions; physical input needs a state observed with control_id.", true, false, true, false), func(schema *jsonschema.Schema) {
 		schema.Properties["elements"].Enum = enum("all", "interactive", "none")
 	})
-	mcp.AddTool(server, stateTool, computerState(controller))
 	waitTool := inputTool[computer.WaitOptions](tool("computer_wait", "Wait for desktop element", "Poll a window's UI Automation tree until an element matching name, automation_id or role is present or absent, then return that observation with its ref_ids and whether the condition was met.", true, false, true, false), func(schema *jsonschema.Schema) {
 		schema.Properties["until"].Enum = enum("present", "absent")
 	})
-	mcp.AddTool(server, waitTool, computerWait(controller))
 	computerActionTool := inputTool[computer.Action](tool("computer_action", "Act on desktop", "Semantic actions (invoke, toggle, select, expand, collapse, set_value, scroll_into_view, scroll_by) operate an element through UI Automation by its ref_id, and place moves, restores or minimizes a window; none of them touches the pointer, keyboard or foreground, so the person at the computer is undisturbed. Physical input (activate, move, click, double_click, drag, type_text, press_key, scroll) needs control_id and a state observed with it; it invalidates prior states.", false, true, false, false), func(schema *jsonschema.Schema) {
 		schema.Properties["kind"].Enum = enum("invoke", "toggle", "select", "expand", "collapse", "set_value", "scroll_into_view", "scroll_by", "place", "activate", "move", "click", "double_click", "drag", "type_text", "press_key", "scroll")
 		schema.Properties["button"].Enum = enum("left", "middle", "right")
 		schema.Properties["show"].Enum = enum("restore", "minimize", "maximize")
 	})
-	mcp.AddTool(server, computerActionTool, computerAction(controller))
+	return []toolSpec{
+		{name: "computer_control", register: func(s *mcp.Server) {
+			mcp.AddTool(s, controlTool, computerControl(controller))
+		}},
+		{name: "computer_targets", readOnly: true, register: func(s *mcp.Server) {
+			mcp.AddTool(s, tool("computer_targets", "List displays and windows", "Return every display (ID, bounds, work area, scale, primary) and the visible top-level windows (opaque target ID, process, title, class, visible frame, normal/minimized/maximized, display). Filter by pid, title or process.", true, false, true, false), computerTargets(controller))
+		}},
+		{name: "computer_state", readOnly: true, register: func(s *mcp.Server) {
+			mcp.AddTool(s, stateTool, computerState(controller))
+		}},
+		{name: "computer_wait", readOnly: true, register: func(s *mcp.Server) {
+			mcp.AddTool(s, waitTool, computerWait(controller))
+		}},
+		{name: "computer_action", destructive: true, register: func(s *mcp.Server) {
+			mcp.AddTool(s, computerActionTool, computerAction(controller))
+		}},
+	}
 }
 
 func requireBridge(bridge *browser.Bridge) error {

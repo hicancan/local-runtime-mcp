@@ -1,22 +1,28 @@
 ## Copy this file to local-runtime-mcp.yaml beside lrmcp.
-## Choose entry points explicitly, for example:
-##   lrmcp serve --transport local
-##   lrmcp serve --transport http --tunnel openai --tunnel cloudflare
-##   lrmcp serve --transport stdio   # auto-attaches to running local daemon on 127.0.0.1:9317
+##
+## Unified architecture (v16.0.0):
+##   lrmcp setup local                         # initialize 127.0.0.1:9317 local plane
+##   lrmcp setup browser                       # initialize 127.0.0.1:9315 browser extension bridge
+##   lrmcp serve --transport stdio             # pure thin proxy; auto-spawns detached daemon
+##   lrmcp start | stop | status               # manage background user-session daemon
+##   lrmcp tunnel up openai [--ttl 2h]         # hot-plug OpenAI wire live (0 daemon restart)
+##   lrmcp tunnel up cloudflare [--ttl 2h]     # hot-plug Cloudflare wire live (0 daemon restart)
+##   lrmcp tunnel down openai | cloudflare | all
+##   lrmcp grant remote openai --read-only     # live-restrict a remote wire to read-only tools
 
-# Surface B: Browser extension bridge (loopback only, chrome-extension:// Origin only)
+# Browser extension bidirectional bridge (loopback only, chrome-extension:// Origin only)
 browser:
   listen: 127.0.0.1:9315
   token: "replace-with-a-random-token-of-at-least-32-characters"
 
-# Surface A: Local-only plane (loopback only, never tunneled, rejects Origin & proxy headers)
-# Serves same-host /mcp (with LocalApps & stdio thin-proxy attach), /v1/*, and /capabilities/*
+# Local-only control & MCP plane (loopback only, never tunneled, rejects Origin & proxy headers)
+# Serves same-host /mcp (with LocalApps & stdio thin-proxy attach), /admin/*, and /capabilities/*
 local:
   listen: 127.0.0.1:9317
   # Generate with: lrmcp setup local
   token: "replace-with-a-different-random-local-token-at-least-32-characters"
 
-# Surface C: Public / tunnel-facing MCP gateway (never serves /v1 or LocalApps)
+# Hot-pluggable public / tunnel-facing MCP gateway (never serves /admin or LocalApps)
 http:
   listen: 127.0.0.1:9316
   public_host: mcp.example.com
@@ -40,42 +46,35 @@ openai:
 cloudflare:
   tunnel_token: "replace-with-your-cloudflare-managed-tunnel-token"
 
-# Registered tools are same-named JSON + JS pairs (page tools) or JSON command bindings (local apps).
+# Distilled Web MCP tools (same-named JSON + JS pairs) and App MCP bindings (JSON command files).
 # Relative paths resolve beside this configuration, not the launch directory.
 capabilities:
   directory: capabilities
 
-# Registered browser-backed models projected from start/read/stop page capabilities.
-# Access is granted per website (grants.web) or per local client (grants.clients).
-models:
-  items:
-    - id: deepseek-web
-      title: DeepSeek 网页
-      url: https://chat.deepseek.com/
-      start: deepseek.start
-      read: deepseek.read
-      stop: deepseek.stop
-      timeout_seconds: 300
-
-# Unified owner grants across websites and same-computer native clients.
+# Unified owner grants across websites, same-computer native clients, and remote wires.
 grants:
   # Browser websites authenticate through the extension's real top-level Origin (zero page secrets).
   # The extension's toolbar L panel edits this list live.
   web:
     - site: https://hicancan.top
       use: true
-      models: [deepseek-web]
       # capabilities:
       #   icourse.outline: "https://www.icourse163.org/learn/COURSE#/learn/content"
+      # tools:
+      #   - browser_status
+    - site: https://icourse163.org
+      provide: true
   # Same-computer native clients authenticate on 127.0.0.1:9317 with one scoped token each.
-  # Generate with: lrmcp setup client --id studev-win --model deepseek-web
+  # Generate with: lrmcp setup client --id studev-win
   # clients:
   #   - id: studev-win
   #     token: "replace-with-a-separate-random-token-of-at-least-32-characters"
   #     browser_id: "owner-selected-profile-id" # Optional when one profile is online.
-  #     models: [deepseek-web]
   #     capabilities:
   #       icourse.outline: "https://www.icourse163.org/learn/COURSE#/learn/content"
-  #   - id: harness
-  #     token: "replace-with-another-random-token-of-at-least-32-characters"
-  #     models: [deepseek-web]
+  # Optional per-wire remote boundaries (empty allows the full remote-safe surface, never LocalApps).
+  # remote:
+  #   openai:
+  #     read_only: false
+  #   http:
+  #     read_only: false

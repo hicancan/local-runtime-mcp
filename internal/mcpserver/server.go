@@ -2,7 +2,9 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"sync"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/hicancan/local-runtime-mcp/internal/browser"
@@ -19,6 +21,10 @@ const Version = version.Version
 
 const instructions = "Local Runtime MCP exposes the machine where lrmcp is running. Filesystem and image tools accept direct absolute paths or paths relative to the server process. Create new text paths with mode=create; replace or patch only an expected SHA-256 version. Process tools execute installed programs directly without shell parsing and return independent sessions for longer programs. Pass the last successfully received output_cursor to process_continue for incremental output. Omit it or use zero to reread the retained output; reads do not consume data. After a lost response, retry a read-only continue using the same cursor. Do not automatically repeat process_run, stdin, resize, or terminate after an uncertain response. Completed async sessions remain readable for up to ten minutes, subject to session capacity. Process duration_ms is elapsed time while running and fixed after exit. Browser tools use the bundled Chromium extension: discover online instances with browser_status, select their browser_id for tabs/open, and use the returned opaque tab_id for all existing-tab operations. Read page content with browser_snapshot. New tabs are inactive by default. Computer tools see every display and window: computer_targets lists them, computer_state observes pixels and a window's UI Automation tree, computer_wait waits for an element. Prefer semantic computer_action kinds and place: they operate controls by ref_id without the pointer, keyboard or foreground, so the person at the computer is undisturbed. Physical input needs computer_control: acquire it, observe with its control_id, act on that exact state_id, and release it. Visible browser changes share the desktop gate and require the matching control_id while another task owns it. Independent process sessions, file paths, and background browser tabs can run concurrently; IDs route resources, not separate operating-system desktops or security tenants. Prefer browser tools for web pages, computer tools for native UI, and native image-content tools for images and screenshots. Source code is available under AGPL-3.0-only at https://github.com/hicancan/local-runtime-mcp."
 
+// ToolFilter reports whether a tool with the given name and side-effect hints
+// should be visible and callable on this MCP server.
+type ToolFilter func(name string, readOnly, destructive bool) bool
+
 // Dependencies are owned by the Runtime Host, never by a client connection.
 type Dependencies struct {
 	Process      *runtimeprocess.Manager
@@ -27,41 +33,159 @@ type Dependencies struct {
 	Computer     computer.Controller
 	Capabilities *capability.Registry
 	LocalApps    bool
+	Filter       ToolFilter
+}
+
+// Managed wraps an MCP server whose active tool catalog can be dynamically
+// resynchronized when owner grants or approved webpage capabilities change.
+type Managed struct {
+	Server *mcp.Server
+
+	mu         sync.Mutex
+	filter     ToolFilter
+	registered map[string]string
+	static     []toolSpec
+	registry   *capability.Registry
+}
+
+type toolSpec struct {
+	name        string
+	readOnly    bool
+	destructive bool
+	register    func(*mcp.Server)
 }
 
 func New(deps Dependencies) *mcp.Server {
+	return NewManaged(deps).Server
+}
+
+func NewManaged(deps Dependencies) *Managed {
 	server := mcp.NewServer(
 		&mcp.Implementation{Name: "local-runtime-mcp", Version: Version},
 		&mcp.ServerOptions{Instructions: instructions, Capabilities: &mcp.ServerCapabilities{}},
 	)
 
-	mcp.AddTool(server, tool("filesystem_list", "List directory", "List a bounded number of files and directories below a direct machine path without following symbolic links.", true, false, true, false), filesystemList)
-	mcp.AddTool(server, tool("filesystem_stat", "Inspect path", "Inspect a direct path without following symbolic links; optionally calculate a regular file's SHA-256.", true, false, true, false), filesystemStat)
-	mcp.AddTool(server, tool("filesystem_read_text", "Read text file", "Read bounded complete UTF-8 lines from a direct machine path, starting at any one-based line.", true, false, true, false), filesystemReadText)
 	writeTool := inputTool[writeTextInput](tool("filesystem_write_text", "Write text file", "Atomically create a new UTF-8 file or replace one expected file version. Writes to the same path are serialized by this host.", false, true, true, false), func(schema *jsonschema.Schema) {
 		schema.Properties["mode"].Enum = enum("create", "replace")
 	})
-	mcp.AddTool(server, writeTool, filesystemWriteText(deps.Filesystem))
-	mcp.AddTool(server, tool("filesystem_patch_text", "Patch text file", "Apply uniquely anchored, non-overlapping UTF-8 hunks against one expected file version and commit them atomically.", false, true, true, false), filesystemPatchText(deps.Filesystem))
-	mcp.AddTool(server, tool("filesystem_search_text", "Search text files", "Search bounded UTF-8 files below a direct path using literal text or a Go regular expression.", true, false, true, false), filesystemSearchText)
-	mcp.AddTool(server, tool("image_read", "Read image", "Return a direct PNG, JPEG, GIF, or WebP path as native MCP image content with metadata.", true, false, true, false), imageRead)
-
 	processRunTool := inputTool[processRunInput](tool("process_run", "Run process", "Start a program directly in pipe or interactive PTY mode. Completed programs return their result; longer programs return a session ID.", false, true, false, true), func(schema *jsonschema.Schema) {
 		schema.Properties["io_mode"].Enum = enum("pipe", "pty")
 	})
-	mcp.AddTool(server, processRunTool, processRun(deps.Process))
-	mcp.AddTool(server, tool("process_continue", "Continue process", "Read retained output from output_cursor, write or close pipe stdin, resize a PTY, wait for, or terminate a process session. Pure reads with the same cursor can be retried; advance the cursor only after receiving a result.", false, true, false, true), processContinue(deps.Process))
 
-	registerBrowserTools(server, deps.Browser)
-	registerComputerTools(server, deps.Computer)
-	registerCapabilityTools(server, deps.Capabilities)
+	static := []toolSpec{
+		{name: "filesystem_list", readOnly: true, register: func(s *mcp.Server) {
+			mcp.AddTool(s, tool("filesystem_list", "List directory", "List a bounded number of files and directories below a direct machine path without following symbolic links.", true, false, true, false), filesystemList)
+		}},
+		{name: "filesystem_stat", readOnly: true, register: func(s *mcp.Server) {
+			mcp.AddTool(s, tool("filesystem_stat", "Inspect path", "Inspect a direct path without following symbolic links; optionally calculate a regular file's SHA-256.", true, false, true, false), filesystemStat)
+		}},
+		{name: "filesystem_read_text", readOnly: true, register: func(s *mcp.Server) {
+			mcp.AddTool(s, tool("filesystem_read_text", "Read text file", "Read bounded complete UTF-8 lines from a direct machine path, starting at any one-based line.", true, false, true, false), filesystemReadText)
+		}},
+		{name: "filesystem_write_text", destructive: true, register: func(s *mcp.Server) {
+			mcp.AddTool(s, writeTool, filesystemWriteText(deps.Filesystem))
+		}},
+		{name: "filesystem_patch_text", destructive: true, register: func(s *mcp.Server) {
+			mcp.AddTool(s, tool("filesystem_patch_text", "Patch text file", "Apply uniquely anchored, non-overlapping UTF-8 hunks against one expected file version and commit them atomically.", false, true, true, false), filesystemPatchText(deps.Filesystem))
+		}},
+		{name: "filesystem_search_text", readOnly: true, register: func(s *mcp.Server) {
+			mcp.AddTool(s, tool("filesystem_search_text", "Search text files", "Search bounded UTF-8 files below a direct path using literal text or a Go regular expression.", true, false, true, false), filesystemSearchText)
+		}},
+		{name: "image_read", readOnly: true, register: func(s *mcp.Server) {
+			mcp.AddTool(s, tool("image_read", "Read image", "Return a direct PNG, JPEG, GIF, or WebP path as native MCP image content with metadata.", true, false, true, false), imageRead)
+		}},
+		{name: "process_run", destructive: true, register: func(s *mcp.Server) {
+			mcp.AddTool(s, processRunTool, processRun(deps.Process))
+		}},
+		{name: "process_continue", destructive: true, register: func(s *mcp.Server) {
+			mcp.AddTool(s, tool("process_continue", "Continue process", "Read retained output from output_cursor, write or close pipe stdin, resize a PTY, wait for, or terminate a process session. Pure reads with the same cursor can be retried; advance the cursor only after receiving a result.", false, true, false, true), processContinue(deps.Process))
+		}},
+	}
+	static = append(static, browserToolSpecs(deps.Browser)...)
+	static = append(static, computerToolSpecs(deps.Computer)...)
 	if deps.Capabilities.Proposes() {
-		registerProposeTool(server, deps.Capabilities)
+		static = append(static, proposeToolSpec(deps.Capabilities))
 	}
 	if deps.LocalApps {
 		registerLocalAppTools(server, deps.Capabilities)
 	}
-	return server
+
+	managed := &Managed{
+		Server:     server,
+		filter:     deps.Filter,
+		registered: map[string]string{},
+		static:     static,
+		registry:   deps.Capabilities,
+	}
+	managed.Sync()
+	if deps.Capabilities != nil {
+		deps.Capabilities.Watch(managed.Sync)
+	}
+	return managed
+}
+
+// SetFilter replaces the active tool filter and immediately reconciles the
+// server's published tool catalog, pushing tools/list_changed to connected clients.
+func (m *Managed) SetFilter(filter ToolFilter) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.filter = filter
+	m.syncLocked()
+}
+
+// Sync reconciles registered tools against the current filter and capability catalog.
+func (m *Managed) Sync() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.syncLocked()
+}
+
+func (m *Managed) syncLocked() {
+	allow := func(name string, readOnly, destructive bool) bool {
+		return m.filter == nil || m.filter(name, readOnly, destructive)
+	}
+	current := map[string]bool{}
+	for _, spec := range m.static {
+		if !allow(spec.name, spec.readOnly, spec.destructive) {
+			continue
+		}
+		current[spec.name] = true
+		if m.registered[spec.name] == "static" {
+			continue
+		}
+		m.registered[spec.name] = "static"
+		spec.register(m.Server)
+	}
+	if m.registry != nil {
+		for _, definition := range m.registry.List() {
+			if !allow(definition.Name, definition.Annotations.ReadOnlyHint, definition.Annotations.DestructiveHint) {
+				continue
+			}
+			current[definition.Name] = true
+			fingerprint, _ := json.Marshal(definition)
+			if m.registered[definition.Name] == string(fingerprint) {
+				continue
+			}
+			m.registered[definition.Name] = string(fingerprint)
+			addCapabilityTool(m.Server, m.registry, definition)
+		}
+	}
+	var gone []string
+	for name := range m.registered {
+		if !current[name] {
+			gone = append(gone, name)
+			delete(m.registered, name)
+		}
+	}
+	if len(gone) > 0 {
+		m.Server.RemoveTools(gone...)
+	}
 }
 
 func tool(name, title, description string, readOnly, destructive, idempotent, openWorld bool) *mcp.Tool {

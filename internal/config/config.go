@@ -61,9 +61,8 @@ type Config struct {
 	HTTP         HTTP         `yaml:"http,omitempty"`
 	Cloudflare   Cloudflare   `yaml:"cloudflare,omitempty"`
 	Capabilities Capabilities `yaml:"capabilities,omitempty"`
-	Models       Models       `yaml:"models,omitempty"`
 	Grants       Grants       `yaml:"grants,omitempty"`
-	// Path is where this configuration was read from, so owner edits made while running (web grants) go back there.
+	// Path is where this configuration was read from, so owner edits made while running (grants) go back there.
 	Path string `yaml:"-"`
 }
 
@@ -77,19 +76,34 @@ type Capabilities struct {
 	Directory string `yaml:"directory,omitempty"`
 }
 
-// Grants defines owner authorization across both browser websites and local native clients.
+// Grants defines owner authorization across websites, same-computer native clients,
+// and remote tunnel wires.
 type Grants struct {
 	Web     []WebGrant    `yaml:"web,omitempty"`
 	Clients []ClientGrant `yaml:"clients,omitempty"`
+	Remote  RemoteGrants  `yaml:"remote,omitempty"`
 }
 
-// ClientGrant authorizes one same-computer native client (such as StuDev Windows or Harness)
+// RemoteGrants constrains what remote MCP wires (OpenAI tunnel and public HTTP / Cloudflare)
+// may see and invoke. Empty grants preserve the full remote-safe surface (never LocalApps).
+type RemoteGrants struct {
+	OpenAI RemoteGrant `yaml:"openai,omitempty" json:"openai"`
+	HTTP   RemoteGrant `yaml:"http,omitempty" json:"http"`
+}
+
+// RemoteGrant restricts one remote MCP wire. ReadOnly limits the wire to tools annotated
+// readOnlyHint=true and destructiveHint=false; non-empty Tools restricts to an explicit allowlist.
+type RemoteGrant struct {
+	ReadOnly bool     `yaml:"read_only,omitempty" json:"read_only,omitempty"`
+	Tools    []string `yaml:"tools,omitempty" json:"tools,omitempty"`
+}
+
+// ClientGrant authorizes one same-computer native client (such as StuDev Windows)
 // on the local-only plane with its own scoped token. It never grants machine MCP control.
 type ClientGrant struct {
 	ID           string            `yaml:"id"`
 	Token        string            `yaml:"token,omitempty"`
 	BrowserID    string            `yaml:"browser_id,omitempty"`
-	Models       []string          `yaml:"models,omitempty"`
 	Capabilities map[string]string `yaml:"capabilities,omitempty"`
 }
 
@@ -98,32 +112,16 @@ type ClientGrant struct {
 // https://mooc1.chaoxing.com), or one exact origin for a local address or a port (http://127.0.0.1:4321).
 //
 // Two switches are the owner's authorization, kept even when nothing is ticked beneath them: Use lets the site use
-// this computer (the models, page tools and machine tools listed below it, and nothing while it is off); Provide lets
+// this computer (the page tools and machine tools listed below it, and nothing while it is off); Provide lets
 // the site's own page tools, today's and those an AI distils later, be lent to other sites.
 type WebGrant struct {
 	Site         string            `yaml:"site"`
 	Use          bool              `yaml:"use,omitempty"`
 	Provide      bool              `yaml:"provide,omitempty"`
-	Models       []string          `yaml:"models,omitempty"`
 	Capabilities map[string]string `yaml:"capabilities,omitempty"`
 	// Tools names built-in machine tools (files, processes, desktop, browser) the owner lends this website.
 	// Each keeps its read-only or changing annotation, which the website must respect when asking its person.
 	Tools []string `yaml:"tools,omitempty"`
-}
-
-type Models struct {
-	Items []BrowserModel `yaml:"items,omitempty"`
-}
-
-type BrowserModel struct {
-	ID             string `yaml:"id"`
-	Title          string `yaml:"title,omitempty"`
-	BrowserID      string `yaml:"browser_id,omitempty"`
-	URL            string `yaml:"url"`
-	Start          string `yaml:"start"`
-	Read           string `yaml:"read"`
-	Stop           string `yaml:"stop"`
-	TimeoutSeconds int    `yaml:"timeout_seconds,omitempty"`
 }
 
 type Browser struct {

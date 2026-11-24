@@ -7,11 +7,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hicancan/local-runtime-mcp/internal/browser"
 	"github.com/hicancan/local-runtime-mcp/internal/capability"
 	"github.com/hicancan/local-runtime-mcp/internal/config"
-	"github.com/hicancan/local-runtime-mcp/internal/modelapi"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -35,7 +35,7 @@ func fixtureMachine(t *testing.T) *machineTools {
 
 func TestGrantChangesGoBackToTheFileAndNothingElse(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "local-runtime-mcp.yaml")
-	original := "browser:\n  token: \"kept-browser-token-0123456789abcdefghij\"\ngrants:\n  web:\n    - site: https://old.example\n      models: []\n"
+	original := "browser:\n  token: \"kept-browser-token-0123456789abcdefghij\"\ngrants:\n  web:\n    - site: https://old.example\n"
 	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func TestGrantChangesGoBackToTheFileAndNothingElse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := newGrantStore(nil, path, registry, nil, fixtureMachine(t))
+	store := newGrantStore(nil, config.RemoteGrants{}, path, registry, fixtureMachine(t), nil, nil)
 	if err := store.set(config.WebGrant{Site: "https://studev.example", Use: true, Tools: []string{"echo_read"}}); err != nil {
 		t.Fatal(err)
 	}
@@ -73,12 +73,8 @@ func TestLentMachineToolsAreListedWithAnnotationsAndRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service, err := modelapi.New(nil, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	store := newGrantStore([]config.WebGrant{{Site: "https://studev.example", Use: true, Tools: []string{"echo_read"}}}, "", registry, nil, fixtureMachine(t))
-	handler := webHandler(store, registry, service)
+	store := newGrantStore([]config.WebGrant{{Site: "https://studev.example", Use: true, Tools: []string{"echo_read"}}}, config.RemoteGrants{}, "", registry, fixtureMachine(t), nil, nil)
+	handler := webHandler(store, registry)
 	source := browser.WebSource{Origin: "https://studev.example"}
 	listed, err := handler(context.Background(), source, browser.WebRequest{Method: "capabilities.list", Params: json.RawMessage(`{}`)}, nil)
 	if err != nil {
@@ -124,8 +120,7 @@ func TestSwitchesAreKeptWithNothingTickedAndProvidingGuardsPageTools(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := newGrantStore(nil, path, registry, nil, fixtureMachine(t))
-	// Authorizing with nothing ticked beneath is kept, in the file too.
+	store := newGrantStore(nil, config.RemoteGrants{}, path, registry, fixtureMachine(t), nil, nil)
 	if err := store.set(config.WebGrant{Site: "https://icourse163.org", Provide: true}); err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +135,6 @@ func TestSwitchesAreKeptWithNothingTickedAndProvidingGuardsPageTools(t *testing.
 	if err := store.set(lend); err != nil {
 		t.Fatal(err)
 	}
-	// Turning providing off takes the lend back; lending again is refused until it is on.
 	if err := store.set(config.WebGrant{Site: "https://icourse163.org"}); err != nil {
 		t.Fatal(err)
 	}
@@ -152,5 +146,107 @@ func TestSwitchesAreKeptWithNothingTickedAndProvidingGuardsPageTools(t *testing.
 	}
 	if err := store.set(config.WebGrant{Site: "https://other.example", Tools: []string{"echo_read"}}); err == nil {
 		t.Fatal("tools were granted with the use switch off")
+	}
+}
+
+type fakeTunnelCtrl struct {
+	active map[string]bool
+}
+
+func (f *fakeTunnelCtrl) Status() []TunnelStatus {
+	out := []TunnelStatus{}
+	for _, n := range []string{"openai", "cloudflare", "http"} {
+		state := "stopped"
+		if f.active[n] {
+			state = "active"
+		}
+		out = append(out, TunnelStatus{Name: n, Configured: true, State: state})
+	}
+	return out
+}
+func (f *fakeTunnelCtrl) Up(name string, _ time.Duration) ([]TunnelStatus, error) {
+	f.active[name] = true
+	return f.Status(), nil
+}
+func (f *fakeTunnelCtrl) Down(name string) ([]TunnelStatus, error) {
+	delete(f.active, name)
+	return f.Status(), nil
+}
+func (f *fakeTunnelCtrl) AttachedClients() int { return 3 }
+
+func TestRemoteGrantsLiveFilterAndExtensionTunnelControls(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	path := filepath.Join(t.TempDir(), "local-runtime-mcp.yaml")
+	if err := os.WriteFile(path, []byte("browser:\n  listen: 127.0.0.1:0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Resolve(path, config.Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := Start(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = host.Close(context.Background()) })
+
+	ctrl := &fakeTunnelCtrl{active: map[string]bool{}}
+	host.SetTunnelController(ctrl)
+
+	// Connect an in-memory client to the OpenAI remote server.
+	cSide, sSide := mcp.NewInMemoryTransports()
+	if _, err := host.RemoteServer("openai").Connect(ctx, sSide, nil); err != nil {
+		t.Fatal(err)
+	}
+	session, err := mcp.NewClient(&mcp.Implementation{Name: "remote-openai", Version: "1"}, nil).Connect(ctx, cSide, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+
+	full, err := session.ListTools(ctx, nil)
+	if err != nil || len(full.Tools) != 22 {
+		t.Fatalf("expected 22 remote tools initially, got %d (%v)", len(full.Tools), err)
+	}
+
+	// Switch OpenAI remote wire to read-only via the extension grant handler.
+	if _, err := host.grants.handle("set_remote_grant", "https://example.com", json.RawMessage(`{"target":"openai","grant":{"read_only":true}}`)); err != nil {
+		t.Fatal(err)
+	}
+	ro, err := session.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ro.Tools) == 0 || len(ro.Tools) >= 22 {
+		t.Fatalf("expected read-only subset, got %d tools", len(ro.Tools))
+	}
+	for _, tool := range ro.Tools {
+		if tool.Name == "process_run" || tool.Name == "filesystem_write_text" || tool.Name == "computer_action" || tool.Name == "browser_action" {
+			t.Fatalf("mutating tool %q leaked into read-only remote wire", tool.Name)
+		}
+	}
+
+	// Verify persistence in YAML.
+	saved, err := config.Load(path)
+	if err != nil || !saved.Grants.Remote.OpenAI.ReadOnly {
+		t.Fatalf("remote grant not persisted: %+v (%v)", saved.Grants.Remote, err)
+	}
+
+	// Toggle tunnel via extension grant handler.
+	viewAny, err := host.grants.handle("tunnel_up", "", json.RawMessage(`{"name":"openai","ttl_seconds":60}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(viewAny)
+	if !strings.Contains(string(raw), `"attached_clients":3`) || !ctrl.active["openai"] {
+		t.Fatalf("extension tunnel_up did not reflect state: %s", raw)
+	}
+	if _, err := host.grants.handle("tunnel_down", "", json.RawMessage(`{"name":"openai"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if ctrl.active["openai"] {
+		t.Fatal("extension tunnel_down did not detach wire")
 	}
 }

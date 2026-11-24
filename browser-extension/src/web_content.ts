@@ -27,7 +27,7 @@
     const message = event.data;
     if (!message || message.protocol !== protocol || typeof message.id !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(message.id)) return;
     if (message.kind === 'cancel') { if (pending.has(message.id)) port?.postMessage({ protocol, kind: 'cancel', id: message.id }); return; }
-    if (message.kind !== 'request' || !['capabilities.list', 'capabilities.invoke', 'models.list', 'models.chat', 'models.close'].includes(message.method)
+    if (message.kind !== 'request' || !['capabilities.list', 'capabilities.invoke'].includes(message.method)
       || !message.params || typeof message.params !== 'object' || Array.isArray(message.params) || pending.has(message.id)) return;
     try {
       if (JSON.stringify(message.params).length > 1024 * 1024 || pending.size >= 8) throw new Error('web request capacity exceeded');

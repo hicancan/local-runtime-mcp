@@ -51,8 +51,5 @@ export function createLRMCPClient(target: Window = window) {
     request,
     listCapabilities: (options?: WebCallOptions) => request('capabilities.list', {}, options).result,
     invoke: (name: string, input: Record<string, unknown>, options?: WebCallOptions) => request('capabilities.invoke', { name, input }, options).result,
-    listModels: (options?: WebCallOptions) => request('models.list', {}, options).result,
-    chat: (input: Record<string, unknown>, options?: WebCallOptions) => request('models.chat', input, options),
-    closeConversation: (model: string, conversation_id: string, options?: WebCallOptions) => request('models.close', { model, conversation_id }, options).result,
   };
 }

@@ -11,8 +11,18 @@ import (
 // bridge credential, reaches it; no web page does.
 type GrantHandler func(method, origin string, grant json.RawMessage) (any, error)
 
-// The panel reads and sets grants, and approves or rejects page tools an AI proposed.
-var validGrantMethod = map[string]bool{"get": true, "set": true, "approve": true, "reject": true}
+// The panel reads and sets site/remote grants, approves or rejects proposed page
+// tools, toggles live remote tunnels, and can stop desktop control.
+var validGrantMethod = map[string]bool{
+	"get":              true,
+	"set":              true,
+	"approve":          true,
+	"reject":           true,
+	"tunnel_up":        true,
+	"tunnel_down":      true,
+	"set_remote_grant": true,
+	"stop_desktop":     true,
+}
 
 func (b *Bridge) SetGrantHandler(handler GrantHandler) {
 	b.mu.Lock()
@@ -37,10 +47,13 @@ func (b *Bridge) receiveGrants(writer http.ResponseWriter, request *http.Request
 		return
 	}
 	var envelope struct {
-		Method string          `json:"method"`
-		Origin string          `json:"origin"`
-		Grant  json.RawMessage `json:"grant"`
-		Name   string          `json:"name"`
+		Method     string          `json:"method"`
+		Origin     string          `json:"origin"`
+		Grant      json.RawMessage `json:"grant"`
+		Name       string          `json:"name"`
+		TTLSeconds int             `json:"ttl_seconds"`
+		Target     string          `json:"target"`
+		Remote     json.RawMessage `json:"remote"`
 	}
 	data, err := io.ReadAll(io.LimitReader(request.Body, 256*1024))
 	if err != nil || json.Unmarshal(data, &envelope) != nil || !validGrantMethod[envelope.Method] {
@@ -48,8 +61,17 @@ func (b *Bridge) receiveGrants(writer http.ResponseWriter, request *http.Request
 		return
 	}
 	body := envelope.Grant
-	if envelope.Method == "approve" || envelope.Method == "reject" {
+	switch envelope.Method {
+	case "approve", "reject":
 		body, _ = json.Marshal(envelope.Name)
+	case "tunnel_up":
+		body, _ = json.Marshal(map[string]any{"name": envelope.Name, "ttl_seconds": envelope.TTLSeconds})
+	case "tunnel_down":
+		body, _ = json.Marshal(map[string]any{"name": envelope.Name})
+	case "set_remote_grant":
+		body, _ = json.Marshal(map[string]any{"target": envelope.Target, "grant": envelope.Remote})
+	case "stop_desktop":
+		body = nil
 	}
 	result, err := handler(envelope.Method, envelope.Origin, body)
 	writer.Header().Set("Content-Type", "application/json")

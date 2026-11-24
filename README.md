@@ -7,11 +7,11 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-Give AI clients the programs, files, images, browser profiles, and desktop of the machine running `lrmcp`. Local Runtime MCP is a portable local runtime with **22 built-in MCP tools** and reusable webpage capabilities registered from the file tree.
+Give AI clients the programs, files, images, browser profiles, and desktop of the machine running `lrmcp`. Local Runtime MCP is a unified personal capability runtime with **22 core built-in MCP tools**, `capability_propose` for distilling reusable webpage tools (Web MCP), and owner-authored local app bindings (App MCP).
 
-The same runtime offers an exact-origin-authorized browser SDK and a local model API with a separate model-only key. A browser model uses registered `start / read / stop` capabilities; Harness and applications keep their own agent loops. See [tools, webpages and models](docs/models.zh-CN.md).
+`lrmcp` and its paired Chromium extension form one bidirectional dual-core runtime: one persistent user-session daemon owns the OS side (`127.0.0.1:9317`) and bridges multiple Chromium profiles (`127.0.0.1:9315`). Every local client attaches concurrently over stateless `stdio` thin proxies; remote cloud clients plug and unplug live through OpenAI Secure MCP Tunnel or Cloudflare Tunnel with zero daemon restarts and per-wire remote grants (`grants.remote`). See [v16.0.0 release notes](docs/releases/v16.0.0.md).
 
-Connect locally over stdio or Streamable HTTP, or remotely through OpenAI Secure MCP Tunnel and Cloudflare Tunnel. One running instance can expose both tunnels at once, with one set of process sessions, browser instances, and desktop control. Independent process sessions and browser tabs run concurrently; shared files and desktop input have explicit coordination rules.
+Independent process sessions, filesystem paths, and browser tabs run concurrently; shared files and desktop physical input have explicit coordination rules.
 
 - **Native multimodal results.** Files, browser pages, and desktop observations return text and MCP image content directly.
 - **Explicit browser targets.** Connect several Chromium profiles, select a named browser instance, and operate its opaque tab handles.
@@ -77,9 +77,16 @@ The Host creates one Process Manager, Filesystem Service, Browser Bridge, and Co
 
 ```text
 lrmcp
-├── serve
-│   ├── --transport stdio|local|http
-│   └── --tunnel openai|cloudflare   (repeatable with HTTP)
+├── serve --transport stdio              Pure stdio thin proxy (auto-starts detached daemon)
+├── start [--http] [--tunnel ...]        Ensure detached user-session daemon is running
+├── stop                                 Gracefully stop the running daemon
+├── status                               Inspect live daemon, browser profiles, and wires
+├── daemon [--http] [--tunnel ...]       Run unified daemon in foreground
+├── tunnel
+│   ├── up <openai|cloudflare|http> [--ttl 2h]
+│   ├── down <openai|cloudflare|http|all>
+│   └── status
+├── grant remote <openai|http> [--read-only] [--tool NAME]
 ├── setup
 │   ├── browser
 │   ├── local
@@ -89,19 +96,22 @@ lrmcp
 └── help
 ```
 
-`serve` starts one Host (or attaches `stdio` as a stateless thin proxy when a local daemon is already listening on `127.0.0.1:9317`). Select `--transport local` for the local-only daemon (`9317` + `9315`), `--transport stdio` for local MCP clients, or `--transport http` to also open the public/tunnel-facing gateway (`9316`, remote `/mcp` and OAuth only—never `/v1` or `LocalApps`).
+One detached user-session daemon owns the OS runtime (`127.0.0.1:9317`) and browser extension bridge (`127.0.0.1:9315`). When `local.token` is configured (`lrmcp setup local`), the first `lrmcp serve --transport stdio` client automatically spawns the detached daemon and attaches as a stateless thin proxy; closing any IDE never stops the daemon or disconnects other clients. Remote wires (`openai`, `cloudflare`, `http`) plug and unplug live without restarting the daemon.
 
-| Command | Connection and credentials |
+| Command | Behavior and credentials |
 | --- | --- |
-| `lrmcp serve --transport stdio` | Standard MCP process pipes; automatically attaches as a thin proxy when the local daemon on `127.0.0.1:9317` is running (shares browser, desktop gate, `LocalApps`, and live `tools/list_changed`). |
-| `lrmcp serve --transport local` | Local-only daemon serving `127.0.0.1:9317` (`/mcp`, `/v1`, `/capabilities`) and `127.0.0.1:9315` (browser bridge), with no public port. |
-| `lrmcp serve --transport http` | Serves the local-only plane (when configured) alongside the public loopback HTTP gateway (`127.0.0.1:9316/mcp`). |
-| `lrmcp serve --transport http --tunnel openai` | Official OpenAI forwarding to a private loopback MCP endpoint; configure the tunnel ID and API key. |
-| `lrmcp serve --transport http --tunnel cloudflare` | Official `cloudflared` companion forwards to public loopback HTTP (`127.0.0.1:9316`). |
-| `lrmcp serve --transport http --tunnel openai --tunnel cloudflare` | Both remote providers and all local clients share one Host and its resources. |
+| `lrmcp serve --transport stdio` | Pure MCP stdio thin proxy; auto-spawns the detached daemon if not yet running and attaches to `127.0.0.1:9317/mcp/attach` (isolated in-process host if `local.token` is unset). |
+| `lrmcp start [--http] [--tunnel openai\|cloudflare] [--ttl 2h]` | Ensures the background user-session daemon is running and optionally attaches remote wires. |
+| `lrmcp stop` | Gracefully shuts down the running daemon via `127.0.0.1:9317/admin/shutdown`. |
+| `lrmcp status` | Prints live daemon PID, attached stdio clients, browser profiles, desktop lock, capability counts, and remote wire states. |
+| `lrmcp daemon [--http] [--tunnel ...]` | Runs the unified daemon in the foreground. |
+| `lrmcp tunnel up openai [--ttl 2h]` | Ensures daemon is running and hot-plugs OpenAI Secure MCP Tunnel on its private loopback hop (zero restart, optional auto-expiry lease). |
+| `lrmcp tunnel up cloudflare [--ttl 2h]` | Hot-plugs public loopback HTTP (`127.0.0.1:9316`) and `cloudflared` (zero restart). |
+| `lrmcp tunnel down openai\|cloudflare\|http\|all` | Hot-unplugs one or all remote wires live; local clients and browser sessions continue uninterrupted. |
+| `lrmcp grant remote openai\|http [--read-only] [--tool NAME]` | Constrains what a remote wire may list and invoke; live-updates connected clients via `tools/list_changed`. |
 | `lrmcp setup browser` | Generate bridge credentials and extract/configure the extension. |
-| `lrmcp setup local` | Generate `local.token` for multi-client `stdio` sharing on `127.0.0.1:9317`. |
-| `lrmcp setup client --id NAME [--model ID]` | Register a scoped local native client in `grants.clients` (`--show` displays credentials). |
+| `lrmcp setup local` | Generate `local.token` for multi-client detached daemon sharing on `127.0.0.1:9317`. |
+| `lrmcp setup client --id NAME [--browser-id ID]` | Register a scoped local native client in `grants.clients` (`--show` displays credentials). |
 | `lrmcp setup oauth --client-name NAME --redirect-uri URI` | Register an OAuth client with its exact callback URI and generate credentials. |
 | `lrmcp setup oauth --show` | Display existing OAuth credentials deliberately in the local terminal. |
 | `lrmcp version` | Print the executable version. |
@@ -387,43 +397,45 @@ The command saves bridge credentials to the adjacent YAML and extracts `browser-
 
 ### OpenAI Tunnel
 
-Fill the `openai` section and run:
+Fill the `openai` section, ensure `local.token` is initialized (`./lrmcp.exe setup local`), and hot-plug the wire live (or toggle it directly in the browser extension `L` panel):
 
 ```powershell
-./lrmcp.exe serve --transport http --tunnel openai
+./lrmcp.exe tunnel up openai --ttl 2h
+./lrmcp.exe tunnel down openai
 ```
 
 See the [OpenAI Secure MCP Tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) for provider setup and supported clients. The private HTTP origin is created automatically; its port and private-hop credential remain runtime-only.
 
 ### Streamable HTTP
 
-For direct HTTP access, choose `http.auth: bearer`, fill `http.bearer_token`, and run:
+For direct loopback HTTP access, choose `http.auth: bearer`, fill `http.bearer_token`, and hot-plug the HTTP wire:
 
 ```powershell
-./lrmcp.exe serve --transport http
+./lrmcp.exe tunnel up http
 ```
 
 The default MCP endpoint is `http://127.0.0.1:9316/mcp`. The loopback listener accepts the configured Bearer token and can serve as a reverse-proxy origin. An OAuth-enabled origin additionally serves discovery, authorization, and token endpoints under its public HTTPS address.
 
 ### Cloudflare Tunnel
 
-Create a remotely managed Cloudflare Tunnel, route its hostname to `http://127.0.0.1:9316`, fill `http.public_host` and `cloudflare.tunnel_token`, configure HTTP authentication, then run:
+Create a remotely managed Cloudflare Tunnel, route its hostname to `http://127.0.0.1:9316`, fill `http.public_host` and `cloudflare.tunnel_token`, configure HTTP authentication, then hot-plug Cloudflare:
 
 ```powershell
-./lrmcp.exe serve --transport http --tunnel cloudflare
+./lrmcp.exe tunnel up cloudflare
 ```
 
 The release includes the pinned `cloudflared` companion. Configure the remote MCP client to use `https://<public_host>/mcp`. With Bearer authentication, enter the MCP Bearer token in the client's token setting. With OAuth, register that client's redirect URI and use its client credentials. The Cloudflare tunnel token authenticates the tunnel process; HTTP credentials authorize MCP clients.
 
 ### Both tunnels
 
-Fill both provider sections and run one process:
+Fill both provider sections and attach both wires onto the same running daemon:
 
 ```powershell
-./lrmcp.exe serve --transport http --tunnel openai --tunnel cloudflare
+./lrmcp.exe tunnel up openai
+./lrmcp.exe tunnel up cloudflare
 ```
 
-Both connections use one browser bridge, process-session registry, filesystem coordination service, and desktop controller. Provider exits are reported locally while the other live entry point continues. Keep the terminal open; `Ctrl+C` shuts down the complete runtime. Logs distinguish a degraded provider from an available peer.
+Both connections share one browser bridge, process-session registry, filesystem coordination service, and desktop controller. Detaching or restarting either wire never interrupts local `stdio` clients or the surviving peer wire. Use `lrmcp grant remote openai --read-only` or `lrmcp grant remote http --read-only` (or the `L` extension panel) to restrict any remote wire live.
 
 ### OAuth for Gemini and other clients
 

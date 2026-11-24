@@ -24,14 +24,15 @@ func TestVersion(t *testing.T) {
 	}
 }
 
-func TestHelpDescribesConfiguration(t *testing.T) {
+func TestHelpDescribesUnifiedCommands(t *testing.T) {
 	var output, errors bytes.Buffer
 	executable := filepath.Join(t.TempDir(), "lrmcp.exe")
 	if err := run(context.Background(), []string{"help"}, strings.NewReader(""), &output, &errors, executable); err != nil {
 		t.Fatal(err)
 	}
 	for _, value := range []string{
-		"serve --transport stdio", "serve --transport local", "serve --transport http", "--tunnel openai", "--tunnel cloudflare",
+		"serve --transport stdio", "lrmcp start", "lrmcp stop", "lrmcp status",
+		"lrmcp daemon", "lrmcp tunnel up", "lrmcp tunnel down", "lrmcp grant remote",
 		"setup browser", "setup local", "setup client", "setup oauth", config.FileName,
 		"command line > LOCAL_RUNTIME_MCP_* environment > YAML > defaults",
 		"https://github.com/hicancan/local-runtime-mcp", "GNU AGPL v3.0 only",
@@ -40,7 +41,7 @@ func TestHelpDescribesConfiguration(t *testing.T) {
 			t.Fatalf("help is missing %q: %q", value, output.String())
 		}
 	}
-	for _, legacy := range []string{"connect openai", "expose cloudflare", "browser-setup", "lrmcp [flags]"} {
+	for _, legacy := range []string{"connect openai", "expose cloudflare", "browser-setup", "serve --transport local", "serve --transport http", "--model"} {
 		if strings.Contains(output.String(), legacy) {
 			t.Fatalf("help still contains removed command %q: %q", legacy, output.String())
 		}
@@ -61,7 +62,8 @@ func TestRemovedCommandsAreUnknown(t *testing.T) {
 		{"tunnel", "openai"},
 		{"tunnel", "cloudflare"},
 		{"serve", "stdio"},
-		{"serve", "http"},
+		{"serve", "--transport", "local"},
+		{"serve", "--transport", "http"},
 		{"serve", "--stdio"},
 		{"serve", "--http"},
 	} {
@@ -79,7 +81,12 @@ func TestCommandGroupsRejectUnknownMembers(t *testing.T) {
 		{"serve"},
 		{"serve", "openai"},
 		{"tunnel"},
+		{"tunnel", "up"},
+		{"tunnel", "down"},
 		{"tunnel", "stdio"},
+		{"grant"},
+		{"grant", "web"},
+		{"grant", "remote", "unknown"},
 		{"setup"},
 		{"setup", "computer"},
 	} {
@@ -87,6 +94,22 @@ func TestCommandGroupsRejectUnknownMembers(t *testing.T) {
 		if err := run(context.Background(), args, strings.NewReader(""), &output, &errors, executable); err == nil {
 			t.Fatalf("invalid command %q was accepted", args)
 		}
+	}
+}
+
+func TestGrantRemotePersistsOffline(t *testing.T) {
+	root := t.TempDir()
+	executable := filepath.Join(root, "lrmcp.exe")
+	var out, errBuf bytes.Buffer
+	if err := run(context.Background(), []string{"grant", "remote", "openai", "--read-only", "--tool", "filesystem_read_text"}, strings.NewReader(""), &out, &errBuf, executable); err != nil {
+		t.Fatalf("grant remote failed: %v (%s)", err, errBuf.String())
+	}
+	saved, err := config.Load(filepath.Join(root, config.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !saved.Grants.Remote.OpenAI.ReadOnly || len(saved.Grants.Remote.OpenAI.Tools) != 1 || saved.Grants.Remote.OpenAI.Tools[0] != "filesystem_read_text" {
+		t.Fatalf("unexpected persisted remote grant: %+v", saved.Grants.Remote)
 	}
 }
 

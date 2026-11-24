@@ -12,7 +12,7 @@ test('a site grant covers its subdomains, while a local origin covers only itsel
 });
 
 test('the toolbar roles follow real grants only', () => {
-  const view = { site: '', pageTools: [], machine: [], models: [], grants: [
+  const view = { site: '', pageTools: [], machine: [], proposals: [], grants: [
     { Site: 'https://hicancan.top', Use: true, Tools: [] },
     { Site: 'https://icourse163.org', Provide: true },
   ] };

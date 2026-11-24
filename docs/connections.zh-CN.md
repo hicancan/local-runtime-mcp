@@ -4,26 +4,31 @@
 
 一个 `lrmcp` 进程管理一个 Runtime Host。所有 MCP 入口提供相同的 22 个内建工具及所有者注册的能力，共享进程会话、浏览器目标、文件提交协调和桌面控制。
 
-## 选择传输与 Provider
+## 选择传输与热插拔远端网线
 
 ```powershell
-# 本地进程集成
+# 本地 MCP 客户端（配置 local.token 后自动拉起并附着后台独立 Daemon）
 ./lrmcp.exe serve --transport stdio
 
-# 直接访问 loopback HTTP
-./lrmcp.exe serve --transport http
+# 后台 Daemon 生命周期与状态
+./lrmcp.exe start
+./lrmcp.exe status
+./lrmcp.exe stop
 
-# 单个远端 Provider
-./lrmcp.exe serve --transport http --tunnel openai
-./lrmcp.exe serve --transport http --tunnel cloudflare
+# 在运行中的 Daemon 上实时热插拔远端网线（0 重启、不中断本地会话）
+./lrmcp.exe tunnel up openai --ttl 2h
+./lrmcp.exe tunnel up cloudflare
+./lrmcp.exe tunnel up http
+./lrmcp.exe tunnel down openai
+./lrmcp.exe tunnel down all
 
-# 两个远端 Provider，共享一个 Host
-./lrmcp.exe serve --transport http --tunnel openai --tunnel cloudflare
+# 实时收窄远端网线权限边界（立即推送 tools/list_changed）
+./lrmcp.exe grant remote openai --read-only
 ```
 
-传输方式需要明确选择，Tunnel 负责转发 HTTP。`local-runtime-mcp.yaml` 中保存的凭据在选中对应 Provider 时生效。仅使用 OpenAI 时创建私有 HTTP 源站；直接 HTTP 或 Cloudflare 使用配置中的公开访问源站；双 Provider 在同一个 MCP Server 上创建两种源站。
+远端网线默认全部断开、零外网暴露；通过命令行或浏览器 `L` 扩展面板按需热插拔。OpenAI 网线自动建立私有回环源站，`http` 与 `cloudflare` 使用公开回环源站（`127.0.0.1:9316`），与所有本地 `stdio` 客户端共享同一个运行时内核。
 
-每个 Provider 管理自己的连接生命周期。某个 Provider 发生终止错误会明确报告，其他在线入口继续服务。按 `Ctrl+C` 关闭整个运行时；所有入口结束时 Host 退出并报告对应失败。恢复可以重新建立传输，机器操作是否重试由客户端明确决定。
+每条网线独立管理生命周期：单条网线报错会记录在 `lrmcp status` 中，不影响本地客户端或其他在线网线。执行 `lrmcp stop`（或在前台 `lrmcp daemon` 按 `Ctrl+C`）优雅断开全部网线并关闭 Host。
 
 ## 凭据职责
 
@@ -52,10 +57,11 @@
    ```
 
 5. 将生成的 client ID 和 client secret 填入 Gemini 对应字段。保留所有者批准密钥用于授权确认。准备命令选择 `http.auth: oauth`，凭据保存在同目录配置。
-6. 开启 Cloudflare，或者同时启用两个 Provider：
+6. 实时热插 Cloudflare 或同时挂载两条远端网线：
 
    ```powershell
-   ./lrmcp.exe serve --transport http --tunnel openai --tunnel cloudflare
+   ./lrmcp.exe tunnel up cloudflare
+   # 可选：./lrmcp.exe tunnel up openai
    ```
 
 7. 继续客户端连接流程。在 Local Runtime 授权页面核对公开域名、注册客户端和访问范围，使用所有者批准密钥确认。浏览器经注册回调返回客户端应用，随后完成令牌交换和工具发现。

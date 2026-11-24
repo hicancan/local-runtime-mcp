@@ -39,7 +39,7 @@
                 port?.postMessage({ protocol, kind: 'cancel', id: message.id });
             return;
         }
-        if (message.kind !== 'request' || !['capabilities.list', 'capabilities.invoke', 'models.list', 'models.chat', 'models.close'].includes(message.method)
+        if (message.kind !== 'request' || !['capabilities.list', 'capabilities.invoke'].includes(message.method)
             || !message.params || typeof message.params !== 'object' || Array.isArray(message.params) || pending.has(message.id))
             return;
         try {

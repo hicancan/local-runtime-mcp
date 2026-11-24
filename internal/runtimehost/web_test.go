@@ -9,7 +9,6 @@ import (
 	"github.com/hicancan/local-runtime-mcp/internal/browser"
 	"github.com/hicancan/local-runtime-mcp/internal/capability"
 	"github.com/hicancan/local-runtime-mcp/internal/config"
-	"github.com/hicancan/local-runtime-mcp/internal/modelapi"
 )
 
 type unavailableTabs struct{ calls int }
@@ -23,27 +22,23 @@ func (t *unavailableTabs) Act(context.Context, browser.Action) (browser.ActionRe
 	panic("unexpected browser action")
 }
 
-func TestWebOriginAndModelGrants(t *testing.T) {
+func TestWebOriginAndCapabilityGrants(t *testing.T) {
 	tabs := &unavailableTabs{}
 	registry, err := capability.Load("", tabs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	service, err := modelapi.New(nil, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	handler := webHandler(newGrantStore([]config.WebGrant{{Site: "https://studev.example", Use: true, Models: nil}}, "", registry, nil, nil), registry, service)
+	handler := webHandler(newGrantStore([]config.WebGrant{{Site: "https://studev.example", Use: true}}, config.RemoteGrants{}, "", registry, nil, nil, nil), registry)
 	source := browser.WebSource{Origin: "https://evil.example", BrowserID: "browser-a"}
 	emit := func(browser.WebEvent) error { t.Fatal("unauthorized request emitted an event"); return nil }
-	for _, method := range []string{"models.list", "models.chat", "models.close", "capabilities.list", "capabilities.invoke"} {
-		if _, err := handler(context.Background(), source, browser.WebRequest{Method: method, Params: json.RawMessage(`{"model":"hidden","messages":[]}`)}, emit); err == nil {
+	for _, method := range []string{"capabilities.list", "capabilities.invoke", "models.list", "models.chat"} {
+		if _, err := handler(context.Background(), source, browser.WebRequest{Method: method, Params: json.RawMessage(`{}`)}, emit); err == nil {
 			t.Fatal("foreign origin permitted", method)
 		}
 	}
 	source.Origin = "https://studev.example"
-	if _, err := handler(context.Background(), source, browser.WebRequest{Method: "models.chat", Params: json.RawMessage(`{"model":"hidden","messages":[]}`)}, emit); err == nil {
-		t.Fatal("ungranted model permitted")
+	if _, err := handler(context.Background(), source, browser.WebRequest{Method: "models.list", Params: json.RawMessage(`{}`)}, emit); err == nil {
+		t.Fatal("removed models.list method was permitted")
 	}
 	if _, err := handler(context.Background(), source, browser.WebRequest{Method: "capabilities.invoke", Params: json.RawMessage(`{"name":"deepseek.read","input":{},"tab_id":"forged"}`)}, emit); err == nil {
 		t.Fatal("page-selected target accepted")
@@ -51,13 +46,13 @@ func TestWebOriginAndModelGrants(t *testing.T) {
 	if tabs.calls != 0 {
 		t.Fatal("unauthorized request reached browser")
 	}
-	value, err := handler(context.Background(), source, browser.WebRequest{Method: "models.list", Params: json.RawMessage(`{}`)}, emit)
+	value, err := handler(context.Background(), source, browser.WebRequest{Method: "capabilities.list", Params: json.RawMessage(`{}`)}, emit)
 	if err != nil {
 		t.Fatal(err)
 	}
 	encoded, _ := json.Marshal(value)
-	if string(encoded) != `{"data":[],"object":"list"}` {
-		t.Fatalf("unexpected models %s", encoded)
+	if string(encoded) != `[]` {
+		t.Fatalf("unexpected capabilities %s", encoded)
 	}
 }
 

@@ -16,7 +16,6 @@ import (
 	"github.com/hicancan/local-runtime-mcp/internal/browser"
 	"github.com/hicancan/local-runtime-mcp/internal/capability"
 	"github.com/hicancan/local-runtime-mcp/internal/config"
-	"github.com/hicancan/local-runtime-mcp/internal/modelapi"
 )
 
 func validateGrantsAndCredentials(cfg *config.Config) error {
@@ -104,21 +103,6 @@ func findClientByToken(clients []config.ClientGrant, bearer string) (config.Clie
 		}
 	}
 	return matched, found
-}
-
-func localModelAuthorizer(clients []config.ClientGrant) modelapi.Authorizer {
-	copied := append([]config.ClientGrant(nil), clients...)
-	return func(bearer string) (modelapi.ClientScope, bool) {
-		client, ok := findClientByToken(copied, bearer)
-		if !ok {
-			return modelapi.ClientScope{}, false
-		}
-		return modelapi.ClientScope{
-			ID:        client.ID,
-			BrowserID: client.BrowserID,
-			Models:    append([]string(nil), client.Models...),
-		}, true
-	}
 }
 
 func localCapabilitiesHandler(clients []config.ClientGrant, registry *capability.Registry, status func() browser.Status) http.Handler {

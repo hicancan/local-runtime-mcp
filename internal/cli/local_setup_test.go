@@ -55,11 +55,11 @@ func TestLocalAndClientSetupPersistWithoutRotatingOrLeaking(t *testing.T) {
 		return value
 	}
 
-	first := invoke("setup", "client", "--id", "studev-win", "--model", "deepseek-web")
+	first := invoke("setup", "client", "--id", "studev-win")
 	if first["client_id"] != "studev-win" || len(first["token"].(string)) != 64 || first["local_url"] != "http://"+config.DefaultLocal {
 		t.Fatalf("unexpected client setup output: %+v", first)
 	}
-	second := invoke("setup", "client", "--id", "studev-win", "--model", "deepseek-web", "--browser-id", "edge-main")
+	second := invoke("setup", "client", "--id", "studev-win", "--browser-id", "edge-main")
 	if first["token"] != second["token"] || second["browser_id"] != "edge-main" {
 		t.Fatalf("setup client rotated token or lost browser_id: %+v", second)
 	}

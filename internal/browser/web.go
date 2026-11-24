@@ -161,7 +161,7 @@ func validWebEnvelope(v webEnvelope) bool {
 		}
 	}
 	switch v.Request.Method {
-	case "capabilities.list", "capabilities.invoke", "models.list", "models.chat", "models.close":
+	case "capabilities.list", "capabilities.invoke":
 	default:
 		return false
 	}

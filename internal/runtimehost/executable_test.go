@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"image"
 	"image/png"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -183,5 +186,201 @@ func TestExecutableStdio(t *testing.T) {
 		if terminated.Running {
 			t.Fatal("terminated process is still running")
 		}
+	}
+}
+
+// TestExecutableDetachedDaemonLifecycleAndHotPlug proves the core v16.0.0
+// unified daemon contract end-to-end against the real compiled binary:
+//  1. First `serve --transport stdio` auto-spawns a detached user-session daemon.
+//  2. Second `serve --transport stdio` attaches to that same daemon concurrently.
+//  3. Closing the FIRST stdio client NEVER stops the daemon or breaks the second client.
+//  4. `tunnel up http` / `grant remote http --read-only` / `tunnel down http`
+//     operate live with ZERO daemon restarts.
+//  5. `lrmcp stop` gracefully terminates the detached daemon.
+func TestExecutableDetachedDaemonLifecycleAndHotPlug(t *testing.T) {
+	srcExe := os.Getenv("LOCAL_RUNTIME_MCP_EXECUTABLE")
+	if srcExe == "" {
+		t.Skip("set LOCAL_RUNTIME_MCP_EXECUTABLE to a release executable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	// Copy the executable into an isolated TempDir so its adjacent
+	// local-runtime-mcp.yaml does not touch any real user configuration.
+	workDir := t.TempDir()
+	binName := "lrmcp"
+	if runtime.GOOS == "windows" {
+		binName = "lrmcp.exe"
+	}
+	executable := filepath.Join(workDir, binName)
+	srcData, err := os.ReadFile(srcExe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(executable, srcData, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	freePort := func() string {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := l.Addr().String()
+		_ = l.Close()
+		return addr
+	}
+	localAddr := freePort()
+	browserAddr := freePort()
+	httpAddr := freePort()
+	httpToken := strings.Repeat("h", 32)
+	cfgYAML := "browser:\n  listen: " + browserAddr + "\n  token: " + strings.Repeat("b", 32) + "\n" +
+		"local:\n  listen: " + localAddr + "\n  token: " + strings.Repeat("l", 32) + "\n" +
+		"http:\n  listen: " + httpAddr + "\n  auth: bearer\n  bearer_token: " + httpToken + "\n"
+	if err := os.WriteFile(filepath.Join(workDir, config.FileName), []byte(cfgYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanEnv := func() []string {
+		var env []string
+		for _, entry := range os.Environ() {
+			if !strings.HasPrefix(strings.ToUpper(entry), config.EnvironmentPrefix) {
+				env = append(env, entry)
+			}
+		}
+		return env
+	}
+	runCLI := func(args ...string) []byte {
+		t.Helper()
+		cmd := exec.CommandContext(ctx, executable, args...)
+		cmd.Dir = workDir
+		cmd.Env = cleanEnv()
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("lrmcp %v failed: %v\n%s", args, err, string(out))
+		}
+		return out
+	}
+
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		cmd := exec.CommandContext(stopCtx, executable, "stop")
+		cmd.Dir = workDir
+		cmd.Env = cleanEnv()
+		_ = cmd.Run()
+	})
+
+	connectStdio := func(name string) *mcp.ClientSession {
+		t.Helper()
+		cmd := exec.Command(executable, "serve", "--transport", "stdio")
+		cmd.Dir = workDir
+		cmd.Env = cleanEnv()
+		var diag bytes.Buffer
+		cmd.Stderr = &diag
+		session, err := mcp.NewClient(&mcp.Implementation{Name: name, Version: "1"}, nil).Connect(ctx, &mcp.CommandTransport{
+			Command: cmd, TerminateDuration: 5 * time.Second,
+		}, nil)
+		if err != nil {
+			t.Fatalf("connect %s: %v (stderr=%s)", name, err, diag.String())
+		}
+		return session
+	}
+
+	// 1. First stdio client auto-spawns the detached daemon.
+	first := connectStdio("first-ide")
+	// 2. Second stdio client attaches concurrently to the same daemon.
+	second := connectStdio("second-ide")
+	defer func() { _ = second.Close() }()
+
+	var st1 struct {
+		Running bool `json:"running"`
+		Daemon  struct {
+			PID           int `json:"pid"`
+			AttachedStdio int `json:"attached_stdio"`
+		} `json:"daemon"`
+	}
+	if err := json.Unmarshal(runCLI("status"), &st1); err != nil {
+		t.Fatal(err)
+	}
+	if !st1.Running || st1.Daemon.PID <= 0 || st1.Daemon.AttachedStdio != 2 {
+		t.Fatalf("unexpected initial daemon status: %+v", st1)
+	}
+
+	// 3. Close the FIRST stdio client — detached daemon & second client MUST survive!
+	if err := first.Close(); err != nil {
+		t.Fatalf("close first stdio: %v", err)
+	}
+	deadline := time.Now().Add(4 * time.Second)
+	for {
+		var st2 struct {
+			Running bool `json:"running"`
+			Daemon  struct {
+				PID           int `json:"pid"`
+				AttachedStdio int `json:"attached_stdio"`
+			} `json:"daemon"`
+		}
+		if err := json.Unmarshal(runCLI("status"), &st2); err != nil {
+			t.Fatal(err)
+		}
+		if st2.Running && st2.Daemon.PID == st1.Daemon.PID && st2.Daemon.AttachedStdio == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("daemon did not survive first stdio close cleanly: %+v", st2)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if res, err := second.CallTool(ctx, &mcp.CallToolParams{Name: "browser_status", Arguments: map[string]any{}}); err != nil || res.IsError {
+		t.Fatalf("second stdio client broke after first closed: %v %+v", err, res)
+	}
+
+	// 4. Hot-plug remote HTTP wire live (0 daemon restart), apply read-only remote grant, then unplug.
+	runCLI("tunnel", "up", "http")
+	runCLI("grant", "remote", "http", "--read-only")
+
+	// Verify daemon PID never changed.
+	var st3 struct {
+		Daemon struct {
+			PID int `json:"pid"`
+		} `json:"daemon"`
+	}
+	if err := json.Unmarshal(runCLI("status"), &st3); err != nil {
+		t.Fatal(err)
+	}
+	if st3.Daemon.PID != st1.Daemon.PID {
+		t.Fatalf("daemon restarted during tunnel hot-plug: before=%d after=%d", st1.Daemon.PID, st3.Daemon.PID)
+	}
+
+	// Verify public HTTP responds to MCP initialize/tools/list with read-only tools only.
+	httpClient := &http.Client{Transport: &http.Transport{Proxy: nil}, Timeout: 5 * time.Second}
+	reqBody := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+httpAddr+"/mcp", strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer "+httpToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		t.Fatalf("remote HTTP request failed: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || strings.Contains(string(body), `"process_run"`) || !strings.Contains(string(body), `"filesystem_read_text"`) {
+		t.Fatalf("remote read-only filter failed: HTTP %d %s", resp.StatusCode, string(body))
+	}
+
+	runCLI("tunnel", "down", "http")
+
+	// 5. Stop daemon gracefully.
+	_ = second.Close()
+	runCLI("stop")
+	var stEnd struct {
+		Running bool `json:"running"`
+	}
+	if err := json.Unmarshal(runCLI("status"), &stEnd); err != nil {
+		t.Fatal(err)
+	}
+	if stEnd.Running {
+		t.Fatal("daemon still running after lrmcp stop")
 	}
 }

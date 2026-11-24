@@ -8,6 +8,44 @@
   "connected": {
     "message": "已连接 lrmcp"
   },
+  "connectedSessions": {
+    "message": "已连接 lrmcp · $COUNT$ 个本地会话",
+    "placeholders": {
+      "count": {
+        "content": "$1"
+      }
+    }
+  },
+  "tunnelsTitle": {
+    "message": "远端网线（热插拔）"
+  },
+  "tunnelsHint": {
+    "message": "随时插拔云端连接，不重启本机守护进程。勾选“仅只读”可将对应远端限制为只读工具。"
+  },
+  "wireOpenAI": {
+    "message": "OpenAI Tunnel"
+  },
+  "wireCloudflare": {
+    "message": "Cloudflare Tunnel"
+  },
+  "wireHTTP": {
+    "message": "本机公网 HTTP (9316)"
+  },
+  "remoteReadOnly": {
+    "message": "仅只读工具（禁止写入与运行程序）"
+  },
+  "tunnelAttached": {
+    "message": "远端网线已接入"
+  },
+  "tunnelDetached": {
+    "message": "远端网线已断开"
+  },
+  "stopDesktop": {
+    "message": "停止当前桌面控制"
+  },
+  "desktopStopped": {
+    "message": "已撤销桌面控制权"
+  },
   "disconnected": {
     "message": "lrmcp 未运行或未设置"
   },
@@ -43,9 +81,6 @@
   },
   "groupPage": {
     "message": "网页工具"
-  },
-  "groupModels": {
-    "message": "浏览器模型 · 实验"
   },
   "saved": {
     "message": "已保存"

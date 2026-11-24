@@ -13,14 +13,10 @@ import (
 func TestLocalHTTPRejectsBrowserProxyAndEnforcesTokenSeparation(t *testing.T) {
 	ownerToken := strings.Repeat("o", 32)
 	clientToken := strings.Repeat("c", 32)
-	modelHits, capHits := 0, 0
-	modelHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		modelHits++
-		if r.Header.Get("Authorization") != "Bearer "+clientToken {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
+	adminHits, capHits := 0, 0
+	adminHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		adminHits++
+		w.WriteHeader(http.StatusOK)
 	})
 	capHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capHits++
@@ -37,9 +33,9 @@ func TestLocalHTTPRejectsBrowserProxyAndEnforcesTokenSeparation(t *testing.T) {
 	server, err := NewLocalHTTP(mcpSrv, LocalConfig{
 		Listen:       "127.0.0.1:0",
 		Token:        ownerToken,
-		Version:      "15.0.0",
-		Models:       modelHandler,
+		Version:      "16.0.0",
 		Capabilities: capHandler,
+		Admin:        adminHandler,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -53,17 +49,19 @@ func TestLocalHTTPRejectsBrowserProxyAndEnforcesTokenSeparation(t *testing.T) {
 	}{
 		{"health ok", http.MethodGet, "/health", "127.0.0.1", "127.0.0.1:4567", ownerToken, "", "", http.StatusOK},
 		{"health rejects client token", http.MethodGet, "/health", "127.0.0.1", "127.0.0.1:4567", clientToken, "", "", http.StatusUnauthorized},
+		{"admin ok", http.MethodGet, "/admin/status", "127.0.0.1", "127.0.0.1:4567", ownerToken, "", "", http.StatusOK},
+		{"admin rejects client token", http.MethodGet, "/admin/status", "127.0.0.1", "127.0.0.1:4567", clientToken, "", "", http.StatusUnauthorized},
+		{"admin rejects browser origin", http.MethodGet, "/admin/status", "127.0.0.1", "127.0.0.1:4567", ownerToken, "Origin", "https://evil.example", http.StatusForbidden},
 		{"mcp rejects client token", http.MethodPost, "/mcp", "127.0.0.1", "127.0.0.1:4567", clientToken, "", "", http.StatusUnauthorized},
 		{"mcp missing token", http.MethodPost, "/mcp", "localhost", "127.0.0.1:4567", "", "", "", http.StatusUnauthorized},
-		{"models ok", http.MethodGet, "/v1/models", "127.0.0.1", "127.0.0.1:4567", clientToken, "", "", http.StatusNoContent},
-		{"models rejects owner token", http.MethodGet, "/v1/models", "127.0.0.1", "127.0.0.1:4567", ownerToken, "", "", http.StatusUnauthorized},
+		{"models route removed", http.MethodGet, "/v1/models", "127.0.0.1", "127.0.0.1:4567", clientToken, "", "", http.StatusNotFound},
 		{"capabilities ok", http.MethodGet, "/capabilities", "127.0.0.1", "127.0.0.1:4567", clientToken, "", "", http.StatusOK},
 		{"capabilities rejects owner token", http.MethodGet, "/capabilities", "127.0.0.1", "127.0.0.1:4567", ownerToken, "", "", http.StatusUnauthorized},
 		{"remote caller blocked", http.MethodGet, "/health", "127.0.0.1", "192.0.2.1:4567", ownerToken, "", "", http.StatusForbidden},
 		{"public host blocked", http.MethodGet, "/health", "public.example", "127.0.0.1:4567", ownerToken, "", "", http.StatusForbidden},
 		{"browser origin blocked", http.MethodGet, "/capabilities", "127.0.0.1", "127.0.0.1:4567", clientToken, "Origin", "https://studev.example", http.StatusForbidden},
 		{"empty origin blocked", http.MethodGet, "/capabilities", "127.0.0.1", "127.0.0.1:4567", clientToken, "Origin", "", http.StatusForbidden},
-		{"reverse proxy blocked", http.MethodGet, "/v1/models", "127.0.0.1", "127.0.0.1:4567", clientToken, "Forwarded", "for=192.0.2.1", http.StatusForbidden},
+		{"reverse proxy blocked", http.MethodGet, "/admin/status", "127.0.0.1", "127.0.0.1:4567", ownerToken, "Forwarded", "for=192.0.2.1", http.StatusForbidden},
 		{"cloudflare header blocked", http.MethodGet, "/mcp", "127.0.0.1", "127.0.0.1:4567", ownerToken, "CF-Connecting-IP", "192.0.2.1", http.StatusForbidden},
 		{"unknown path", http.MethodGet, "/oauth/token", "127.0.0.1", "127.0.0.1:4567", ownerToken, "", "", http.StatusNotFound},
 	} {
@@ -83,12 +81,12 @@ func TestLocalHTTPRejectsBrowserProxyAndEnforcesTokenSeparation(t *testing.T) {
 			}
 		})
 	}
-	if modelHits != 2 || capHits != 2 {
-		t.Fatalf("blocked request reached inner handlers: modelHits=%d capHits=%d", modelHits, capHits)
+	if adminHits != 1 || capHits != 2 {
+		t.Fatalf("blocked request reached inner handlers: adminHits=%d capHits=%d", adminHits, capHits)
 	}
 }
 
-func TestPublicHTTPNeverMountsModelsOrCapabilities(t *testing.T) {
+func TestPublicHTTPNeverMountsAdminOrCapabilities(t *testing.T) {
 	instance, err := NewHTTP(mcp.NewServer(&mcp.Implementation{Name: "test", Version: "1"}, nil), HTTPConfig{
 		Listen: "127.0.0.1:0", BearerToken: testBearerToken,
 	})
@@ -105,7 +103,7 @@ func TestPublicHTTPNeverMountsModelsOrCapabilities(t *testing.T) {
 		}
 	})
 	endpoint := "http://" + instance.Address()
-	for _, path := range []string{"/v1/models", "/v1/chat/completions", "/capabilities", "/capabilities/invoke", "/health"} {
+	for _, path := range []string{"/admin/status", "/v1/models", "/capabilities", "/capabilities/invoke", "/health"} {
 		resp := request(t, endpoint+path, testBearerToken, "", "")
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusNotFound {

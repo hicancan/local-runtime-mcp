@@ -1,17 +1,35 @@
 import { packagedConfig } from './runtime_config.js';
-/** Asks lrmcp for every grant, opened on one page origin so the answer names that page's site. */
-export async function grants(method, origin, grant, name) {
+async function postGrant(payload) {
     const settings = await chrome.storage.local.get({ address: packagedConfig.address || '127.0.0.1:9315', token: packagedConfig.token || '' });
     if (!settings.token)
         throw new Error('not configured');
     const response = await fetch(`http://${settings.address}/v1/grants`, {
         method: 'POST', headers: { Authorization: `Bearer ${settings.token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ method, origin, ...(grant ? { grant } : {}), ...(name ? { name } : {}) }),
+        body: JSON.stringify(payload),
     });
     const body = await response.json().catch(() => null);
     if (!response.ok)
         throw new Error(body?.error || `lrmcp ${response.status}`);
     return body;
+}
+/** Asks lrmcp for every grant and runtime status, opened on one page origin so the answer names that page's site. */
+export async function grants(method, origin, grant, name) {
+    if (method === 'get')
+        return postGrant({ method: 'get', origin });
+    if (method === 'set')
+        return postGrant({ method: 'set', origin, grant: grant });
+    return postGrant({ method, origin, name: name });
+}
+export async function toggleTunnel(origin, name, up, ttlSeconds = 0) {
+    return up
+        ? postGrant({ method: 'tunnel_up', origin, name, ttl_seconds: ttlSeconds })
+        : postGrant({ method: 'tunnel_down', origin, name });
+}
+export async function setRemoteGrant(origin, target, remote) {
+    return postGrant({ method: 'set_remote_grant', origin, target, remote });
+}
+export async function stopDesktop(origin) {
+    return postGrant({ method: 'stop_desktop', origin });
 }
 /** Whether a grant's site covers a page origin: the same origin, or a subdomain under the same scheme. A site with a
  * port, or a local address, covers only itself. lrmcp names sites; this only matches them. */

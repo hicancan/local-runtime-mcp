@@ -55,6 +55,7 @@ func TestClientTokenEnvironmentNeedsAnExplicitGrant(t *testing.T) {
 
 func TestLegacyFieldsAreRejected(t *testing.T) {
 	for name, content := range map[string]string{
+		"models":              "models:\n  items:\n    - id: deepseek-web\n",
 		"models.key":          "models:\n  key: old-model-key\n",
 		"capabilities.web":    "capabilities:\n  web:\n    - site: https://example.com\n",
 		"capabilities.native": "capabilities:\n  native:\n    site: https://example.com\n",

@@ -11,7 +11,6 @@ import (
 	"github.com/hicancan/local-runtime-mcp/internal/browser"
 	"github.com/hicancan/local-runtime-mcp/internal/capability"
 	"github.com/hicancan/local-runtime-mcp/internal/config"
-	"github.com/hicancan/local-runtime-mcp/internal/modelapi"
 )
 
 func validateCapabilities(cfg *config.Config, registry *capability.Registry) error {
@@ -19,22 +18,7 @@ func validateCapabilities(cfg *config.Config, registry *capability.Registry) err
 	for _, d := range registry.List() {
 		definitions[d.Name] = d
 	}
-	models := map[string]bool{}
-	for _, m := range cfg.Models.Items {
-		models[m.ID] = true
-		for _, name := range []string{m.Start, m.Read, m.Stop} {
-			d, ok := definitions[name]
-			if !ok || !allowsTarget(d, m.URL) {
-				return errors.New("model capability is missing or does not allow its target origin")
-			}
-		}
-	}
 	for _, g := range cfg.Grants.Web {
-		for _, id := range g.Models {
-			if !models[id] {
-				return errors.New("web grant refers to an unregistered model")
-			}
-		}
 		for name, target := range g.Capabilities {
 			d, ok := definitions[name]
 			if !ok || !allowsTarget(d, target) {
@@ -43,11 +27,6 @@ func validateCapabilities(cfg *config.Config, registry *capability.Registry) err
 		}
 	}
 	for _, c := range cfg.Grants.Clients {
-		for _, id := range c.Models {
-			if !models[id] {
-				return errors.New("local client grant refers to an unregistered model")
-			}
-		}
 		for name, target := range c.Capabilities {
 			d, ok := definitions[name]
 			if !ok || !allowsTarget(d, target) {
@@ -76,8 +55,8 @@ type capabilityRequest struct {
 	Input map[string]any `json:"input"`
 }
 
-func webHandler(grants *grantStore, registry *capability.Registry, models *modelapi.Service) browser.WebHandler {
-	return func(ctx context.Context, source browser.WebSource, request browser.WebRequest, emit func(browser.WebEvent) error) (any, error) {
+func webHandler(grants *grantStore, registry *capability.Registry) browser.WebHandler {
+	return func(ctx context.Context, source browser.WebSource, request browser.WebRequest, _ func(browser.WebEvent) error) (any, error) {
 		grant, ok := grants.get(source.Origin)
 		if !ok || !grant.Use {
 			return nil, errors.New("this website has no local runtime grant")
@@ -117,46 +96,6 @@ func webHandler(grants *grantStore, registry *capability.Registry, models *model
 				return nil, errors.New("capability execution failed; no request was replayed")
 			}
 			return result, nil
-		case "models.list":
-			result := []map[string]any{}
-			for _, m := range models.List() {
-				if contains(grant.Models, m["id"].(string)) {
-					result = append(result, m)
-				}
-			}
-			return map[string]any{"object": "list", "data": result}, nil
-		case "models.chat":
-			r, err := modelapi.DecodeRequest(request.Params)
-			if err != nil {
-				return nil, err
-			}
-			if !contains(grant.Models, r.Model) {
-				return nil, errors.New("this model is not granted to this website")
-			}
-			answer, err := models.Generate(ctx, r, source.BrowserID, source.Origin+"|"+source.BrowserID, func(d modelapi.Delta) error { return emit(browser.WebEvent{Type: "delta", Data: d}) })
-			if err != nil {
-				var safe *modelapi.Error
-				if errors.As(err, &safe) {
-					return nil, safe
-				}
-				if ctx.Err() != nil {
-					return nil, errors.New("local model request cancelled or timed out; source stop was requested")
-				}
-				return nil, errors.New("local model source failed; no request was replayed")
-			}
-			return modelapi.Completion(r.Model, answer), nil
-		case "models.close":
-			var p struct {
-				Model          string `json:"model"`
-				ConversationID string `json:"conversation_id"`
-			}
-			if decodeWeb(request.Params, &p) != nil || !contains(grant.Models, p.Model) {
-				return nil, errors.New("this model conversation is not granted to this website")
-			}
-			if err := models.CloseConversation(ctx, source.Origin+"|"+source.BrowserID, p.Model, p.ConversationID); err != nil {
-				return nil, errors.New("the model conversation could not be closed")
-			}
-			return map[string]any{"closed": true, "conversation_id": p.ConversationID}, nil
 		default:
 			return nil, errors.New("unsupported local runtime operation")
 		}
@@ -174,6 +113,7 @@ func decodeWeb(data []byte, target any) error {
 	}
 	return nil
 }
+
 func contains(values []string, value string) bool {
 	for _, v := range values {
 		if v == value {

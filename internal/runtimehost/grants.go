@@ -10,30 +10,71 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hicancan/local-runtime-mcp/internal/capability"
+	"github.com/hicancan/local-runtime-mcp/internal/computer"
 	"github.com/hicancan/local-runtime-mcp/internal/config"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// grantStore holds the owner's web grants while the Host runs. The configuration file stays their one source: a
-// change from the extension's panel takes effect at once and is written back into that file, touching nothing else
-// in it (environment overrides and secrets never leave memory).
+// grantStore holds the owner's web and remote grants while the Host runs. The
+// configuration file stays their one source: a change from the extension panel
+// or admin API takes effect at once and is written back into that file, touching
+// nothing else in it (environment overrides and secrets never leave memory).
 type grantStore struct {
-	mu       sync.RWMutex
-	bySite   map[string]config.WebGrant
-	path     string
-	registry *capability.Registry
-	models   []map[string]any
-	machine  *machineTools
+	mu             sync.RWMutex
+	bySite         map[string]config.WebGrant
+	remote         config.RemoteGrants
+	path           string
+	registry       *capability.Registry
+	machine        *machineTools
+	controller     computer.Controller
+	tunnels        TunnelController
+	onRemoteChange func(target string, grant config.RemoteGrant)
 }
 
-func newGrantStore(grants []config.WebGrant, path string, registry *capability.Registry, models []map[string]any, machine *machineTools) *grantStore {
-	store := &grantStore{bySite: map[string]config.WebGrant{}, path: path, registry: registry, models: models, machine: machine}
+func newGrantStore(
+	grants []config.WebGrant,
+	remote config.RemoteGrants,
+	path string,
+	registry *capability.Registry,
+	machine *machineTools,
+	controller computer.Controller,
+	onRemoteChange func(target string, grant config.RemoteGrant),
+) *grantStore {
+	store := &grantStore{
+		bySite:         map[string]config.WebGrant{},
+		remote:         cloneRemoteGrants(remote),
+		path:           path,
+		registry:       registry,
+		machine:        machine,
+		controller:     controller,
+		onRemoteChange: onRemoteChange,
+	}
 	for _, g := range grants {
 		store.bySite[g.Site] = g
 	}
 	return store
+}
+
+func cloneRemoteGrants(r config.RemoteGrants) config.RemoteGrants {
+	return config.RemoteGrants{
+		OpenAI: config.RemoteGrant{ReadOnly: r.OpenAI.ReadOnly, Tools: append([]string(nil), r.OpenAI.Tools...)},
+		HTTP:   config.RemoteGrant{ReadOnly: r.HTTP.ReadOnly, Tools: append([]string(nil), r.HTTP.Tools...)},
+	}
+}
+
+func (s *grantStore) setTunnels(ctrl TunnelController) {
+	s.mu.Lock()
+	s.tunnels = ctrl
+	s.mu.Unlock()
+}
+
+func (s *grantStore) remoteCopy() config.RemoteGrants {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneRemoteGrants(s.remote)
 }
 
 // get finds the grant covering one page origin.
@@ -65,13 +106,8 @@ func (s *grantStore) check(g config.WebGrant, providers providerLookup) error {
 	if !config.ValidSite(g.Site) {
 		return errors.New("a grant needs one site, like https://example.com")
 	}
-	if !g.Use && (len(g.Models) > 0 || len(g.Capabilities) > 0 || len(g.Tools) > 0) {
+	if !g.Use && (len(g.Capabilities) > 0 || len(g.Tools) > 0) {
 		return errors.New("a site uses nothing until its use switch is on")
-	}
-	for _, id := range g.Models {
-		if !slices.ContainsFunc(s.models, func(m map[string]any) bool { return m["id"] == id }) {
-			return fmt.Errorf("model %q is not configured", id)
-		}
 	}
 	definitions := map[string]capability.Definition{}
 	for _, d := range s.registry.List() {
@@ -108,6 +144,26 @@ func (s *grantStore) checkAll(grants map[string]config.WebGrant) error {
 	return nil
 }
 
+func (s *grantStore) checkRemote(g config.RemoteGrant) error {
+	if len(g.Tools) == 0 {
+		return nil
+	}
+	pages := map[string]bool{}
+	for _, d := range s.registry.List() {
+		pages[d.Name] = true
+	}
+	for _, name := range g.Tools {
+		if _, ok := s.machine.find(name); ok {
+			continue
+		}
+		if pages[name] {
+			continue
+		}
+		return fmt.Errorf("remote tool %q is not offered", name)
+	}
+	return nil
+}
+
 // providerLookup answers, for one page origin, whether the site covering it provides its page tools.
 type providerLookup map[string]config.WebGrant
 
@@ -123,8 +179,6 @@ func siteCovers(site, origin string) bool {
 
 // set replaces one origin's grant (an empty one removes it) and writes the grants back to the file.
 func (s *grantStore) set(g config.WebGrant) error {
-	slices.Sort(g.Models)
-	g.Models = slices.Compact(g.Models)
 	slices.Sort(g.Tools)
 	g.Tools = slices.Compact(g.Tools)
 	s.mu.Lock()
@@ -177,21 +231,85 @@ func (s *grantStore) set(g config.WebGrant) error {
 	return nil
 }
 
-// view is what the panel shows: every grant, the catalog grants choose from, and the site of the page it is open on.
+// setRemote updates one remote wire's grant ("openai" or "http"), persists it,
+// and live-updates that wire's MCP tool filter.
+func (s *grantStore) setRemote(target string, g config.RemoteGrant) error {
+	if target != "openai" && target != "http" {
+		return fmt.Errorf("unknown remote grant target %q; choose openai or http", target)
+	}
+	g.Tools = append([]string(nil), g.Tools...)
+	slices.Sort(g.Tools)
+	g.Tools = slices.Compact(g.Tools)
+	if err := s.checkRemote(g); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	next := cloneRemoteGrants(s.remote)
+	if target == "openai" {
+		next.OpenAI = g
+	} else {
+		next.HTTP = g
+	}
+	if s.path != "" {
+		raw, err := config.Load(s.path)
+		if err != nil {
+			s.mu.Unlock()
+			return err
+		}
+		raw.Grants.Remote = next
+		if _, err := config.Save(s.path, raw); err != nil {
+			s.mu.Unlock()
+			return fmt.Errorf("save remote grants: %w", err)
+		}
+	}
+	s.remote = next
+	notify := s.onRemoteChange
+	s.mu.Unlock()
+	if notify != nil {
+		notify(target, g)
+	}
+	return nil
+}
+
+// view is what the panel shows: every grant, the catalog grants choose from,
+// live remote wires, desktop lock state, and the site of the page it is open on.
 func (s *grantStore) view(origin string) map[string]any {
 	site, _ := config.SiteOf(origin)
+	s.mu.RLock()
+	ctrl := s.tunnels
+	remote := cloneRemoteGrants(s.remote)
+	s.mu.RUnlock()
+
+	tunnels := []TunnelStatus{}
+	attached := 0
+	if ctrl != nil {
+		tunnels = ctrl.Status()
+		attached = ctrl.AttachedClients()
+	}
+	desktopOwned := false
+	if s.controller != nil {
+		if st, err := s.controller.Control(context.Background(), computer.ControlOptions{Kind: "status"}); err == nil && st.Status == "owned" {
+			desktopOwned = true
+		}
+	}
 	return map[string]any{
-		"site":      site,
-		"grants":    s.all(),
-		"pageTools": s.registry.List(),
-		"machine":   s.machine.list(),
-		"proposals": s.registry.Proposals(),
-		"models":    s.models,
+		"site":         site,
+		"grants":       s.all(),
+		"pageTools":    s.registry.List(),
+		"machine":      s.machine.list(),
+		"proposals":    s.registry.Proposals(),
+		"tunnels":      tunnels,
+		"remoteGrants": remote,
+		"runtime": map[string]any{
+			"attached_clients": attached,
+			"desktop_owned":    desktopOwned,
+		},
 	}
 }
 
 func (s *grantStore) handle(method, origin string, body json.RawMessage) (any, error) {
-	if method == "approve" || method == "reject" {
+	switch method {
+	case "approve", "reject":
 		var name string
 		if json.Unmarshal(body, &name) != nil {
 			return nil, errors.New("invalid proposal name")
@@ -204,14 +322,61 @@ func (s *grantStore) handle(method, origin string, body json.RawMessage) (any, e
 		if err := act(name); err != nil {
 			return nil, err
 		}
-	}
-	if method == "set" {
+	case "set":
 		var g config.WebGrant
 		if err := json.Unmarshal(body, &g); err != nil {
 			return nil, errors.New("invalid grant")
 		}
 		if err := s.set(g); err != nil {
 			return nil, err
+		}
+	case "tunnel_up":
+		var req struct {
+			Name       string `json:"name"`
+			TTLSeconds int    `json:"ttl_seconds"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil || req.Name == "" || req.TTLSeconds < 0 {
+			return nil, errors.New("invalid tunnel_up request")
+		}
+		s.mu.RLock()
+		ctrl := s.tunnels
+		s.mu.RUnlock()
+		if ctrl == nil {
+			return nil, errors.New("remote tunnel control is unavailable in this mode")
+		}
+		if _, err := ctrl.Up(req.Name, time.Duration(req.TTLSeconds)*time.Second); err != nil {
+			return nil, err
+		}
+	case "tunnel_down":
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil || req.Name == "" {
+			return nil, errors.New("invalid tunnel_down request")
+		}
+		s.mu.RLock()
+		ctrl := s.tunnels
+		s.mu.RUnlock()
+		if ctrl == nil {
+			return nil, errors.New("remote tunnel control is unavailable in this mode")
+		}
+		if _, err := ctrl.Down(req.Name); err != nil {
+			return nil, err
+		}
+	case "set_remote_grant":
+		var req struct {
+			Target string             `json:"target"`
+			Grant  config.RemoteGrant `json:"grant"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			return nil, errors.New("invalid remote grant request")
+		}
+		if err := s.setRemote(req.Target, req.Grant); err != nil {
+			return nil, err
+		}
+	case "stop_desktop":
+		if s.controller != nil {
+			s.controller.LocalStop()
 		}
 	}
 	return s.view(origin), nil

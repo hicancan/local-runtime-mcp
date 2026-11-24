@@ -4,26 +4,31 @@
 
 One `lrmcp` process owns one Runtime Host. Its MCP entry points publish the same 22 built-in tools plus owner-registered capabilities, and share process sessions, browser targets, filesystem coordination, and desktop control.
 
-## Select transport and providers
+## Select transport and remote wires
 
 ```powershell
-# Local process integration
+# Local MCP clients (auto-starts detached daemon when local.token is set)
 ./lrmcp.exe serve --transport stdio
 
-# Direct loopback HTTP
-./lrmcp.exe serve --transport http
+# Background daemon lifecycle & status
+./lrmcp.exe start
+./lrmcp.exe status
+./lrmcp.exe stop
 
-# One remote provider
-./lrmcp.exe serve --transport http --tunnel openai
-./lrmcp.exe serve --transport http --tunnel cloudflare
+# Hot-plug remote wires live onto the running daemon (0 restart!)
+./lrmcp.exe tunnel up openai --ttl 2h
+./lrmcp.exe tunnel up cloudflare
+./lrmcp.exe tunnel up http
+./lrmcp.exe tunnel down openai
+./lrmcp.exe tunnel down all
 
-# Both remote providers, one Host
-./lrmcp.exe serve --transport http --tunnel openai --tunnel cloudflare
+# Live per-wire remote boundaries (broadcasts tools/list_changed)
+./lrmcp.exe grant remote openai --read-only
 ```
 
-The transport is explicit. Tunnels forward HTTP. Provider credentials saved in `local-runtime-mcp.yaml` take effect when that provider is selected. An OpenAI-only invocation creates its private HTTP origin; a direct HTTP or Cloudflare invocation uses the configured public-facing origin. A dual-provider invocation creates both origins against the same MCP Server.
+Remote wires are hot-pluggable and independent. Provider credentials saved in `local-runtime-mcp.yaml` stay idle until that wire is attached (via CLI or the browser extension `L` panel). An OpenAI wire creates its private loopback HTTP origin; `http` and `cloudflare` use the configured public-facing loopback origin (`127.0.0.1:9316`). Both remote wires and all local `stdio` clients share one Host.
 
-Each provider owns its connection lifetime. A provider's terminal error is reported while a surviving entry point continues serving. `Ctrl+C` stops the complete runtime. If every entry point ends, the Host shuts down and reports the resulting failures. Recovery can restore delivery; retrying a machine action remains a deliberate client decision.
+Each wire owns its connection lifetime. A wire's failure is recorded in `lrmcp status` while local clients and surviving wires continue unaffected. `lrmcp stop` (or `Ctrl+C` in foreground `lrmcp daemon`) gracefully detaches every wire and shuts down the Host. Recovery restores delivery; retrying a machine action remains a deliberate client decision.
 
 ## Credential roles
 
@@ -52,10 +57,11 @@ These values are stored beside the executable where persistent storage is needed
    ```
 
 5. Enter the generated client ID and client secret in Gemini's OAuth fields. Retain the owner approval key for the consent step. Setup selects `http.auth: oauth`; credentials remain in the adjacent configuration.
-6. Start Cloudflare alone or both providers:
+6. Hot-plug Cloudflare alone or both remote wires onto the running daemon:
 
    ```powershell
-   ./lrmcp.exe serve --transport http --tunnel openai --tunnel cloudflare
+   ./lrmcp.exe tunnel up cloudflare
+   # optional: ./lrmcp.exe tunnel up openai
    ```
 
 7. Continue the client's connection flow. On Local Runtime's consent page, verify the public hostname, registered client, and requested access, then approve using the owner approval key. The browser returns through the registered callback to the client application; token exchange and tool discovery complete the connection.

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -21,20 +22,36 @@ const (
 )
 
 // LocalConfig configures the local-only loopback plane. This listener is never
-// exposed to public tunnels or browsers; it serves same-computer MCP agents
-// (including stdio thin proxies) alongside scoped local client APIs.
+// exposed to public tunnels or browsers; it serves same-computer MCP clients
+// (including stdio thin proxies), the authenticated local admin control plane,
+// and scoped local capability APIs.
 type LocalConfig struct {
 	Listen       string
 	Token        string
 	Version      string
-	Models       http.Handler
 	Capabilities http.Handler
+	Admin        http.Handler
+}
+
+// LocalServer wraps the local-only loopback listener and exposes live attached
+// stdio client counts.
+type LocalServer struct {
+	*HTTPServer
+	attached *atomic.Int64
+}
+
+// AttachedClients reports how many stdio thin proxies are currently attached.
+func (s *LocalServer) AttachedClients() int {
+	if s == nil || s.attached == nil {
+		return 0
+	}
+	return int(s.attached.Load())
 }
 
 // NewLocalHTTP creates the dedicated local-only listener.
 // Every route rejects non-loopback peers, browser Origin headers, non-loopback
 // Host headers, and reverse-proxy forwarding headers.
-func NewLocalHTTP(localServer *mcp.Server, cfg LocalConfig) (*HTTPServer, error) {
+func NewLocalHTTP(localServer *mcp.Server, cfg LocalConfig) (*LocalServer, error) {
 	if cfg.Listen == "" {
 		cfg.Listen = DefaultLocalListen
 	}
@@ -45,7 +62,7 @@ func NewLocalHTTP(localServer *mcp.Server, cfg LocalConfig) (*HTTPServer, error)
 	if hasOwner && (len(cfg.Token) < 32 || strings.ContainsAny(cfg.Token, " \t\r\n")) {
 		return nil, errors.New("local token must contain at least 32 characters without whitespace")
 	}
-	if !hasOwner && cfg.Models == nil && cfg.Capabilities == nil {
+	if !hasOwner && cfg.Capabilities == nil {
 		return nil, errors.New("local listener requires a local token or at least one local client handler")
 	}
 	if hasOwner && localServer == nil {
@@ -67,6 +84,7 @@ func NewLocalHTTP(localServer *mcp.Server, cfg LocalConfig) (*HTTPServer, error)
 	var attachMu sync.Mutex
 	attachConns := map[net.Conn]struct{}{}
 	attachCtx, cancelAttach := context.WithCancel(context.Background())
+	var attached atomic.Int64
 
 	server, err := newLoopbackHTTP(cfg.Listen, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
@@ -146,7 +164,9 @@ func NewLocalHTTP(localServer *mcp.Server, cfg LocalConfig) (*HTTPServer, error)
 			}
 			attachConns[conn] = struct{}{}
 			attachMu.Unlock()
+			attached.Add(1)
 			defer func() {
+				attached.Add(-1)
 				attachMu.Lock()
 				delete(attachConns, conn)
 				attachMu.Unlock()
@@ -156,12 +176,17 @@ func NewLocalHTTP(localServer *mcp.Server, cfg LocalConfig) (*HTTPServer, error)
 				Reader: bufferedConnReader{Reader: rw.Reader, Closer: conn},
 				Writer: conn,
 			})
-		case strings.HasPrefix(r.URL.Path, "/v1/"):
-			if cfg.Models == nil {
-				writeLocalError(w, http.StatusNotFound, "not_found", "Local model API is not enabled.")
+		case strings.HasPrefix(r.URL.Path, "/admin/"):
+			if !hasOwner || cfg.Admin == nil {
+				writeLocalError(w, http.StatusNotFound, "not_found", "Local admin control plane is not enabled.")
 				return
 			}
-			cfg.Models.ServeHTTP(w, r)
+			if !validLocalOwnerToken(r, cfg.Token) {
+				w.Header().Set("WWW-Authenticate", `Bearer realm="local-runtime-local"`)
+				writeLocalError(w, http.StatusUnauthorized, "unauthorized", "A valid local token is required.")
+				return
+			}
+			cfg.Admin.ServeHTTP(w, r)
 		case r.URL.Path == "/capabilities" || r.URL.Path == "/capabilities/invoke":
 			if cfg.Capabilities == nil {
 				writeLocalError(w, http.StatusNotFound, "not_found", "Local capability API is not enabled.")
@@ -184,7 +209,7 @@ func NewLocalHTTP(localServer *mcp.Server, cfg LocalConfig) (*HTTPServer, error)
 		}
 		attachMu.Unlock()
 	})
-	return server, nil
+	return &LocalServer{HTTPServer: server, attached: &attached}, nil
 }
 
 type bufferedConnReader struct {

@@ -42,21 +42,19 @@ func TestLocalClientCapabilitiesAreScopedPerClientWithoutBorrowingWebGrant(t *te
 		t.Fatal(err)
 	}
 	studevToken := strings.Repeat("s", 32)
-	harnessToken := strings.Repeat("h", 32)
+	otherToken := strings.Repeat("h", 32)
 	clients := []config.ClientGrant{
 		{
-			ID:     "studev-win",
-			Token:  studevToken,
-			Models: []string{"deepseek-web"},
+			ID:    "studev-win",
+			Token: studevToken,
 			Capabilities: map[string]string{
 				"icourse.outline": testCourse,
 				"deepseek.start":  "https://chat.deepseek.com/",
 			},
 		},
 		{
-			ID:     "harness",
-			Token:  harnessToken,
-			Models: []string{"deepseek-web"},
+			ID:    "reader-only",
+			Token: otherToken,
 		},
 	}
 	chosen := func() browser.Status {
@@ -75,10 +73,10 @@ func TestLocalClientCapabilitiesAreScopedPerClientWithoutBorrowingWebGrant(t *te
 		return w
 	}
 
-	// Harness has no capabilities granted, only models.
-	harnessList := request(handler, harnessToken, http.MethodGet, "/capabilities", "")
-	if harnessList.Code != http.StatusOK || strings.TrimSpace(harnessList.Body.String()) != "[]" {
-		t.Fatalf("unexpected harness capability list: %d %s", harnessList.Code, harnessList.Body.String())
+	// Second client has no capabilities granted.
+	otherList := request(handler, otherToken, http.MethodGet, "/capabilities", "")
+	if otherList.Code != http.StatusOK || strings.TrimSpace(otherList.Body.String()) != "[]" {
+		t.Fatalf("unexpected empty client capability list: %d %s", otherList.Code, otherList.Body.String())
 	}
 
 	// Unauthenticated or wrong token is rejected.
@@ -98,7 +96,7 @@ func TestLocalClientCapabilitiesAreScopedPerClientWithoutBorrowingWebGrant(t *te
 	for _, test := range []struct{ name, token, path, body, code string }{
 		{"mutating registered capability", studevToken, invoke, `{"name":"deepseek.start","input":{}}`, "capability_not_granted"},
 		{"ungranted read-only capability", studevToken, invoke, `{"name":"deepseek.read","input":{}}`, "capability_not_granted"},
-		{"other client ungranted capability", harnessToken, invoke, course, "capability_not_granted"},
+		{"other client ungranted capability", otherToken, invoke, course, "capability_not_granted"},
 		{"machine tool", studevToken, invoke, `{"name":"process_run","input":{}}`, "capability_not_granted"},
 		{"direct browser", studevToken, invoke, `{"name":"icourse.outline","input":{},"browser_id":"other"}`, "invalid_request"},
 		{"direct target", studevToken, invoke, `{"name":"icourse.outline","input":{},"url":"https://elsewhere.example"}`, "invalid_request"},

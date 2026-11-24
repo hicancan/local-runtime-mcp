@@ -102,7 +102,7 @@ unknown outcome does not automatically repeat an action.
 
 ## Same-computer native clients
 
-With `lrmcp serve --transport local` or `lrmcp serve --transport http`, the owner
+With the unified daemon running (`lrmcp start`, `lrmcp daemon`, or auto-spawned by `lrmcp serve --transport stdio`), the owner
 can configure scoped clients under `grants.clients` in `local-runtime-mcp.yaml`
 (or create one with `lrmcp setup client --id studev-win`). Each client holds its
 own independent token (or receives `LOCAL_RUNTIME_MCP_CLIENT_TOKEN` /

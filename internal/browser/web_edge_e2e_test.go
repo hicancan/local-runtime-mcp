@@ -35,7 +35,7 @@ func TestEdgeWebBridgeSDKOriginAndStreaming(t *testing.T) {
 		if source.Origin != ownerURL {
 			return nil, fmt.Errorf("origin not granted")
 		}
-		if request.Method != "models.chat" {
+		if request.Method != "capabilities.invoke" {
 			return nil, fmt.Errorf("method not granted")
 		}
 		if strings.Contains(string(request.Params), "error-code-fixture") {
@@ -49,12 +49,12 @@ func TestEdgeWebBridgeSDKOriginAndStreaming(t *testing.T) {
 			close(canceled)
 			return nil, ctx.Err()
 		}
-		for _, event := range []WebEvent{{Type: "keepalive"}, {Type: "text_delta", Data: "hello"}, {Type: "tool_delta", Data: map[string]any{"name": "fixture"}}} {
+		for _, event := range []WebEvent{{Type: "keepalive"}, {Type: "progress", Data: "hello"}, {Type: "chunk", Data: map[string]any{"name": "fixture"}}} {
 			if err := emit(event); err != nil {
 				return nil, err
 			}
 		}
-		return map[string]any{"role": "assistant", "content": "hello"}, nil
+		return map[string]any{"ok": true, "content": "hello"}, nil
 	})
 	modules := func(w http.ResponseWriter, r *http.Request) bool {
 		name := strings.TrimPrefix(r.URL.Path, "/")
@@ -76,10 +76,10 @@ func TestEdgeWebBridgeSDKOriginAndStreaming(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "text/html")
 		if r.URL.Path == "/iframe" {
-			fmt.Fprint(w, `<!doctype html><p>iframe fixture</p><script>parent.postMessage({protocol:'lrmcp.web.v1',kind:'request',id:'iframe-forgery',method:'models.list',params:{}},'*')</script>`)
+			fmt.Fprint(w, `<!doctype html><p>iframe fixture</p><script>parent.postMessage({protocol:'lrmcp.web.v1',kind:'request',id:'iframe-forgery',method:'capabilities.list',params:{}},'*')</script>`)
 			return
 		}
-		fmt.Fprint(w, `<!doctype html><p id="status">waiting</p><script type="module">import{createLRMCPClient}from'/web_sdk.js';try{await createLRMCPClient().listModels({timeoutMs:5000});document.querySelector('#status').textContent='FAIL: denied origin succeeded'}catch(e){document.querySelector('#status').textContent=e.message.includes('origin not granted')?'DENIED_OK':'FAIL: '+e.message}</script>`)
+		fmt.Fprint(w, `<!doctype html><p id="status">waiting</p><script type="module">import{createLRMCPClient}from'/web_sdk.js';try{await createLRMCPClient().listCapabilities({timeoutMs:5000});document.querySelector('#status').textContent='FAIL: denied origin succeeded'}catch(e){document.querySelector('#status').textContent=e.message.includes('origin not granted')?'DENIED_OK':'FAIL: '+e.message}</script>`)
 	}))
 	defer child.Close()
 	owner := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -88,14 +88,14 @@ func TestEdgeWebBridgeSDKOriginAndStreaming(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "text/html")
 		if r.URL.Path == "/coded-error" {
-			fmt.Fprint(w, `<!doctype html><p id="status">waiting</p><script type="module">import{createLRMCPClient,LocalRuntimeError}from'/web_sdk.js';try{await createLRMCPClient().chat({messages:[{role:'user',content:'error-code-fixture'}]}).result;document.querySelector('#status').textContent='FAIL: coded error reported completion'}catch(e){document.querySelector('#status').textContent=e instanceof LocalRuntimeError&&e.code==='provider_unavailable'?'ERROR_CODE_OK':'FAIL: public error code lost'}</script>`)
+			fmt.Fprint(w, `<!doctype html><p id="status">waiting</p><script type="module">import{createLRMCPClient,LocalRuntimeError}from'/web_sdk.js';try{await createLRMCPClient().request('capabilities.invoke',{name:'fixture',input:{mode:'error-code-fixture'}}).result;document.querySelector('#status').textContent='FAIL: coded error reported completion'}catch(e){document.querySelector('#status').textContent=e instanceof LocalRuntimeError&&e.code==='provider_unavailable'?'ERROR_CODE_OK':'FAIL: public error code lost'}</script>`)
 			return
 		}
 		if r.URL.Path == "/cancel" {
-			fmt.Fprint(w, `<!doctype html><p id="status">waiting</p><script type="module">import{createLRMCPClient}from'/web_sdk.js';try{const controller=new AbortController();const call=createLRMCPClient().chat({messages:[{role:'user',content:'cancel-fixture'}]},{signal:controller.signal,timeoutMs:5000});for await(const item of call){controller.abort()}document.querySelector('#status').textContent='FAIL: cancel reported completion'}catch(e){document.querySelector('#status').textContent=e.message.includes('outcome may be unknown')?'CANCEL_OK':'FAIL: '+e.message}</script>`)
+			fmt.Fprint(w, `<!doctype html><p id="status">waiting</p><script type="module">import{createLRMCPClient}from'/web_sdk.js';try{const controller=new AbortController();const call=createLRMCPClient().request('capabilities.invoke',{name:'fixture',input:{mode:'cancel-fixture'}},{signal:controller.signal,timeoutMs:5000});for await(const item of call){controller.abort()}document.querySelector('#status').textContent='FAIL: cancel reported completion'}catch(e){document.querySelector('#status').textContent=e.message.includes('outcome may be unknown')?'CANCEL_OK':'FAIL: '+e.message}</script>`)
 			return
 		}
-		fmt.Fprintf(w, `<!doctype html><p id="status">waiting</p><iframe src=%q></iframe><script type="module">import{createLRMCPClient}from'/web_sdk.js';try{const call=createLRMCPClient().chat({messages:[{role:'user',content:'fixture'}]},{timeoutMs:5000});const events=[];for await(const item of call)events.push(item.type);const result=await call.result;document.querySelector('#status').textContent=result.content==='hello'&&events.join(',')==='keepalive,text_delta,tool_delta'?'STREAM_OK':'FAIL: wrong stream'}catch(e){document.querySelector('#status').textContent='FAIL: '+e.message}</script>`, child.URL+"/iframe")
+		fmt.Fprintf(w, `<!doctype html><p id="status">waiting</p><iframe src=%q></iframe><script type="module">import{createLRMCPClient}from'/web_sdk.js';try{const call=createLRMCPClient().request('capabilities.invoke',{name:'fixture',input:{mode:'stream'}},{timeoutMs:5000});const events=[];for await(const item of call)events.push(item.type);const result=await call.result;document.querySelector('#status').textContent=result.content==='hello'&&events.join(',')==='keepalive,progress,chunk'?'STREAM_OK':'FAIL: wrong stream'}catch(e){document.querySelector('#status').textContent='FAIL: '+e.message}</script>`, child.URL+"/iframe")
 	}))
 	defer owner.Close()
 	ownerURL = owner.URL

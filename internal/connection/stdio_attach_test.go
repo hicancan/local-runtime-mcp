@@ -27,7 +27,7 @@ func reservePort(t *testing.T) string {
 	return addr
 }
 
-func TestUnifiedDaemonSharesOneHostAcrossMultipleStdioProxiesAndPublicHTTP(t *testing.T) {
+func TestUnifiedDaemonSharesOneHostAcrossStdioProxiesAndHotPlugsHTTP(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 
@@ -55,7 +55,7 @@ func TestUnifiedDaemonSharesOneHostAcrossMultipleStdioProxiesAndPublicHTTP(t *te
 	var daemonLog bytes.Buffer
 	daemonDone := make(chan error, 1)
 	go func() {
-		daemonDone <- Run(daemonCtx, cfg, Options{Transport: "http"}, strings.NewReader(""), io.Discard, &daemonLog)
+		daemonDone <- Run(daemonCtx, cfg, Options{Transport: "daemon"}, strings.NewReader(""), io.Discard, &daemonLog)
 	}()
 	t.Cleanup(func() {
 		stopDaemon()
@@ -106,27 +106,43 @@ func TestUnifiedDaemonSharesOneHostAcrossMultipleStdioProxiesAndPublicHTTP(t *te
 		return session, &stderr
 	}
 
-	codex1, log1 := connectStdio("codex-1")
-	codex2, log2 := connectStdio("codex-2")
+	client1, log1 := connectStdio("client-1")
+	client2, log2 := connectStdio("client-2")
 
 	if !strings.Contains(log1.String(), "attached to running local runtime") || !strings.Contains(log2.String(), "attached to running local runtime") {
 		t.Fatalf("expected stdio thin proxy attach; log1=%q log2=%q", log1.String(), log2.String())
 	}
 
-	// Both proxies see the SAME configured browser bridge (zero 9315 conflict!).
-	for idx, session := range []*mcp.ClientSession{codex1, codex2} {
+	// Admin status reports 2 attached stdio sessions and stopped remote wires.
+	var status DaemonStatus
+	if err := transport.AdminRequest(ctx, localAddr, localToken, http.MethodGet, "/admin/status", nil, &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.AttachedStdio != 2 {
+		t.Fatalf("expected 2 attached stdio clients, got %d", status.AttachedStdio)
+	}
+	if findWire(status.Tunnels, "http").State != "stopped" {
+		t.Fatalf("expected http wire stopped before hot-plug: %+v", status.Tunnels)
+	}
+
+	// Hot-plug public HTTP wire via /admin/tunnels/up without restarting daemon or dropping stdio proxies.
+	if err := transport.AdminRequest(ctx, localAddr, localToken, http.MethodPost, "/admin/tunnels/up", map[string]any{"name": "http"}, nil); err != nil {
+		t.Fatalf("hot-plug http wire failed: %v", err)
+	}
+
+	// Both proxies still see the SAME configured browser bridge.
+	for idx, session := range []*mcp.ClientSession{client1, client2} {
 		res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "browser_status", Arguments: map[string]any{}})
 		if err != nil || res.IsError {
-			t.Fatalf("codex-%d browser_status failed: %v %+v", idx+1, err, res)
+			t.Fatalf("client-%d browser_status failed: %v %+v", idx+1, err, res)
 		}
 		raw, _ := json.Marshal(res.StructuredContent)
 		if !strings.Contains(string(raw), browserAddr) || strings.Contains(string(raw), "not listening") {
-			t.Fatalf("codex-%d lost shared browser bridge: %s", idx+1, raw)
+			t.Fatalf("client-%d lost shared browser bridge: %s", idx+1, raw)
 		}
 	}
 
-	// Verify scoped local client token works on 9317 /v1/models and /capabilities,
-	// while being rejected on 9317 /mcp and 9316 /mcp.
+	// Verify token boundaries on 9317 and hot-plugged 9316.
 	directHTTP := &http.Client{Transport: &http.Transport{Proxy: nil}, Timeout: 3 * time.Second}
 	check := func(method, url, token string, want int) {
 		t.Helper()
@@ -141,15 +157,26 @@ func TestUnifiedDaemonSharesOneHostAcrossMultipleStdioProxiesAndPublicHTTP(t *te
 			t.Fatalf("%s %s status=%d want=%d", method, url, resp.StatusCode, want)
 		}
 	}
-	check(http.MethodGet, "http://"+localAddr+"/v1/models", clientToken, http.StatusOK)
 	check(http.MethodGet, "http://"+localAddr+"/capabilities", clientToken, http.StatusOK)
 	check(http.MethodPost, "http://"+localAddr+"/mcp", clientToken, http.StatusUnauthorized)
-	check(http.MethodGet, "http://"+localAddr+"/v1/models", localToken, http.StatusUnauthorized)
-	check(http.MethodGet, "http://"+publicAddr+"/v1/models", clientToken, http.StatusNotFound)
+	check(http.MethodGet, "http://"+localAddr+"/admin/status", clientToken, http.StatusUnauthorized)
+	check(http.MethodGet, "http://"+localAddr+"/v1/models", clientToken, http.StatusNotFound)
 	check(http.MethodGet, "http://"+publicAddr+"/capabilities", clientToken, http.StatusNotFound)
+	check(http.MethodGet, "http://"+publicAddr+"/admin/status", localToken, http.StatusNotFound)
+
+	// Hot-unplug public HTTP wire cleanly while stdio clients stay alive.
+	if err := transport.AdminRequest(ctx, localAddr, localToken, http.MethodPost, "/admin/tunnels/down", map[string]any{"name": "http"}, nil); err != nil {
+		t.Fatalf("hot-unplug http wire failed: %v", err)
+	}
+	if err := transport.AdminRequest(ctx, localAddr, localToken, http.MethodGet, "/admin/status", nil, &status); err != nil {
+		t.Fatal(err)
+	}
+	if findWire(status.Tunnels, "http").State != "stopped" || status.AttachedStdio != 2 {
+		t.Fatalf("unexpected status after hot-unplug: %+v", status)
+	}
 }
 
-func TestFirstStdioHostsLocalPlaneSoSecondStdioAttaches(t *testing.T) {
+func TestFirstStdioHostsLocalPlaneInProcessWhenAutoSpawnDisabled(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -167,7 +194,7 @@ func TestFirstStdioHostsLocalPlaneSoSecondStdioAttaches(t *testing.T) {
 		var stderr bytes.Buffer
 		done := make(chan error, 1)
 		go func() {
-			err := Run(ctx, cfg, Options{Transport: "stdio"}, cToPR, pToCW, &stderr)
+			err := Run(ctx, cfg, Options{Transport: "stdio", AutoSpawnDaemon: false}, cToPR, pToCW, &stderr)
 			_ = pToCW.Close()
 			done <- err
 		}()
@@ -192,13 +219,11 @@ func TestFirstStdioHostsLocalPlaneSoSecondStdioAttaches(t *testing.T) {
 		return session, &stderr
 	}
 
-	// First stdio starts the Host + local plane.
-	first, log1 := connect("codex-first")
+	first, log1 := connect("first")
 	if strings.Contains(log1.String(), "attached to running local runtime") {
 		t.Fatalf("first stdio unexpectedly attached: %s", log1.String())
 	}
-	// Second stdio discovers the local plane hosted by the first and attaches cleanly.
-	second, log2 := connect("codex-second")
+	second, log2 := connect("second")
 	if !strings.Contains(log2.String(), "attached to running local runtime") {
 		t.Fatalf("second stdio did not attach to first: %s", log2.String())
 	}

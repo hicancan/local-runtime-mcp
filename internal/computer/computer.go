@@ -12,6 +12,7 @@ import (
 // or the complete virtual desktop; origins are physical pixels in the virtual desktop.
 type Controller interface {
 	Control(context.Context, ControlOptions) (ControlStatus, error)
+	LocalStop()
 	BeginDesktopOperation(context.Context, string) (context.Context, func(), error)
 	Targets(context.Context, TargetsOptions) (TargetsResult, error)
 	State(context.Context, StateOptions) ([]byte, State, error)

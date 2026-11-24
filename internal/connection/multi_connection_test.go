@@ -6,69 +6,144 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/hicancan/local-runtime-mcp/internal/config"
+	"github.com/hicancan/local-runtime-mcp/internal/runtimehost"
 )
 
 func TestExplicitTransportAndProviderSelection(t *testing.T) {
-	for _, value := range []Options{{Transport: "stdio"}, {Transport: "local"}, {Transport: "http"}, {Transport: "http", Tunnels: []string{"openai"}}, {Transport: "http", Tunnels: []string{"cloudflare"}}, {Transport: "http", Tunnels: []string{"openai", "cloudflare"}}} {
+	for _, value := range []Options{
+		{Transport: "stdio"},
+		{Transport: "daemon"},
+		{Transport: "daemon", HTTP: true},
+		{Transport: "daemon", Tunnels: []string{"openai"}},
+		{Transport: "daemon", Tunnels: []string{"cloudflare"}},
+		{Transport: "daemon", HTTP: true, Tunnels: []string{"openai", "cloudflare"}},
+	} {
 		if err := value.Validate(); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, value := range []Options{{}, {Transport: "sse"}, {Transport: "stdio", Tunnels: []string{"openai"}}, {Transport: "local", Tunnels: []string{"cloudflare"}}, {Transport: "http", Tunnels: []string{"unknown"}}, {Transport: "http", Tunnels: []string{"openai", "openai"}}} {
+	for _, value := range []Options{
+		{},
+		{Transport: "sse"},
+		{Transport: "local"},
+		{Transport: "http"},
+		{Transport: "stdio", HTTP: true},
+		{Transport: "stdio", Tunnels: []string{"openai"}},
+		{Transport: "daemon", Tunnels: []string{"unknown"}},
+		{Transport: "daemon", Tunnels: []string{"openai", "openai"}},
+	} {
 		if value.Validate() == nil {
 			t.Fatalf("invalid selection accepted: %+v", value)
 		}
 	}
 }
 
-func TestProviderFailureDoesNotCancelOtherEntrance(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+func TestIngressManagerHotPlugTTLAndIsolation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	failed := errors.New("owned provider failed")
-	peerReady := make(chan struct{})
-	peerStopped := make(chan struct{})
-	var output bytes.Buffer
-	done := make(chan error, 1)
-	go func() {
-		done <- runComponents(ctx, []component{
-			{"failed", func(context.Context) error { <-peerReady; return failed }},
-			{"peer", func(ctx context.Context) error { close(peerReady); <-ctx.Done(); close(peerStopped); return ctx.Err() }},
-		}, &lockedWriter{writer: &output})
-	}()
-	<-peerReady
-	select {
-	case <-peerStopped:
-		t.Fatal("peer was cancelled by a different provider")
-	case <-done:
-		t.Fatal("root exited while another entrance was serving")
-	case <-time.After(50 * time.Millisecond):
-	}
-	cancel()
-	select {
-	case err := <-done:
-		if !errors.Is(err, failed) {
-			t.Fatalf("lost provider error: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("root shutdown stuck")
-	}
-	if !strings.Contains(output.String(), "[failed]") {
-		t.Fatal("provider failure not labeled")
-	}
-}
 
-func TestAllEndedEntrancesReturnWithoutCancellingHostContext(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	if err := runComponents(ctx, []component{{"first", func(context.Context) error { return nil }}, {"second", func(context.Context) error { return nil }}}, io.Discard); err != nil {
+	httpAddr := reservePort(t)
+	cfg := config.Default()
+	cfg.Browser = config.Browser{Listen: "127.0.0.1:0", Token: strings.Repeat("b", 32)}
+	cfg.Local = config.Local{Listen: "127.0.0.1:0", Token: strings.Repeat("l", 32)}
+	cfg.HTTP = config.HTTP{Listen: httpAddr, PublicHost: "mcp.example.com", Auth: "bearer", BearerToken: strings.Repeat("p", 32)}
+	cfg.OpenAI = config.OpenAI{TunnelID: "tunnel_0123456789abcdef0123456789abcdef", APIKey: "sk-proj-test-key-0123456789abcdef"}
+
+	host, err := runtimehost.Start(ctx, cfg)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if ctx.Err() != nil {
-		t.Fatal("entrance altered its owner's context")
+	t.Cleanup(func() { _ = host.Close(context.Background()) })
+
+	var log bytes.Buffer
+	mgr := newIngressManager(ctx, cfg, host, &log, func() int { return 2 })
+	t.Cleanup(mgr.Close)
+
+	var openaiStarts atomic.Int32
+	openaiStarted := make(chan struct{}, 4)
+	openaiFail := make(chan error, 1)
+	mgr.runOpenAI = func(wctx context.Context, _ *config.Config, _ *runtimehost.Host) error {
+		openaiStarts.Add(1)
+		openaiStarted <- struct{}{}
+		select {
+		case err := <-openaiFail:
+			return err
+		case <-wctx.Done():
+			return wctx.Err()
+		}
+	}
+
+	// Initially all wires are stopped.
+	for _, w := range mgr.Status() {
+		if w.State != "stopped" {
+			t.Fatalf("expected stopped initially: %+v", w)
+		}
+	}
+
+	// Hot-plug public HTTP wire.
+	statuses, err := mgr.Up("http", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if findWire(statuses, "http").State != "active" {
+		t.Fatalf("http wire not active: %+v", statuses)
+	}
+
+	// Hot-plug OpenAI wire with a short TTL lease; verify it auto-detaches without disturbing HTTP.
+	if _, err := mgr.Up("openai", 250*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-openaiStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("openai runner did not start")
+	}
+	if findWire(mgr.Status(), "openai").State != "active" || openaiStarts.Load() != 1 {
+		t.Fatalf("openai wire did not start: %+v", mgr.Status())
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for findWire(mgr.Status(), "openai").State != "stopped" {
+		if time.Now().After(deadline) {
+			t.Fatalf("openai lease did not expire: %+v", mgr.Status())
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if findWire(mgr.Status(), "http").State != "active" {
+		t.Fatalf("http wire was disturbed by openai lease expiry: %+v", mgr.Status())
+	}
+
+	// Re-attach OpenAI and inject a provider error; HTTP must survive and OpenAI reports error.
+	if _, err := mgr.Up("openai", 0); err != nil {
+		t.Fatal(err)
+	}
+	openaiFail <- errors.New("upstream disconnect")
+	deadline = time.Now().Add(3 * time.Second)
+	for findWire(mgr.Status(), "openai").State != "error" {
+		if time.Now().After(deadline) {
+			t.Fatalf("openai error state not observed: %+v", mgr.Status())
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !strings.Contains(findWire(mgr.Status(), "openai").LastError, "upstream disconnect") {
+		t.Fatalf("unexpected openai error: %+v", findWire(mgr.Status(), "openai"))
+	}
+	if findWire(mgr.Status(), "http").State != "active" {
+		t.Fatalf("http wire died when openai failed: %+v", mgr.Status())
+	}
+
+	// Hot-unplug all wires cleanly.
+	if _, err := mgr.Down("all"); err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range mgr.Status() {
+		if w.State != "stopped" {
+			t.Fatalf("wire did not stop: %+v", w)
+		}
 	}
 }
 
@@ -90,3 +165,14 @@ func TestPublicAuthenticationIsSelectedIndependently(t *testing.T) {
 		t.Fatal("invalid auth accepted")
 	}
 }
+
+func findWire(list []runtimehost.TunnelStatus, name string) runtimehost.TunnelStatus {
+	for _, item := range list {
+		if item.Name == name {
+			return item
+		}
+	}
+	return runtimehost.TunnelStatus{}
+}
+
+var _ = io.Discard

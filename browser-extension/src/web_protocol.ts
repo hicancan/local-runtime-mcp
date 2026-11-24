@@ -1,5 +1,5 @@
 export const WEB_PROTOCOL = 'lrmcp.web.v1';
-export const WEB_METHODS = new Set(['capabilities.list', 'capabilities.invoke', 'models.list', 'models.chat', 'models.close']);
+export const WEB_METHODS = new Set(['capabilities.list', 'capabilities.invoke']);
 export type WebRequest = { protocol: typeof WEB_PROTOCOL; kind: 'request'; id: string; method: string; params: Record<string, unknown> };
 export type WebCancel = { protocol: typeof WEB_PROTOCOL; kind: 'cancel'; id: string };
 export type WebMessage = WebRequest | WebCancel;

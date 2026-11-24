@@ -1,5 +1,5 @@
 export const WEB_PROTOCOL = 'lrmcp.web.v1';
-export const WEB_METHODS = new Set(['capabilities.list', 'capabilities.invoke', 'models.list', 'models.chat', 'models.close']);
+export const WEB_METHODS = new Set(['capabilities.list', 'capabilities.invoke']);
 export function webMessage(value) {
     if (!value || typeof value !== 'object')
         return null;
