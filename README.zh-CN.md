@@ -7,9 +7,9 @@
 
 [English](README.md) · **简体中文**
 
-让 AI 客户端使用运行 `lrmcp` 的机器上的程序、文件、图像、浏览器配置文件和桌面。Local Runtime MCP 是一个统一常驻的本机能力内核，提供 **22 个核心内建 MCP 工具**、用于沉淀可复用网页工具（Web MCP）的 `capability_propose`，以及本机原生软件绑定（App MCP）。
+让 AI 客户端使用运行 `lrmcp` 的机器上的程序、文件、图像、浏览器配置文件和桌面。Local Runtime MCP 是一个统一常驻的本机能力内核，提供 **23 个核心内建 MCP 工具**（含只读零副作用的 `agent_report` 进度播报）、用于沉淀可复用网页工具（Web MCP）的 `capability_propose`，以及本机原生软件绑定（App MCP）。
 
-`lrmcp` 与配套 Chromium 扩展抽象上是同一个双向双核运行时：唯一的用户会话常驻守护进程（`127.0.0.1:9317`）负责操作系统能力与主权边界，扩展桥（`127.0.0.1:9315`）接入多 Profile 浏览器环境并提供网页互联与 `L` 主权控制面板。所有本地 AI 客户端均作为无状态 `stdio` 薄代理并发接入；云端 AI 客户端通过 OpenAI Secure MCP Tunnel / Cloudflare Tunnel 像热插拔网线一样随时接入或断开，无需重启守护进程，并受独立 `grants.remote` 约束。见 [v16.0.0 发布说明](docs/releases/v16.0.0.md)。
+`lrmcp` 与配套 Chromium 扩展抽象上是同一个双向双核运行时：唯一的用户会话常驻守护进程（`127.0.0.1:9317`）负责操作系统能力、内置纯 Go SQLite WAL + FTS5 高性能活动审计引擎（`lrmcp-audit.db`）与仅本机可访问的极简主权活动台（`lrmcp ui`），扩展桥（`127.0.0.1:9315`）接入多 Profile 浏览器环境并提供网页互联与 `L` 主权控制面板。所有本地 AI 客户端均作为无状态 `stdio` 薄代理并发接入；云端客户端（支持 OAuth 与 `grants.remote.tokens` 多客户端独立 Bearer Token 共存）通过 OpenAI Secure MCP Tunnel / Cloudflare Tunnel 像热插拔网线一样随时接入或断开，无需重启守护进程。见 [v17.0.0 发布说明](docs/releases/v17.0.0.md)。
 
 不同进程会话、文件路径和浏览器标签页均可并发执行，共享文件和桌面物理输入遵循明确的资源协调规则。
 
@@ -87,11 +87,19 @@ lrmcp
 │   ├── down <openai|cloudflare|http|all>
 │   └── status
 ├── grant remote <openai|http> [--read-only] [--tool NAME]
+├── ui [--no-open]                       打开仅本机可访问的极简主权活动台（/ui）
+├── audit
+│   ├── list [--limit N]
+│   ├── events [--session ID] [--agent ID]
+│   ├── search <query>
+│   ├── tail [--agent ID]
+│   └── export [--session ID] [--output FILE]
 ├── setup
 │   ├── browser
 │   ├── local
 │   ├── client
-│   └── oauth
+│   ├── oauth
+│   └── remote-token
 ├── version
 └── help
 ```
@@ -109,10 +117,13 @@ lrmcp
 | `lrmcp tunnel up cloudflare [--ttl 2h]` | 实时热插公网回环 HTTP（`127.0.0.1:9316`）与 `cloudflared`（不重启 Daemon）。 |
 | `lrmcp tunnel down openai\|cloudflare\|http\|all` | 实时拔掉单条或全部远端网线；本地客户端与浏览器会话不受任何影响。 |
 | `lrmcp grant remote openai\|http [--read-only] [--tool NAME]` | 实时配置远端网线权限边界（如限制为仅只读工具）并立即广播 `tools/list_changed`。 |
+| `lrmcp ui [--no-open]` | 确保 Daemon 在线、签发一次性 60 秒引导链接并打开内置本地活动台（`http://127.0.0.1:9317/ui/`）。 |
+| `lrmcp audit list \| events \| search \| tail \| export` | 查询会话、FTS5 中英文毫秒级全文检索、实时 SSE 跟踪或导出 JSONL 审计流。 |
 | `lrmcp setup browser` | 生成 Bridge 凭据，释放和配置扩展。 |
 | `lrmcp setup local` | 生成本机专属面 `local.token`，开启多 `stdio` 客户端共享与热插拔控制面。 |
 | `lrmcp setup client --id NAME [--browser-id ID]` | 在 `grants.clients` 中注册同机受控应用并生成独立 Scoped Token（`--show` 查看）。 |
 | `lrmcp setup oauth --client-name NAME --redirect-uri URI` | 用准确回调地址注册 OAuth 客户端并生成凭据。 |
+| `lrmcp setup remote-token --id NAME [--read-only] [--tool NAME]` | 在 `grants.remote.tokens` 中为云端多实例生成独立 Bearer Token（可与 OAuth 共存于单条 Cloudflare 隧道）。 |
 | `lrmcp setup oauth --show` | 在本地终端明确查看已有 OAuth 凭据。 |
 | `lrmcp version` | 输出可执行文件版本。 |
 | `lrmcp help` | 显示命令与参数。 |
@@ -142,7 +153,8 @@ flowchart LR
 | Image | 1 |
 | Computer | 5 |
 | Browser | 8 |
-| **总计** | **22** |
+| 活动播报（`agent_report`） | 1 |
+| **总计** | **23** |
 
 ### Process · 2 个工具
 
@@ -329,7 +341,7 @@ flowchart TB
 | 平台 | Process、Filesystem、Image | Browser | Computer |
 | --- | --- | --- | --- |
 | Windows amd64 | 支持 | Chromium 扩展 | Windows 原生引擎 |
-| Linux / macOS | 支持 | 桌面浏览器中的 Chromium 扩展 | 返回平台不可用 |
+| Linux amd64 / arm64 | 支持 | 桌面浏览器中的 Chromium 扩展 | 返回平台不可用 |
 
 Browser 需要 Chromium 120 或更新版本，以及正在运行并加载扩展的 Profile。Windows Computer 需要 Windows 10 2004 或更新版本（包括 Windows 11）、交互桌面，以及适合目标应用的账户权限。
 
@@ -461,6 +473,7 @@ OAuth 授权开放此运行时的完整机器控制工具。每个客户端使�
 | `LOCAL_RUNTIME_MCP_LOCAL_LISTEN` | `local.listen` |
 | `LOCAL_RUNTIME_MCP_LOCAL_TOKEN` | `local.token` |
 | `LOCAL_RUNTIME_MCP_CLIENT_TOKEN` / `LOCAL_RUNTIME_MCP_CLIENT_TOKEN_<ID>` | `grants.clients[].token` |
+| `LOCAL_RUNTIME_MCP_REMOTE_TOKEN_<ID>` | `grants.remote.tokens[].token` |
 | `LOCAL_RUNTIME_MCP_OPENAI_TUNNEL_ID` | `openai.tunnel_id` |
 | `LOCAL_RUNTIME_MCP_OPENAI_API_KEY` | `openai.api_key` |
 | `LOCAL_RUNTIME_MCP_HTTP_LISTEN` | `http.listen` |
@@ -500,7 +513,7 @@ go test ./internal/browser -run 'TestEdgeExtension(IdleLifecycle|EndToEnd)' -cou
 go test ./internal/browser -run TestEdgeOAuthAuthorizationRedirect -count=3 -v
 ```
 
-OAuth 浏览器回归使用测试凭据验证批准、取消、错误密钥重试、跨站回调链、客户端认证和刷新令牌轮换。CI 覆盖 Windows、Linux 和 macOS。本地协议与浏览器测试验证对应执行链路；真实客户端验收针对已配置的账户和 Tunnel 单独进行。
+OAuth 浏览器回归使用测试凭据验证批准、取消、错误密钥重试、跨站回调链、客户端认证和刷新令牌轮换。CI 覆盖 Windows 与 Linux。本地协议与浏览器测试验证对应执行链路；真实客户端验收针对已配置的账户和 Tunnel 单独进行。
 
 ## 安全、隐私与协议
 

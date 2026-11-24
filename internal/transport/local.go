@@ -3,7 +3,9 @@ package transport
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -13,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/hicancan/local-runtime-mcp/internal/audit"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -22,22 +25,24 @@ const (
 )
 
 // LocalConfig configures the local-only loopback plane. This listener is never
-// exposed to public tunnels or browsers; it serves same-computer MCP clients
-// (including stdio thin proxies), the authenticated local admin control plane,
-// and scoped local capability APIs.
+// exposed to public tunnels or browsers (except the owner-bootstrapped /ui studio);
+// it serves same-computer MCP clients (including stdio thin proxies), the
+// authenticated local admin control plane, and scoped local capability APIs.
 type LocalConfig struct {
 	Listen       string
 	Token        string
 	Version      string
 	Capabilities http.Handler
 	Admin        http.Handler
+	UI           http.Handler
 }
 
 // LocalServer wraps the local-only loopback listener and exposes live attached
-// stdio client counts.
+// stdio client counts and session termination.
 type LocalServer struct {
 	*HTTPServer
-	attached *atomic.Int64
+	attached   *atomic.Int64
+	kickAttach func(sessionID string) bool
 }
 
 // AttachedClients reports how many stdio thin proxies are currently attached.
@@ -48,9 +53,19 @@ func (s *LocalServer) AttachedClients() int {
 	return int(s.attached.Load())
 }
 
+// KickAttached closes an attached stdio proxy session matching sessionID.
+func (s *LocalServer) KickAttached(sessionID string) bool {
+	if s == nil || s.kickAttach == nil {
+		return false
+	}
+	return s.kickAttach(sessionID)
+}
+
 // NewLocalHTTP creates the dedicated local-only listener.
-// Every route rejects non-loopback peers, browser Origin headers, non-loopback
-// Host headers, and reverse-proxy forwarding headers.
+// API routes (/health, /mcp, /mcp/attach, /admin/*, /capabilities*) reject
+// non-loopback peers, browser Origin headers, non-loopback Host headers, and
+// reverse-proxy forwarding headers. /ui routes additionally permit same-host
+// browser access protected by single-use bootstrap cookie + CSRF checks.
 func NewLocalHTTP(localServer *mcp.Server, cfg LocalConfig) (*LocalServer, error) {
 	if cfg.Listen == "" {
 		cfg.Listen = DefaultLocalListen
@@ -80,9 +95,9 @@ func NewLocalHTTP(localServer *mcp.Server, cfg LocalConfig) (*LocalServer, error
 		})
 	}
 
-	// Track active hijacked attach connections so server shutdown closes them cleanly.
+	// Track active hijacked attach connections so shutdown or owner kick closes them cleanly.
 	var attachMu sync.Mutex
-	attachConns := map[net.Conn]struct{}{}
+	attachConns := map[string]net.Conn{}
 	attachCtx, cancelAttach := context.WithCancel(context.Background())
 	var attached atomic.Int64
 
@@ -91,8 +106,23 @@ func NewLocalHTTP(localServer *mcp.Server, cfg LocalConfig) (*LocalServer, error
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		remoteHost, _, _ := net.SplitHostPort(r.RemoteAddr)
 		ip := net.ParseIP(remoteHost)
-		_, hasOrigin := r.Header["Origin"]
-		if ip == nil || !ip.IsLoopback() || !allowedHost(r.Host, "") || hasOrigin || forwardedLocalRequest(r.Header) {
+		if ip == nil || !ip.IsLoopback() || !allowedHost(r.Host, "") || forwardedLocalRequest(r.Header) {
+			writeLocalError(w, http.StatusForbidden, "local_only", "This endpoint is only available to local processes.")
+			return
+		}
+
+		// Local Studio UI (/ui and /ui/*) is strictly loopback-only, never forwarded,
+		// and handles its own single-use bootstrap cookie and same-origin CSRF checks.
+		if r.URL.Path == "/ui" || strings.HasPrefix(r.URL.Path, "/ui/") {
+			if !hasOwner || cfg.UI == nil {
+				writeLocalError(w, http.StatusNotFound, "not_found", "Local Studio UI is not enabled.")
+				return
+			}
+			cfg.UI.ServeHTTP(w, r)
+			return
+		}
+
+		if _, hasOrigin := r.Header["Origin"]; hasOrigin {
 			writeLocalError(w, http.StatusForbidden, "local_only", "This endpoint is only available to local processes.")
 			return
 		}
@@ -124,7 +154,14 @@ func NewLocalHTTP(localServer *mcp.Server, cfg LocalConfig) (*LocalServer, error
 				writeLocalError(w, http.StatusUnauthorized, "unauthorized", "A valid local token is required.")
 				return
 			}
-			mcpHandler.ServeHTTP(w, r)
+			meta := audit.CallMeta{
+				Wire:    "local",
+				AgentID: audit.HeaderAgentID(r.Header, ""),
+			}
+			if hsid := audit.HeaderSessionID(r.Header); hsid != "" {
+				meta.SessionID = "local:" + hsid
+			}
+			mcpHandler.ServeHTTP(w, r.WithContext(audit.WithCallMeta(r.Context(), meta)))
 		case r.URL.Path == "/mcp/attach":
 			if !hasOwner {
 				writeLocalError(w, http.StatusNotFound, "not_found", "Local MCP is not enabled.")
@@ -156,23 +193,32 @@ func NewLocalHTTP(localServer *mcp.Server, cfg LocalConfig) (*LocalServer, error
 				_ = conn.Close()
 				return
 			}
+			attachSID := "local:stdio-" + shortAttachID()
+			if hsid := audit.HeaderSessionID(r.Header); hsid != "" {
+				attachSID = "local:" + hsid
+			}
 			attachMu.Lock()
 			if attachCtx.Err() != nil {
 				attachMu.Unlock()
 				_ = conn.Close()
 				return
 			}
-			attachConns[conn] = struct{}{}
+			attachConns[attachSID] = conn
 			attachMu.Unlock()
 			attached.Add(1)
 			defer func() {
 				attached.Add(-1)
 				attachMu.Lock()
-				delete(attachConns, conn)
+				delete(attachConns, attachSID)
 				attachMu.Unlock()
 				_ = conn.Close()
 			}()
-			_ = localServer.Run(attachCtx, &mcp.IOTransport{
+			sessionCtx := audit.WithCallMeta(attachCtx, audit.CallMeta{
+				Wire:      "local",
+				AgentID:   audit.HeaderAgentID(r.Header, ""),
+				SessionID: attachSID,
+			})
+			_ = localServer.Run(sessionCtx, &mcp.IOTransport{
 				Reader: bufferedConnReader{Reader: rw.Reader, Closer: conn},
 				Writer: conn,
 			})
@@ -204,12 +250,34 @@ func NewLocalHTTP(localServer *mcp.Server, cfg LocalConfig) (*LocalServer, error
 	server.server.RegisterOnShutdown(func() {
 		cancelAttach()
 		attachMu.Lock()
-		for conn := range attachConns {
+		for id, conn := range attachConns {
 			_ = conn.Close()
+			delete(attachConns, id)
 		}
 		attachMu.Unlock()
 	})
-	return &LocalServer{HTTPServer: server, attached: &attached}, nil
+	kickAttach := func(sessionID string) bool {
+		attachMu.Lock()
+		defer attachMu.Unlock()
+		if conn, ok := attachConns[sessionID]; ok {
+			_ = conn.Close()
+			delete(attachConns, sessionID)
+			return true
+		}
+		if conn, ok := attachConns["local:"+sessionID]; ok {
+			_ = conn.Close()
+			delete(attachConns, "local:"+sessionID)
+			return true
+		}
+		return false
+	}
+	return &LocalServer{HTTPServer: server, attached: &attached, kickAttach: kickAttach}, nil
+}
+
+func shortAttachID() string {
+	b := make([]byte, 6)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 type bufferedConnReader struct {

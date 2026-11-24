@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/google/jsonschema-go/jsonschema"
+	"github.com/hicancan/local-runtime-mcp/internal/audit"
 	"github.com/hicancan/local-runtime-mcp/internal/browser"
 	"github.com/hicancan/local-runtime-mcp/internal/capability"
 	"github.com/hicancan/local-runtime-mcp/internal/computer"
@@ -19,7 +20,7 @@ import (
 
 const Version = version.Version
 
-const instructions = "Local Runtime MCP exposes the machine where lrmcp is running. Filesystem and image tools accept direct absolute paths or paths relative to the server process. Create new text paths with mode=create; replace or patch only an expected SHA-256 version. Process tools execute installed programs directly without shell parsing and return independent sessions for longer programs. Pass the last successfully received output_cursor to process_continue for incremental output. Omit it or use zero to reread the retained output; reads do not consume data. After a lost response, retry a read-only continue using the same cursor. Do not automatically repeat process_run, stdin, resize, or terminate after an uncertain response. Completed async sessions remain readable for up to ten minutes, subject to session capacity. Process duration_ms is elapsed time while running and fixed after exit. Browser tools use the bundled Chromium extension: discover online instances with browser_status, select their browser_id for tabs/open, and use the returned opaque tab_id for all existing-tab operations. Read page content with browser_snapshot. New tabs are inactive by default. Computer tools see every display and window: computer_targets lists them, computer_state observes pixels and a window's UI Automation tree, computer_wait waits for an element. Prefer semantic computer_action kinds and place: they operate controls by ref_id without the pointer, keyboard or foreground, so the person at the computer is undisturbed. Physical input needs computer_control: acquire it, observe with its control_id, act on that exact state_id, and release it. Visible browser changes share the desktop gate and require the matching control_id while another task owns it. Independent process sessions, file paths, and background browser tabs can run concurrently; IDs route resources, not separate operating-system desktops or security tenants. Prefer browser tools for web pages, computer tools for native UI, and native image-content tools for images and screenshots. Source code is available under AGPL-3.0-only at https://github.com/hicancan/local-runtime-mcp."
+const instructions = "Local Runtime MCP exposes the machine where lrmcp is running. Filesystem and image tools accept direct absolute paths or paths relative to the server process. Create new text paths with mode=create; replace or patch only an expected SHA-256 version. Process tools execute installed programs directly without shell parsing and return independent sessions for longer programs. Pass the last successfully received output_cursor to process_continue for incremental output. Omit it or use zero to reread the retained output; reads do not consume data. After a lost response, retry a read-only continue using the same cursor. Do not automatically repeat process_run, stdin, resize, or terminate after an uncertain response. Completed async sessions remain readable for up to ten minutes, subject to session capacity. Process duration_ms is elapsed time while running and fixed after exit. Browser tools use the bundled Chromium extension: discover online instances with browser_status, select their browser_id for tabs/open, and use the returned opaque tab_id for all existing-tab operations. Read page content with browser_snapshot. New tabs are inactive by default. Computer tools see every display and window: computer_targets lists them, computer_state observes pixels and a window's UI Automation tree, computer_wait waits for an element. Prefer semantic computer_action kinds and place: they operate controls by ref_id without the pointer, keyboard or foreground, so the person at the computer is undisturbed. Physical input needs computer_control: acquire it, observe with its control_id, act on that exact state_id, and release it. Visible browser changes share the desktop gate and require the matching control_id while another task owns it. Independent process sessions, file paths, and background browser tabs can run concurrently; IDs route resources, not separate operating-system desktops or security tenants. Call agent_report periodically with short progress milestones so the owner can monitor long tasks in the local activity stream. Prefer browser tools for web pages, computer tools for native UI, and native image-content tools for images and screenshots. Source code is available under AGPL-3.0-only at https://github.com/hicancan/local-runtime-mcp."
 
 // ToolFilter reports whether a tool with the given name and side-effect hints
 // should be visible and callable on this MCP server.
@@ -32,6 +33,8 @@ type Dependencies struct {
 	Browser      *browser.Bridge
 	Computer     computer.Controller
 	Capabilities *capability.Registry
+	Audit        *audit.Store
+	Wire         string
 	LocalApps    bool
 	Filter       ToolFilter
 }
@@ -42,6 +45,7 @@ type Managed struct {
 	Server *mcp.Server
 
 	mu         sync.Mutex
+	wire       string
 	filter     ToolFilter
 	registered map[string]string
 	static     []toolSpec
@@ -103,6 +107,7 @@ func NewManaged(deps Dependencies) *Managed {
 	}
 	static = append(static, browserToolSpecs(deps.Browser)...)
 	static = append(static, computerToolSpecs(deps.Computer)...)
+	static = append(static, agentReportToolSpec(deps.Audit, deps.Wire))
 	if deps.Capabilities.Proposes() {
 		static = append(static, proposeToolSpec(deps.Capabilities))
 	}
@@ -112,11 +117,13 @@ func NewManaged(deps Dependencies) *Managed {
 
 	managed := &Managed{
 		Server:     server,
+		wire:       deps.Wire,
 		filter:     deps.Filter,
 		registered: map[string]string{},
 		static:     static,
 		registry:   deps.Capabilities,
 	}
+	managed.installMiddleware(deps.Audit, deps.Wire)
 	managed.Sync()
 	if deps.Capabilities != nil {
 		deps.Capabilities.Watch(managed.Sync)

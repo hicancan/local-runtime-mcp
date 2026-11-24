@@ -6,13 +6,16 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
+	"github.com/hicancan/local-runtime-mcp/internal/audit"
 	"github.com/hicancan/local-runtime-mcp/internal/browser"
 	"github.com/hicancan/local-runtime-mcp/internal/computer"
 	"github.com/hicancan/local-runtime-mcp/internal/config"
 	"github.com/hicancan/local-runtime-mcp/internal/mcpserver"
 	"github.com/hicancan/local-runtime-mcp/internal/runtimehost"
+	"github.com/hicancan/local-runtime-mcp/internal/ui"
 )
 
 // DaemonStatus is the live snapshot returned by GET /admin/status and `lrmcp status`.
@@ -28,35 +31,155 @@ type DaemonStatus struct {
 	Capabilities   runtimehost.CapabilitySummary `json:"capabilities"`
 	Tunnels        []runtimehost.TunnelStatus    `json:"tunnels"`
 	RemoteGrants   config.RemoteGrants           `json:"remote_grants"`
+	Audit          audit.Stats                   `json:"audit"`
+}
+
+func buildStatus(ctx context.Context, localAddr func() string, host *runtimehost.Host, ingress *IngressManager) DaemonStatus {
+	started := host.StartedAt()
+	uptime := int64(time.Since(started).Seconds())
+	if uptime < 0 {
+		uptime = 0
+	}
+	auditStats, _ := host.Audit().Stats()
+	return DaemonStatus{
+		Version:        mcpserver.Version,
+		PID:            os.Getpid(),
+		StartedAt:      started.UTC(),
+		UptimeSeconds:  uptime,
+		LocalListen:    localAddr(),
+		AttachedStdio:  ingress.AttachedClients(),
+		Browser:        host.BrowserStatus(),
+		DesktopControl: host.DesktopStatus(ctx),
+		Capabilities:   host.CapabilitiesSummary(),
+		Tunnels:        ingress.Status(),
+		RemoteGrants:   host.RemoteGrants(),
+		Audit:          auditStats,
+	}
+}
+
+func newStudio(
+	localAddr func() string,
+	host *runtimehost.Host,
+	ingress *IngressManager,
+	kickSession func(string) bool,
+) (*ui.Studio, error) {
+	return ui.New(ui.Backend{
+		Audit: host.Audit(),
+		Status: func(ctx context.Context) ui.StatusSnapshot {
+			st := buildStatus(ctx, localAddr, host, ingress)
+			return ui.StatusSnapshot{
+				Version:        st.Version,
+				PID:            st.PID,
+				StartedAt:      st.StartedAt,
+				UptimeSeconds:  st.UptimeSeconds,
+				LocalListen:    st.LocalListen,
+				AttachedStdio:  st.AttachedStdio,
+				Browser:        st.Browser,
+				DesktopControl: st.DesktopControl,
+				Capabilities:   st.Capabilities,
+				Tunnels:        st.Tunnels,
+				RemoteGrants:   st.RemoteGrants,
+				WebGrants:      host.WebGrants(),
+				AuditStats:     st.Audit,
+			}
+		},
+		TunnelUp:        ingress.Up,
+		TunnelDown:      ingress.Down,
+		SetRemoteGrant:  host.SetRemoteGrant,
+		StopDesktop:     host.StopDesktop,
+		Proposals:       host.Proposals,
+		ApproveProposal: host.ApproveProposal,
+		RejectProposal:  host.RejectProposal,
+		KickSession:     kickSession,
+	})
 }
 
 func newAdminHandler(
 	localAddr func() string,
 	host *runtimehost.Host,
 	ingress *IngressManager,
+	studio *ui.Studio,
+	kickSession func(string) bool,
 	shutdown func(),
 ) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /admin/status", func(w http.ResponseWriter, r *http.Request) {
-		started := host.StartedAt()
-		uptime := int64(time.Since(started).Seconds())
-		if uptime < 0 {
-			uptime = 0
+		writeAdminJSON(w, http.StatusOK, buildStatus(r.Context(), localAddr, host, ingress))
+	})
+
+	mux.HandleFunc("POST /admin/ui/bootstrap", func(w http.ResponseWriter, _ *http.Request) {
+		if studio == nil {
+			writeAdminError(w, http.StatusNotFound, "ui_unavailable", "Local Studio UI is not enabled.")
+			return
 		}
-		writeAdminJSON(w, http.StatusOK, DaemonStatus{
-			Version:        mcpserver.Version,
-			PID:            os.Getpid(),
-			StartedAt:      started.UTC(),
-			UptimeSeconds:  uptime,
-			LocalListen:    localAddr(),
-			AttachedStdio:  ingress.AttachedClients(),
-			Browser:        host.BrowserStatus(),
-			DesktopControl: host.DesktopStatus(r.Context()),
-			Capabilities:   host.CapabilitiesSummary(),
-			Tunnels:        ingress.Status(),
-			RemoteGrants:   host.RemoteGrants(),
+		url, err := studio.MintBootstrapURL(localAddr())
+		if err != nil {
+			writeAdminError(w, http.StatusInternalServerError, "bootstrap_failed", err.Error())
+			return
+		}
+		writeAdminJSON(w, http.StatusOK, map[string]any{"url": url})
+	})
+
+	mux.HandleFunc("GET /admin/audit/sessions", func(w http.ResponseWriter, r *http.Request) {
+		limit := adminIntQuery(r, "limit", 100, 1, 500)
+		sessions, err := host.Audit().ListSessions(limit)
+		if err != nil {
+			writeAdminError(w, http.StatusInternalServerError, "audit_error", err.Error())
+			return
+		}
+		writeAdminJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
+	})
+
+	mux.HandleFunc("GET /admin/audit/events", func(w http.ResponseWriter, r *http.Request) {
+		events, err := host.Audit().ListEvents(audit.EventFilter{
+			SessionID: r.URL.Query().Get("session_id"),
+			AgentID:   r.URL.Query().Get("agent_id"),
+			Wire:      r.URL.Query().Get("wire"),
+			Kind:      r.URL.Query().Get("kind"),
+			Status:    r.URL.Query().Get("status"),
+			Limit:     adminIntQuery(r, "limit", 100, 1, 1000),
 		})
+		if err != nil {
+			writeAdminError(w, http.StatusInternalServerError, "audit_error", err.Error())
+			return
+		}
+		writeAdminJSON(w, http.StatusOK, map[string]any{"events": events})
+	})
+
+	mux.HandleFunc("GET /admin/audit/search", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("q")
+		limit := adminIntQuery(r, "limit", 80, 1, 200)
+		events, err := host.Audit().Search(q, limit)
+		if err != nil {
+			writeAdminError(w, http.StatusInternalServerError, "audit_error", err.Error())
+			return
+		}
+		writeAdminJSON(w, http.StatusOK, map[string]any{"query": q, "events": events})
+	})
+
+	mux.HandleFunc("GET /admin/audit/stream", func(w http.ResponseWriter, r *http.Request) {
+		ui.ServeSSE(w, r, host.Audit())
+	})
+
+	mux.HandleFunc("GET /admin/audit/export", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+		_ = host.Audit().ExportJSONL(w, r.URL.Query().Get("session_id"))
+	})
+
+	mux.HandleFunc("POST /admin/sessions/kick", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			SessionID string `json:"session_id"`
+		}
+		if err := decodeAdminJSON(w, r, &req); err != nil || req.SessionID == "" {
+			writeAdminError(w, http.StatusBadRequest, "invalid_request", "Provide session_id.")
+			return
+		}
+		disconnected := false
+		if kickSession != nil {
+			disconnected = kickSession(req.SessionID)
+		}
+		writeAdminJSON(w, http.StatusOK, map[string]any{"ok": true, "disconnected": disconnected})
 	})
 
 	mux.HandleFunc("POST /admin/tunnels/up", func(w http.ResponseWriter, r *http.Request) {
@@ -130,6 +253,24 @@ func newAdminHandler(
 	return mux
 }
 
+func adminIntQuery(r *http.Request, name string, def, min, max int) int {
+	raw := r.URL.Query().Get(name)
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return def
+	}
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
 func decodeAdminJSON(w http.ResponseWriter, r *http.Request, target any) error {
 	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 256<<10))
 	if err != nil {
@@ -147,6 +288,3 @@ func writeAdminJSON(w http.ResponseWriter, status int, value any) {
 func writeAdminError(w http.ResponseWriter, status int, code, message string) {
 	writeAdminJSON(w, status, map[string]any{"error": map[string]string{"code": code, "message": message}})
 }
-
-// Unused import guard for context if needed by callers.
-var _ context.Context

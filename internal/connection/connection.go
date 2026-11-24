@@ -18,6 +18,7 @@ import (
 	"github.com/hicancan/local-runtime-mcp/internal/mcpserver"
 	"github.com/hicancan/local-runtime-mcp/internal/runtimehost"
 	"github.com/hicancan/local-runtime-mcp/internal/transport"
+	"github.com/hicancan/local-runtime-mcp/internal/ui"
 )
 
 type Options struct {
@@ -195,7 +196,22 @@ func Run(ctx context.Context, cfg *config.Config, options Options, stdin io.Read
 			var localSrv *transport.LocalServer
 			ingress := newIngressManager(daemonCtx, cfg, host, log, func() int { return localSrv.AttachedClients() })
 			host.SetTunnelController(ingress)
-			localSrv, localErr := newLocalHTTP(host, cfg, newAdminHandler(func() string { return localSrv.Address() }, host, ingress, stopDaemon))
+			kick := func(id string) bool {
+				a := localSrv.KickAttached(id)
+				b := host.KickSession(id)
+				return a || b
+			}
+			var studio *ui.Studio
+			if cfg.Local.Token != "" {
+				var studioErr error
+				studio, studioErr = newStudio(func() string { return localSrv.Address() }, host, ingress, kick)
+				if studioErr != nil {
+					ingress.Close()
+					return studioErr
+				}
+				host.SetUIBootstrap(func() (string, error) { return studio.MintBootstrapURL(localSrv.Address()) })
+			}
+			localSrv, localErr := newLocalHTTP(host, cfg, newAdminHandler(func() string { return localSrv.Address() }, host, ingress, studio, kick, stopDaemon), studio)
 			if localErr != nil {
 				ingress.Close()
 				if cfg.Local.Token != "" && transport.ProbeLocal(ctx, cfg.Local.Listen, cfg.Local.Token) {
@@ -217,18 +233,32 @@ func Run(ctx context.Context, cfg *config.Config, options Options, stdin io.Read
 		return normalizeCancellation(transport.ServeStdio(daemonCtx, host.LocalServer(), stdin, stdout))
 	}
 
-	// Unified daemon mode: always hosts 9317 (local plane + admin) and 9315 (browser
-	// bridge), with remote wires (openai / cloudflare / http) hot-pluggable on demand.
+	// Unified daemon mode: always hosts 9317 (local plane + admin + /ui studio) and 9315
+	// (browser bridge), with remote wires (openai / cloudflare / http) hot-pluggable on demand.
 	var localSrv *transport.LocalServer
 	ingress := newIngressManager(daemonCtx, cfg, host, log, func() int { return localSrv.AttachedClients() })
 	defer ingress.Close()
 	host.SetTunnelController(ingress)
 
-	localSrv, err = newLocalHTTP(host, cfg, newAdminHandler(func() string { return localSrv.Address() }, host, ingress, stopDaemon))
+	kick := func(id string) bool {
+		a := localSrv.KickAttached(id)
+		b := host.KickSession(id)
+		return a || b
+	}
+	var studio *ui.Studio
+	if cfg.Local.Token != "" {
+		studio, err = newStudio(func() string { return localSrv.Address() }, host, ingress, kick)
+		if err != nil {
+			return err
+		}
+		host.SetUIBootstrap(func() (string, error) { return studio.MintBootstrapURL(localSrv.Address()) })
+	}
+
+	localSrv, err = newLocalHTTP(host, cfg, newAdminHandler(func() string { return localSrv.Address() }, host, ingress, studio, kick, stopDaemon), studio)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(log, "[daemon] local plane listening on http://%s (mcp=%t, clients=%d)\n", localSrv.Address(), cfg.Local.Token != "", len(cfg.Grants.Clients))
+	fmt.Fprintf(log, "[daemon] local plane listening on http://%s (mcp=%t, studio=%t, clients=%d)\n", localSrv.Address(), cfg.Local.Token != "", studio != nil, len(cfg.Grants.Clients))
 
 	if options.HTTP {
 		if _, err := ingress.Up("http", 0); err != nil {
@@ -246,7 +276,7 @@ func Run(ctx context.Context, cfg *config.Config, options Options, stdin io.Read
 	return err
 }
 
-func newLocalHTTP(host *runtimehost.Host, cfg *config.Config, admin http.Handler) (*transport.LocalServer, error) {
+func newLocalHTTP(host *runtimehost.Host, cfg *config.Config, admin, studio http.Handler) (*transport.LocalServer, error) {
 	address := cfg.Local.Listen
 	if address == "" {
 		address = config.DefaultLocal
@@ -257,11 +287,31 @@ func newLocalHTTP(host *runtimehost.Host, cfg *config.Config, admin http.Handler
 		Version:      mcpserver.Version,
 		Capabilities: host.LocalCapabilitiesHandler(),
 		Admin:        admin,
+		UI:           studio,
 	})
 }
 
 func publicHTTPConfig(cfg *config.Config) (transport.HTTPConfig, error) {
-	result := transport.HTTPConfig{Listen: cfg.HTTP.Listen, BearerToken: cfg.HTTP.BearerToken, PublicHost: cfg.HTTP.PublicHost}
+	tokens := make([]transport.RemoteTokenAuth, 0, len(cfg.Grants.Remote.Tokens))
+	for _, rt := range cfg.Grants.Remote.Tokens {
+		tokens = append(tokens, transport.RemoteTokenAuth{
+			ID:       rt.ID,
+			Token:    rt.Token,
+			ReadOnly: rt.ReadOnly,
+			Tools:    append([]string(nil), rt.Tools...),
+		})
+	}
+	wire := "http"
+	if cfg.Cloudflare.TunnelToken != "" && cfg.HTTP.PublicHost != "" {
+		wire = "cloudflare"
+	}
+	result := transport.HTTPConfig{
+		Listen:       cfg.HTTP.Listen,
+		BearerToken:  cfg.HTTP.BearerToken,
+		PublicHost:   cfg.HTTP.PublicHost,
+		RemoteTokens: tokens,
+		Wire:         wire,
+	}
 	switch cfg.HTTP.Auth {
 	case "", "bearer":
 	case "oauth":

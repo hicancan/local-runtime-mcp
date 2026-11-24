@@ -22,6 +22,7 @@ var validGrantMethod = map[string]bool{
 	"tunnel_down":      true,
 	"set_remote_grant": true,
 	"stop_desktop":     true,
+	"ui_bootstrap":     true,
 }
 
 func (b *Bridge) SetGrantHandler(handler GrantHandler) {
@@ -70,7 +71,7 @@ func (b *Bridge) receiveGrants(writer http.ResponseWriter, request *http.Request
 		body, _ = json.Marshal(map[string]any{"name": envelope.Name})
 	case "set_remote_grant":
 		body, _ = json.Marshal(map[string]any{"target": envelope.Target, "grant": envelope.Remote})
-	case "stop_desktop":
+	case "stop_desktop", "ui_bootstrap":
 		body = nil
 	}
 	result, err := handler(envelope.Method, envelope.Origin, body)

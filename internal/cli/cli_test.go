@@ -33,7 +33,8 @@ func TestHelpDescribesUnifiedCommands(t *testing.T) {
 	for _, value := range []string{
 		"serve --transport stdio", "lrmcp start", "lrmcp stop", "lrmcp status",
 		"lrmcp daemon", "lrmcp tunnel up", "lrmcp tunnel down", "lrmcp grant remote",
-		"setup browser", "setup local", "setup client", "setup oauth", config.FileName,
+		"lrmcp ui", "lrmcp audit list", "lrmcp audit search", "lrmcp audit tail", "lrmcp audit export",
+		"setup browser", "setup local", "setup client", "setup oauth", "setup remote-token", config.FileName,
 		"command line > LOCAL_RUNTIME_MCP_* environment > YAML > defaults",
 		"https://github.com/hicancan/local-runtime-mcp", "GNU AGPL v3.0 only",
 	} {
@@ -148,5 +149,37 @@ func TestBrowserSetupUsesPortablePaths(t *testing.T) {
 	}
 	if strings.Contains(output.String(), cfg.Browser.Token) {
 		t.Fatal("browser setup leaked token to stdout")
+	}
+}
+
+func TestSetupRemoteTokenPersistsAndShows(t *testing.T) {
+	root := t.TempDir()
+	executable := filepath.Join(root, "lrmcp.exe")
+	var out, errBuf bytes.Buffer
+	if err := run(context.Background(), []string{"setup", "remote-token", "--id", "astra-1", "--read-only", "--tool", "browser_status"}, strings.NewReader(""), &out, &errBuf, executable); err != nil {
+		t.Fatalf("setup remote-token failed: %v (%s)", err, errBuf.String())
+	}
+	var created struct {
+		ID       string   `json:"id"`
+		Token    string   `json:"token"`
+		ReadOnly bool     `json:"read_only"`
+		Tools    []string `json:"tools"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.ID != "astra-1" || len(created.Token) != 64 || !created.ReadOnly || len(created.Tools) != 1 || created.Tools[0] != "browser_status" {
+		t.Fatalf("unexpected remote-token output: %+v", created)
+	}
+	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	if err != nil || len(cfg.Grants.Remote.Tokens) != 1 || cfg.Grants.Remote.Tokens[0].Token != created.Token {
+		t.Fatalf("remote token not persisted cleanly: %+v (%v)", cfg.Grants.Remote.Tokens, err)
+	}
+	out.Reset()
+	if err := run(context.Background(), []string{"setup", "remote-token", "--id", "astra-1", "--show"}, strings.NewReader(""), &out, &errBuf, executable); err != nil {
+		t.Fatalf("setup remote-token --show failed: %v", err)
+	}
+	if !strings.Contains(out.String(), created.Token) {
+		t.Fatalf("--show omitted token: %s", out.String())
 	}
 }

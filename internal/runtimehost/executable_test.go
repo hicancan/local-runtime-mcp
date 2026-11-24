@@ -59,7 +59,7 @@ func TestExecutableStdio(t *testing.T) {
 		t.Fatalf("unexpected executable identity: %+v", identity)
 	}
 	catalog, err := session.ListTools(ctx, nil)
-	if err != nil || len(catalog.Tools) != 22 {
+	if err != nil || len(catalog.Tools) != 23 {
 		t.Fatalf("executable tool catalog: %v; %v", catalog, err)
 	}
 	call := func(name string, arguments any, output any) *mcp.CallToolResult {
@@ -333,6 +333,78 @@ func TestExecutableDetachedDaemonLifecycleAndHotPlug(t *testing.T) {
 	}
 	if res, err := second.CallTool(ctx, &mcp.CallToolParams{Name: "browser_status", Arguments: map[string]any{}}); err != nil || res.IsError {
 		t.Fatalf("second stdio client broke after first closed: %v %+v", err, res)
+	}
+	if res, err := second.CallTool(ctx, &mcp.CallToolParams{Name: "agent_report", Arguments: map[string]any{
+		"title":   "桌面巡检任务",
+		"message": "已完成连接稳定性检查，准备验证审计流。",
+		"status":  "working",
+	}}); err != nil || res.IsError {
+		t.Fatalf("agent_report failed: %v %+v", err, res)
+	}
+
+	// Verify embedded SQLite WAL + FTS5 audit CLI commands & single-use Studio UI bootstrap!
+	var auditSessions struct {
+		Sessions []struct {
+			ID    string `json:"id"`
+			Title string `json:"title"`
+		} `json:"sessions"`
+	}
+	if err := json.Unmarshal(runCLI("audit", "list"), &auditSessions); err != nil {
+		t.Fatal(err)
+	}
+	foundTitle := false
+	for _, s := range auditSessions.Sessions {
+		if s.Title == "桌面巡检任务" {
+			foundTitle = true
+		}
+	}
+	if !foundTitle {
+		t.Fatalf("audit list missing agent_report session title: %+v", auditSessions)
+	}
+	var auditSearch struct {
+		Events []struct {
+			Kind    string `json:"kind"`
+			Summary string `json:"summary"`
+		} `json:"events"`
+	}
+	if err := json.Unmarshal(runCLI("audit", "search", "稳定性检查"), &auditSearch); err != nil {
+		t.Fatal(err)
+	}
+	if len(auditSearch.Events) == 0 || auditSearch.Events[0].Kind != "note" {
+		t.Fatalf("audit FTS5 search failed: %+v", auditSearch)
+	}
+	exported := string(runCLI("audit", "export"))
+	if !strings.Contains(exported, "browser_status") || !strings.Contains(exported, "稳定性检查") {
+		t.Fatalf("audit export missing expected JSONL records: %s", exported)
+	}
+	var uiBoot struct {
+		BootstrapURL string `json:"bootstrap_url"`
+	}
+	if err := json.Unmarshal(runCLI("ui", "--no-open"), &uiBoot); err != nil || !strings.Contains(uiBoot.BootstrapURL, "/ui/auth?code=") {
+		t.Fatalf("ui --no-open failed: %v %+v", err, uiBoot)
+	}
+	noRedirect := &http.Client{
+		Transport: &http.Transport{Proxy: nil},
+		Timeout:   5 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	uiResp, err := noRedirect.Get(uiBoot.BootstrapURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uiResp.Body.Close()
+	if uiResp.StatusCode != http.StatusSeeOther || uiResp.Header.Get("Location") != "/ui/" {
+		t.Fatalf("ui bootstrap auth failed: status=%d loc=%q", uiResp.StatusCode, uiResp.Header.Get("Location"))
+	}
+	replayResp, err := noRedirect.Get(uiBoot.BootstrapURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayResp.Body.Close()
+	if replayResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("replayed ui bootstrap URL was not rejected: %d", replayResp.StatusCode)
 	}
 
 	// 4. Hot-plug remote HTTP wire live (0 daemon restart), apply read-only remote grant, then unplug.

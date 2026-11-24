@@ -19,7 +19,7 @@ export type TunnelStatus = {
 };
 export type RemoteGrant = { read_only?: boolean; tools?: string[] };
 export type RemoteGrants = { openai: RemoteGrant; http: RemoteGrant };
-export type RuntimeSummary = { attached_clients: number; desktop_owned: boolean };
+export type RuntimeSummary = { attached_clients: number; desktop_owned: boolean; ui_available?: boolean };
 export type View = {
   site: string;
   grants: Grant[];
@@ -38,7 +38,8 @@ type GrantAction =
   | { method: 'tunnel_up'; origin: string; name: string; ttl_seconds?: number }
   | { method: 'tunnel_down'; origin: string; name: string }
   | { method: 'set_remote_grant'; origin: string; target: 'openai' | 'http'; remote: RemoteGrant }
-  | { method: 'stop_desktop'; origin: string };
+  | { method: 'stop_desktop'; origin: string }
+  | { method: 'ui_bootstrap'; origin: string };
 
 async function postGrant(payload: GrantAction): Promise<View> {
   const settings = await chrome.storage.local.get({ address: packagedConfig.address || '127.0.0.1:9315', token: packagedConfig.token || '' });
@@ -71,6 +72,18 @@ export async function setRemoteGrant(origin: string, target: 'openai' | 'http', 
 
 export async function stopDesktop(origin: string): Promise<View> {
   return postGrant({ method: 'stop_desktop', origin });
+}
+
+export async function mintStudioURL(origin: string): Promise<string> {
+  const settings = await chrome.storage.local.get({ address: packagedConfig.address || '127.0.0.1:9315', token: packagedConfig.token || '' });
+  if (!settings.token) throw new Error('not configured');
+  const response = await fetch(`http://${settings.address}/v1/grants`, {
+    method: 'POST', headers: { Authorization: `Bearer ${settings.token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ method: 'ui_bootstrap', origin }),
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok || !body?.url) throw new Error(body?.error || `lrmcp ${response.status}`);
+  return body.url as string;
 }
 
 /** Whether a grant's site covers a page origin: the same origin, or a subdomain under the same scheme. A site with a

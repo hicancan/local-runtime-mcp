@@ -24,14 +24,6 @@ jobs:
             goos: linux
             goarch: arm64
             executable: lrmcp
-          - os: macos-latest
-            goos: darwin
-            goarch: amd64
-            executable: lrmcp
-          - os: macos-latest
-            goos: darwin
-            goarch: arm64
-            executable: lrmcp
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7

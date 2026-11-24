@@ -52,6 +52,9 @@
   "openSettings": {
     "message": "连接设置"
   },
+  "openStudio": {
+    "message": "活动台"
+  },
   "notAWebsite": {
     "message": "打开一个网站，就能管理它可以使用或交出的能力。"
   },
@@ -158,6 +161,9 @@
   },
   "tool_computer_action": {
     "message": "在桌面上操作"
+  },
+  "tool_agent_report": {
+    "message": "发送进度播报"
   },
   "groupProposals": {
     "message": "AI 提议 · 等你审批"

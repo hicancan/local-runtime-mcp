@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/hicancan/local-runtime-mcp/internal/audit"
 	"github.com/hicancan/local-runtime-mcp/internal/browser"
 	"github.com/hicancan/local-runtime-mcp/internal/capability"
 	"github.com/hicancan/local-runtime-mcp/internal/computer"
@@ -51,6 +53,7 @@ type Host struct {
 	httpServer        *mcpserver.Managed
 	openaiServer      *mcpserver.Managed
 	localServer       *mcpserver.Managed
+	audit             *audit.Store
 	bridge            *browser.Bridge
 	controller        computer.Controller
 	processes         *runtimeprocess.Manager
@@ -81,26 +84,40 @@ func Start(ctx context.Context, cfg *config.Config) (*Host, error) {
 	}
 	// The Host keeps resource transport alive until its ordered Close.
 	ctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+
+	auditPath := ""
+	if cfg.Path != "" {
+		auditPath = filepath.Join(filepath.Dir(cfg.Path), "lrmcp-audit.db")
+	}
+	auditStore, err := audit.Open(auditPath)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
 	bridge, err := browser.Start(ctx, cfg.Browser)
 	if err != nil {
 		cancel()
+		_ = auditStore.Close()
 		return nil, err
 	}
 	registry, err := capability.Load(cfg.Capabilities.Directory, bridge)
 	if err != nil {
 		cancel()
 		_ = bridge.Close(context.Background())
+		_ = auditStore.Close()
 		return nil, err
 	}
 	if err := validateCapabilities(cfg, registry); err != nil {
 		cancel()
 		_ = bridge.Close(context.Background())
+		_ = auditStore.Close()
 		return nil, err
 	}
 
 	var localCapabilities http.Handler
 	if len(cfg.Grants.Clients) > 0 {
-		localCapabilities = localCapabilitiesHandler(cfg.Grants.Clients, registry, bridge.Status)
+		localCapabilities = localCapabilitiesHandler(cfg.Grants.Clients, registry, bridge.Status, auditStore)
 	}
 
 	controller := computer.New(ctx)
@@ -114,33 +131,41 @@ func Start(ctx context.Context, cfg *config.Config) (*Host, error) {
 		Browser:      bridge,
 		Computer:     controller,
 		Capabilities: registry,
+		Audit:        auditStore,
 	}
 	httpDeps := baseDeps
+	httpDeps.Wire = "http"
 	httpDeps.LocalApps = false
 	httpDeps.Filter = remoteFilter(cfg.Grants.Remote.HTTP)
 	httpServer := mcpserver.NewManaged(httpDeps)
 
 	openaiDeps := baseDeps
+	openaiDeps.Wire = "openai"
 	openaiDeps.LocalApps = false
 	openaiDeps.Filter = remoteFilter(cfg.Grants.Remote.OpenAI)
 	openaiServer := mcpserver.NewManaged(openaiDeps)
 
 	localDeps := baseDeps
+	localDeps.Wire = "local"
 	localDeps.LocalApps = true
 	localServer := mcpserver.NewManaged(localDeps)
 
 	// Websites the owner lends machine tools to reach them through an unfiltered
 	// in-process MCP session (built-in machine tools only, never LocalApps).
+	// Auditing for websites is recorded cleanly in webHandler with source.Origin.
 	machineDeps := baseDeps
+	machineDeps.Audit = nil
+	machineDeps.Wire = "web"
 	machineDeps.LocalApps = false
 	machineServer := mcpserver.New(machineDeps)
 	machine, err := connectMachineTools(ctx, machineServer)
 	if err != nil {
 		cancel()
 		_ = bridge.Close(context.Background())
+		_ = auditStore.Close()
 		return nil, err
 	}
-	grants := newGrantStore(cfg.Grants.Web, cfg.Grants.Remote, cfg.Path, registry, machine, controller, func(target string, rg config.RemoteGrant) {
+	grants := newGrantStore(cfg.Grants.Web, cfg.Grants.Remote, cfg.Path, registry, machine, controller, auditStore, func(target string, rg config.RemoteGrant) {
 		switch target {
 		case "openai":
 			openaiServer.SetFilter(remoteFilter(rg))
@@ -151,24 +176,36 @@ func Start(ctx context.Context, cfg *config.Config) (*Host, error) {
 	if err := grants.checkAll(grants.bySite); err != nil {
 		cancel()
 		_ = bridge.Close(context.Background())
+		_ = auditStore.Close()
 		return nil, err
 	}
 	if err := grants.checkRemote(cfg.Grants.Remote.OpenAI); err != nil {
 		cancel()
 		_ = bridge.Close(context.Background())
+		_ = auditStore.Close()
 		return nil, err
 	}
 	if err := grants.checkRemote(cfg.Grants.Remote.HTTP); err != nil {
 		cancel()
 		_ = bridge.Close(context.Background())
+		_ = auditStore.Close()
 		return nil, err
 	}
-	bridge.SetWebHandler(webHandler(grants, registry))
+	for _, rt := range cfg.Grants.Remote.Tokens {
+		if err := grants.checkRemote(config.RemoteGrant{ReadOnly: rt.ReadOnly, Tools: rt.Tools}); err != nil {
+			cancel()
+			_ = bridge.Close(context.Background())
+			_ = auditStore.Close()
+			return nil, err
+		}
+	}
+	bridge.SetWebHandler(webHandler(grants, registry, auditStore))
 	bridge.SetGrantHandler(grants.handle)
 	return &Host{
 		httpServer:        httpServer,
 		openaiServer:      openaiServer,
 		localServer:       localServer,
+		audit:             auditStore,
 		bridge:            bridge,
 		controller:        controller,
 		processes:         processes,
@@ -197,6 +234,9 @@ func (h *Host) LocalServer() *mcp.Server { return h.localServer.Server }
 // LocalCapabilitiesHandler serves /capabilities/* only on the dedicated local-only listener.
 func (h *Host) LocalCapabilitiesHandler() http.Handler { return h.localCapabilities }
 
+// Audit returns the embedded SQLite WAL + FTS5 audit store.
+func (h *Host) Audit() *audit.Store { return h.audit }
+
 // SetTunnelController attaches the daemon's dynamic ingress controller so both
 // the local admin API and the browser extension panel share live tunnel state.
 func (h *Host) SetTunnelController(ctrl TunnelController) {
@@ -204,6 +244,15 @@ func (h *Host) SetTunnelController(ctrl TunnelController) {
 		return
 	}
 	h.grants.setTunnels(ctrl)
+}
+
+// SetUIBootstrap registers a callback that mints a single-use /ui/auth link
+// so the browser extension popup can jump straight into the local Studio UI.
+func (h *Host) SetUIBootstrap(fn func() (string, error)) {
+	if h == nil || h.grants == nil {
+		return
+	}
+	h.grants.setUIBootstrap(fn)
 }
 
 // SetRemoteGrant updates and persists a remote wire's tool grant and live-syncs its MCP server.
@@ -216,6 +265,47 @@ func (h *Host) SetRemoteGrant(target string, grant config.RemoteGrant) (config.R
 
 // RemoteGrants returns the current remote wire grants.
 func (h *Host) RemoteGrants() config.RemoteGrants { return h.grants.remoteCopy() }
+
+// WebGrants returns all configured website grants.
+func (h *Host) WebGrants() []config.WebGrant { return h.grants.all() }
+
+// Proposals returns pending Web MCP capability proposals awaiting owner decision.
+func (h *Host) Proposals() []capability.Proposal { return h.registry.Proposals() }
+
+// ApproveProposal approves a pending Web MCP capability proposal.
+func (h *Host) ApproveProposal(name string) error {
+	if err := h.registry.Approve(name); err != nil {
+		return err
+	}
+	h.audit.RecordSystem("proposal", "Approved page tool "+name, map[string]any{"name": name, "decision": "approved"})
+	return nil
+}
+
+// RejectProposal rejects a pending Web MCP capability proposal.
+func (h *Host) RejectProposal(name string) error {
+	if err := h.registry.Reject(name); err != nil {
+		return err
+	}
+	h.audit.RecordSystem("proposal", "Rejected page tool "+name, map[string]any{"name": name, "decision": "rejected"})
+	return nil
+}
+
+// KickSession closes any active MCP server session matching sessionID and marks it closed in audit.
+func (h *Host) KickSession(sessionID string) bool {
+	kicked := false
+	if h.localServer != nil && h.localServer.CloseSession(sessionID) {
+		kicked = true
+	}
+	if h.httpServer != nil && h.httpServer.CloseSession(sessionID) {
+		kicked = true
+	}
+	if h.openaiServer != nil && h.openaiServer.CloseSession(sessionID) {
+		kicked = true
+	}
+	h.audit.MarkSessionClosed(sessionID)
+	h.audit.RecordSystem("system", "Closed session "+sessionID, map[string]any{"session_id": sessionID, "disconnected": kicked})
+	return kicked
+}
 
 // BrowserStatus returns the current status of connected browser profiles.
 func (h *Host) BrowserStatus() browser.Status { return h.bridge.Status() }
@@ -230,7 +320,10 @@ func (h *Host) DesktopStatus(ctx context.Context) computer.ControlStatus {
 }
 
 // StopDesktop revokes active desktop physical control immediately.
-func (h *Host) StopDesktop() { h.controller.LocalStop() }
+func (h *Host) StopDesktop() {
+	h.controller.LocalStop()
+	h.audit.RecordSystem("system", "Owner revoked desktop physical control", nil)
+}
 
 // CapabilitiesSummary returns counts of loaded Web MCP tools, App MCP tools, and proposals.
 func (h *Host) CapabilitiesSummary() CapabilitySummary {
@@ -247,7 +340,7 @@ func (h *Host) StartedAt() time.Time { return h.startedAt }
 func (h *Host) Close(ctx context.Context) error {
 	h.closeOnce.Do(func() {
 		h.cancel()
-		h.closeErr = errors.Join(h.bridge.Close(ctx), h.controller.Close(), h.processes.Close())
+		h.closeErr = errors.Join(h.bridge.Close(ctx), h.controller.Close(), h.processes.Close(), h.audit.Close())
 	})
 	return h.closeErr
 }

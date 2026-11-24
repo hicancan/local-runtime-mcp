@@ -134,7 +134,7 @@ func TestFileCapabilityIsDiscoverableAndCallableThroughRealMCP(t *testing.T) {
 		}
 	}
 	// The built-in tools, the file capability, and capability_propose (a catalog exists to hold drafts).
-	if found == nil || len(listed.Tools) != 24 || found.Title != "Read an example page" || !found.Annotations.ReadOnlyHint || !*found.Annotations.OpenWorldHint {
+	if found == nil || len(listed.Tools) != 25 || found.Title != "Read an example page" || !found.Annotations.ReadOnlyHint || !*found.Annotations.OpenWorldHint {
 		t.Fatal("file capability was not registered alongside the existing tools")
 	}
 	// The actual advertised schema, including the routing envelope, must retain

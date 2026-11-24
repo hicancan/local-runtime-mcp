@@ -31,6 +31,19 @@ export async function setRemoteGrant(origin, target, remote) {
 export async function stopDesktop(origin) {
     return postGrant({ method: 'stop_desktop', origin });
 }
+export async function mintStudioURL(origin) {
+    const settings = await chrome.storage.local.get({ address: packagedConfig.address || '127.0.0.1:9315', token: packagedConfig.token || '' });
+    if (!settings.token)
+        throw new Error('not configured');
+    const response = await fetch(`http://${settings.address}/v1/grants`, {
+        method: 'POST', headers: { Authorization: `Bearer ${settings.token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ method: 'ui_bootstrap', origin }),
+    });
+    const body = await response.json().catch(() => null);
+    if (!response.ok || !body?.url)
+        throw new Error(body?.error || `lrmcp ${response.status}`);
+    return body.url;
+}
 /** Whether a grant's site covers a page origin: the same origin, or a subdomain under the same scheme. A site with a
  * port, or a local address, covers only itself. lrmcp names sites; this only matches them. */
 export function covers(site, origin) {

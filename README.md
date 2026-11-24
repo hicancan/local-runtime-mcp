@@ -7,9 +7,9 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-Give AI clients the programs, files, images, browser profiles, and desktop of the machine running `lrmcp`. Local Runtime MCP is a unified personal capability runtime with **22 core built-in MCP tools**, `capability_propose` for distilling reusable webpage tools (Web MCP), and owner-authored local app bindings (App MCP).
+Give AI clients the programs, files, images, browser profiles, and desktop of the machine running `lrmcp`. Local Runtime MCP is a unified personal capability runtime with **23 core built-in MCP tools** (including `agent_report` live progress notes), `capability_propose` for distilling reusable webpage tools (Web MCP), and owner-authored local app bindings (App MCP).
 
-`lrmcp` and its paired Chromium extension form one bidirectional dual-core runtime: one persistent user-session daemon owns the OS side (`127.0.0.1:9317`) and bridges multiple Chromium profiles (`127.0.0.1:9315`). Every local client attaches concurrently over stateless `stdio` thin proxies; remote cloud clients plug and unplug live through OpenAI Secure MCP Tunnel or Cloudflare Tunnel with zero daemon restarts and per-wire remote grants (`grants.remote`). See [v16.0.0 release notes](docs/releases/v16.0.0.md).
+`lrmcp` and its paired Chromium extension form one bidirectional dual-core runtime: one persistent user-session daemon owns the OS side (`127.0.0.1:9317`), an embedded pure-Go SQLite WAL + FTS5 audit engine (`lrmcp-audit.db`), and the local-only Sovereign Activity Studio (`lrmcp ui`), while bridging multiple Chromium profiles (`127.0.0.1:9315`). Every local client attaches concurrently over stateless `stdio` thin proxies; remote cloud clients (OAuth or named per-client Bearer tokens under `grants.remote.tokens`) plug and unplug live through OpenAI Secure MCP Tunnel or Cloudflare Tunnel with zero daemon restarts and per-wire remote grants (`grants.remote`). See [v17.0.0 release notes](docs/releases/v17.0.0.md).
 
 Independent process sessions, filesystem paths, and browser tabs run concurrently; shared files and desktop physical input have explicit coordination rules.
 
@@ -87,11 +87,19 @@ lrmcp
 │   ├── down <openai|cloudflare|http|all>
 │   └── status
 ├── grant remote <openai|http> [--read-only] [--tool NAME]
+├── ui [--no-open]                       Open local Sovereign Activity & Audit Studio
+├── audit
+│   ├── list [--limit N]
+│   ├── events [--session ID] [--agent ID]
+│   ├── search <query>
+│   ├── tail [--agent ID]
+│   └── export [--session ID] [--output FILE]
 ├── setup
 │   ├── browser
 │   ├── local
 │   ├── client
-│   └── oauth
+│   ├── oauth
+│   └── remote-token
 ├── version
 └── help
 ```
@@ -109,10 +117,13 @@ One detached user-session daemon owns the OS runtime (`127.0.0.1:9317`) and brow
 | `lrmcp tunnel up cloudflare [--ttl 2h]` | Hot-plugs public loopback HTTP (`127.0.0.1:9316`) and `cloudflared` (zero restart). |
 | `lrmcp tunnel down openai\|cloudflare\|http\|all` | Hot-unplugs one or all remote wires live; local clients and browser sessions continue uninterrupted. |
 | `lrmcp grant remote openai\|http [--read-only] [--tool NAME]` | Constrains what a remote wire may list and invoke; live-updates connected clients via `tools/list_changed`. |
+| `lrmcp ui [--no-open]` | Ensures the daemon is running, mints a single-use 60s bootstrap link, and opens the embedded local Activity Studio (`http://127.0.0.1:9317/ui/`). |
+| `lrmcp audit list \| events \| search \| tail \| export` | Query, FTS5 full-text search, live-tail over SSE, or export the embedded SQLite WAL audit log as JSONL. |
 | `lrmcp setup browser` | Generate bridge credentials and extract/configure the extension. |
 | `lrmcp setup local` | Generate `local.token` for multi-client detached daemon sharing on `127.0.0.1:9317`. |
 | `lrmcp setup client --id NAME [--browser-id ID]` | Register a scoped local native client in `grants.clients` (`--show` displays credentials). |
 | `lrmcp setup oauth --client-name NAME --redirect-uri URI` | Register an OAuth client with its exact callback URI and generate credentials. |
+| `lrmcp setup remote-token --id NAME [--read-only] [--tool NAME]` | Mint an independent named Bearer token under `grants.remote.tokens` for multi-client cloud access on `9316` (coexists with OAuth). |
 | `lrmcp setup oauth --show` | Display existing OAuth credentials deliberately in the local terminal. |
 | `lrmcp version` | Print the executable version. |
 | `lrmcp help` | Show commands and flags. |
@@ -142,7 +153,8 @@ Precedence is **command line > environment > YAML > defaults**. The file path is
 | Image | 1 |
 | Computer | 5 |
 | Browser | 8 |
-| **Total** | **22** |
+| Activity (`agent_report`) | 1 |
+| **Total** | **23** |
 
 ### Process · 2 tools
 
@@ -329,7 +341,7 @@ Download a platform archive from [Releases](https://github.com/hicancan/local-ru
 | Platform | Process, Filesystem, Image | Browser | Computer |
 | --- | --- | --- | --- |
 | Windows amd64 | Supported | Chromium extension | Native Windows engine |
-| Linux / macOS | Supported | Chromium extension in a desktop browser | Reports platform unavailability |
+| Linux amd64 / arm64 | Supported | Chromium extension in a desktop browser | Reports platform unavailability |
 
 Browser control requires Chromium 120 or newer and a running profile with the extension loaded. Windows Computer requires Windows 10 version 2004 or newer, including Windows 11, an interactive desktop, and permissions appropriate for the target applications.
 
@@ -461,6 +473,7 @@ See [the connection guide](docs/connections.md) for the complete setup sequence,
 | `LOCAL_RUNTIME_MCP_LOCAL_LISTEN` | `local.listen` |
 | `LOCAL_RUNTIME_MCP_LOCAL_TOKEN` | `local.token` |
 | `LOCAL_RUNTIME_MCP_CLIENT_TOKEN` / `LOCAL_RUNTIME_MCP_CLIENT_TOKEN_<ID>` | `grants.clients[].token` |
+| `LOCAL_RUNTIME_MCP_REMOTE_TOKEN_<ID>` | `grants.remote.tokens[].token` |
 | `LOCAL_RUNTIME_MCP_OPENAI_TUNNEL_ID` | `openai.tunnel_id` |
 | `LOCAL_RUNTIME_MCP_OPENAI_API_KEY` | `openai.api_key` |
 | `LOCAL_RUNTIME_MCP_HTTP_LISTEN` | `http.listen` |
@@ -500,7 +513,7 @@ go test ./internal/browser -run 'TestEdgeExtension(IdleLifecycle|EndToEnd)' -cou
 go test ./internal/browser -run TestEdgeOAuthAuthorizationRedirect -count=3 -v
 ```
 
-The OAuth browser regression exercises consent, cancellation, incorrect-key retry, cross-origin callback chains, client authentication, and refresh rotation with fixture credentials. CI exercises Windows, Linux, and macOS. Local protocol and browser tests validate those execution paths; live client acceptance is performed separately against the configured account and tunnel.
+The OAuth browser regression exercises consent, cancellation, incorrect-key retry, cross-origin callback chains, client authentication, and refresh rotation with fixture credentials. CI exercises Windows and Linux. Local protocol and browser tests validate those execution paths; live client acceptance is performed separately against the configured account and tunnel.
 
 ## Security, privacy, and license
 

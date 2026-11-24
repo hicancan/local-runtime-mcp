@@ -2,7 +2,7 @@
 
 [English](connections.md) · **简体中文**
 
-一个 `lrmcp` 进程管理一个 Runtime Host。所有 MCP 入口提供相同的 22 个内建工具及所有者注册的能力，共享进程会话、浏览器目标、文件提交协调和桌面控制。
+一个 `lrmcp` 进程管理一个 Runtime Host。所有 MCP 入口提供相同的 23 个内建工具（含 `agent_report`）及所有者注册的能力，共享进程会话、浏览器目标、文件提交协调、桌面控制以及内置 SQLite WAL + FTS5 审计流（`lrmcp ui` / `lrmcp audit`）。
 
 ## 选择传输与热插拔远端网线
 
@@ -65,7 +65,18 @@
    ```
 
 7. 继续客户端连接流程。在 Local Runtime 授权页面核对公开域名、注册客户端和访问范围，使用所有者批准密钥确认。浏览器经注册回调返回客户端应用，随后完成令牌交换和工具发现。
-8. 确认客户端发现 22 个内建工具及所有者启用的注册能力。先验证只读版本查询、浏览器状态和文件元数据，再验证有副作用的操作。
+8. 确认客户端发现 23 个内建工具及所有者启用的注册能力。先验证只读版本查询、浏览器状态和文件元数据，再验证有副作用的操作。
+
+### 单条 Cloudflare 隧道并发接入多个云端实例（与 OAuth 共存）
+
+当多个云端并发工作节点共用同一条 Cloudflare Tunnel（`https://<public_host>/mcp`）时，可通过 `lrmcp setup remote-token` 在 `grants.remote.tokens` 下签发带独立标识与最小权限的命名 Bearer Token——即使 `http.auth` 为 `oauth`，两者也可安全共存（传统静态 `http.bearer_token` 仍严格保持拒绝）：
+
+```powershell
+./lrmcp.exe setup remote-token --id worker-1
+./lrmcp.exe setup remote-token --id worker-ro --read-only
+```
+
+远端调用方携带 `Authorization: Bearer <token>` 与可选 `X-LRMCP-Agent: <实例标识>` 请求头，即可在 `lrmcp ui` 与 `lrmcp audit` 中按独立时间线实时观测每个并发节点的工作进展。
 
 回调 URI 需要准确匹配，包括路径和查询参数。同一客户端需要多个允许回调时重复传入 `--redirect-uri`。再次为同名客户端执行准备命令会追加回调，保留已有凭据。客户端名称就是 client ID，默认为 `gemini`。注册和 `--show` 都会在本地显示该客户端的凭据。
 

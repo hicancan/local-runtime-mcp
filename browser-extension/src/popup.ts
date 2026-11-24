@@ -1,4 +1,4 @@
-import { covers, grants, setRemoteGrant, stopDesktop, toggleTunnel, type Definition, type Grant, type Proposal, type TunnelStatus, type View } from './grants.js';
+import { covers, grants, mintStudioURL, setRemoteGrant, stopDesktop, toggleTunnel, type Definition, type Grant, type Proposal, type TunnelStatus, type View } from './grants.js';
 
 // The owner's sovereign panel: live remote wire toggles (OpenAI / Cloudflare / HTTP),
 // emergency desktop stop, plus the current tab's site grants (Use / Provide) and
@@ -25,6 +25,15 @@ $('language').addEventListener('click', async () => {
   await loadLanguage(); paintConnection(); render();
 });
 $('settings').addEventListener('click', event => { event.preventDefault(); void chrome.runtime.openOptionsPage(); });
+$('studio').addEventListener('click', async event => {
+  event.preventDefault();
+  try {
+    const url = await mintStudioURL(origin);
+    await chrome.tabs.create({ url });
+  } catch (error) {
+    status.textContent = t('failed', error instanceof Error ? error.message : String(error));
+  }
+});
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, props: Record<string, unknown> = {}, ...children: (Node | string)[]): HTMLElementTagNameMap[K] {
   const node: HTMLElementTagNameMap[K] = document.createElement(tag);
@@ -206,9 +215,11 @@ function paintConnection() {
     const n = view.runtime?.attached_clients ?? 0;
     connection.textContent = n > 0 ? t('connectedSessions', String(n)) : t('connected');
     connection.className = '';
+    $('studio').hidden = !view.runtime?.ui_available;
   } else {
     connection.textContent = t('disconnected');
     connection.className = 'off';
+    $('studio').hidden = true;
   }
   // The grant covers the whole site; the page's own host is shown beneath it when they differ.
   const host = origin.replace(/^https?:\/\//, ''), site = view?.site.replace(/^https?:\/\//, '') ?? host;

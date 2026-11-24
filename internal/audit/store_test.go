@@ -1,0 +1,110 @@
+package audit
+
+import (
+	"bytes"
+	"encoding/json"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestSQLiteWALStoreRedactionFTS5BlobsAndLiveStream(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "lrmcp-audit.db")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	ch, unsub := store.Subscribe()
+	defer unsub()
+
+	rawArgs := json.RawMessage(`{"program":"pwsh","args":["-Command","echo hello"],"environment":{"NORMAL":"ok","GITHUB_API_KEY":"super-secret-value","LOCAL_RUNTIME_MCP_LOCAL_TOKEN":"secret-token"}}`)
+	evID, sid := store.StartTool(StartToolInput{
+		SessionID:  "cf:astra-1",
+		AgentID:    "astra-1-mooc",
+		ClientName: "dot-cloud",
+		Wire:       "cloudflare",
+		ToolName:   "process_run",
+		RawArgs:    rawArgs,
+	})
+	if evID <= 0 || sid != "cf:astra-1" {
+		t.Fatalf("unexpected start: id=%d sid=%q", evID, sid)
+	}
+
+	// Receive live start packet.
+	select {
+	case pkt := <-ch:
+		if pkt.Event == nil || pkt.Event.Status != "running" || strings.Contains(pkt.Event.ArgsJSON, "super-secret-value") || strings.Contains(pkt.Event.ArgsJSON, "secret-token") {
+			t.Fatalf("redaction or live start failed: %+v", pkt.Event)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("missing live start event")
+	}
+
+	fakePNG := []byte{0x89, 'P', 'N', 'G', 1, 2, 3, 4}
+	store.FinishTool(evID, sid, FinishToolInput{
+		Status:     "ok",
+		Result:     map[string]any{"stdout": "hello world", "api_key": "must-not-leak"},
+		ImageData:  fakePNG,
+		ImageMIME:  "image/png",
+		DurationMS: 42,
+	})
+
+	// Receive live finish packet.
+	var blobHash string
+	select {
+	case pkt := <-ch:
+		if pkt.Event == nil || pkt.Event.Status != "ok" || pkt.Event.DurationMS != 42 || pkt.Event.ImageBlob == "" || strings.Contains(pkt.Event.ResultJSON, "must-not-leak") {
+			t.Fatalf("finish event invalid: %+v", pkt.Event)
+		}
+		blobHash = pkt.Event.ImageBlob
+	case <-time.After(2 * time.Second):
+		t.Fatal("missing live finish event")
+	}
+
+	gotBlob, err := store.GetBlob(blobHash)
+	if err != nil || !bytes.Equal(gotBlob, fakePNG) {
+		t.Fatalf("blob mismatch: %v %x", err, gotBlob)
+	}
+
+	// Record a progress note (agent_report).
+	note, err := store.RecordNote(NoteInput{
+		SessionID: sid,
+		AgentID:   "astra-1-mooc",
+		Wire:      "cloudflare",
+		Title:     "核对网络技术第六周测验",
+		Message:   "已完成 MOOC 页面拉取，正在交叉验证截止时间。",
+		Status:    "working",
+	})
+	if err != nil || note.Kind != "note" {
+		t.Fatalf("note failed: %v %+v", err, note)
+	}
+
+	// FTS5 search across tool calls and notes.
+	hits, err := store.Search("交叉验证", 20)
+	if err != nil || len(hits) != 1 || hits[0].ID != note.ID {
+		t.Fatalf("FTS5 search failed: %v %+v", err, hits)
+	}
+	hits2, err := store.Search("hello", 20)
+	if err != nil || len(hits2) != 1 || hits2[0].ID != evID {
+		t.Fatalf("FTS5 search for tool output failed: %v %+v", err, hits2)
+	}
+
+	// Sessions listing preserves title and counts.
+	sessions, err := store.ListSessions(10)
+	if err != nil || len(sessions) != 1 || sessions[0].Title != "核对网络技术第六周测验" || sessions[0].ToolCount != 1 {
+		t.Fatalf("unexpected sessions: %v %+v", err, sessions)
+	}
+
+	// JSONL export produces valid lines.
+	var exported bytes.Buffer
+	if err := store.ExportJSONL(&exported, sid); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(exported.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 JSONL lines, got %d: %s", len(lines), exported.String())
+	}
+}

@@ -28,6 +28,7 @@ const (
 	EnvLocalListen           = EnvironmentPrefix + "LOCAL_LISTEN"
 	EnvLocalToken            = EnvironmentPrefix + "LOCAL_TOKEN"
 	EnvClientToken           = EnvironmentPrefix + "CLIENT_TOKEN"
+	EnvRemoteToken           = EnvironmentPrefix + "REMOTE_TOKEN"
 	EnvOpenAITunnelID        = EnvironmentPrefix + "OPENAI_TUNNEL_ID"
 	EnvOpenAIAPIKey          = EnvironmentPrefix + "OPENAI_API_KEY"
 	EnvHTTPListen            = EnvironmentPrefix + "HTTP_LISTEN"
@@ -50,6 +51,12 @@ func ValidClientID(id string) bool {
 func ClientTokenEnvVar(id string) string {
 	normalized := strings.ToUpper(strings.ReplaceAll(id, "-", "_"))
 	return EnvClientToken + "_" + normalized
+}
+
+// RemoteTokenEnvVar returns the per-remote-token environment variable name for id.
+func RemoteTokenEnvVar(id string) string {
+	normalized := strings.ToUpper(strings.ReplaceAll(id, "-", "_"))
+	return EnvRemoteToken + "_" + normalized
 }
 
 // Config is the complete persistent configuration for one portable runtime.
@@ -87,8 +94,20 @@ type Grants struct {
 // RemoteGrants constrains what remote MCP wires (OpenAI tunnel and public HTTP / Cloudflare)
 // may see and invoke. Empty grants preserve the full remote-safe surface (never LocalApps).
 type RemoteGrants struct {
-	OpenAI RemoteGrant `yaml:"openai,omitempty" json:"openai"`
-	HTTP   RemoteGrant `yaml:"http,omitempty" json:"http"`
+	OpenAI RemoteGrant   `yaml:"openai,omitempty" json:"openai"`
+	HTTP   RemoteGrant   `yaml:"http,omitempty" json:"http"`
+	Tokens []RemoteToken `yaml:"tokens,omitempty" json:"tokens,omitempty"`
+}
+
+// RemoteToken authorizes one named remote client on the public HTTP / Cloudflare
+// wire (9316) with an independent Bearer token and optional per-token tool bounds.
+// When configured alongside OAuth, both OAuth clients and named Bearer tokens
+// share the single tunnel while keeping independent identity attribution.
+type RemoteToken struct {
+	ID       string   `yaml:"id" json:"id"`
+	Token    string   `yaml:"token,omitempty" json:"-"`
+	ReadOnly bool     `yaml:"read_only,omitempty" json:"read_only,omitempty"`
+	Tools    []string `yaml:"tools,omitempty" json:"tools,omitempty"`
 }
 
 // RemoteGrant restricts one remote MCP wire. ReadOnly limits the wire to tools annotated
@@ -318,6 +337,11 @@ func applyEnvironment(cfg *Config, lookup func(string) (string, bool)) {
 		}
 		if cfg.Grants.Clients[i].ID != "" {
 			assign(ClientTokenEnvVar(cfg.Grants.Clients[i].ID), &cfg.Grants.Clients[i].Token)
+		}
+	}
+	for i := range cfg.Grants.Remote.Tokens {
+		if cfg.Grants.Remote.Tokens[i].ID != "" {
+			assign(RemoteTokenEnvVar(cfg.Grants.Remote.Tokens[i].ID), &cfg.Grants.Remote.Tokens[i].Token)
 		}
 	}
 }

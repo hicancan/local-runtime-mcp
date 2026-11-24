@@ -78,7 +78,7 @@ func TestMultiIngressHostSharesSessionsAndSurvivesPrivateClosure(t *testing.T) {
 			t.Fatalf("unexpected shared Server identity: %+v", identity)
 		}
 		catalog, err := session.ListTools(ctx, nil)
-		if err != nil || len(catalog.Tools) != 22 {
+		if err != nil || len(catalog.Tools) != 23 {
 			t.Fatalf("entrance catalog: result=%+v err=%v", catalog, err)
 		}
 	}
@@ -194,7 +194,7 @@ func TestMultiIngressHostSharesSessionsAndSurvivesPrivateClosure(t *testing.T) {
 		t.Fatalf("read-only desktop coordination state: %+v, %v", control, err)
 	}
 	catalog, err := b.ListTools(ctx, nil)
-	if err != nil || len(catalog.Tools) != 22 {
+	if err != nil || len(catalog.Tools) != 23 {
 		t.Fatalf("remaining public entrance catalog: result=%+v err=%v", catalog, err)
 	}
 }

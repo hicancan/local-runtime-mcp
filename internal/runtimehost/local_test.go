@@ -60,7 +60,7 @@ func TestLocalClientCapabilitiesAreScopedPerClientWithoutBorrowingWebGrant(t *te
 	chosen := func() browser.Status {
 		return browser.Status{Instances: []browser.InstanceStatus{{BrowserID: "owner", Connected: true}}}
 	}
-	handler := localCapabilitiesHandler(clients, registry, chosen)
+	handler := localCapabilitiesHandler(clients, registry, chosen, nil)
 	request := func(handler http.Handler, token, method, path, body string) *httptest.ResponseRecorder {
 		t.Helper()
 		r := httptest.NewRequest(method, path, strings.NewReader(body))
@@ -121,7 +121,7 @@ func TestLocalClientCapabilitiesAreScopedPerClientWithoutBorrowingWebGrant(t *te
 	status := func() browser.Status { return browser.Status{Instances: states} }
 	for _, test := range []struct{ owner, code string }{{"", "browser_ambiguous"}, {"missing", "browser_unavailable"}} {
 		c := []config.ClientGrant{{ID: "studev-win", Token: studevToken, BrowserID: test.owner, Capabilities: map[string]string{"icourse.outline": testCourse}}}
-		result := request(localCapabilitiesHandler(c, registry, status), studevToken, http.MethodPost, invoke, course)
+		result := request(localCapabilitiesHandler(c, registry, status, nil), studevToken, http.MethodPost, invoke, course)
 		if result.Code < 400 || !strings.Contains(result.Body.String(), test.code) || len(peer.actions) != 1 {
 			t.Fatalf("unexpected profile handling %d %s", result.Code, result.Body)
 		}
@@ -129,12 +129,12 @@ func TestLocalClientCapabilitiesAreScopedPerClientWithoutBorrowingWebGrant(t *te
 
 	peer.tabs = append(peer.tabs, browser.Tab{ID: "b", BrowserID: "owner", URL: testCourse})
 	c := []config.ClientGrant{{ID: "studev-win", Token: studevToken, BrowserID: "owner", Capabilities: map[string]string{"icourse.outline": testCourse}}}
-	result = request(localCapabilitiesHandler(c, registry, status), studevToken, http.MethodPost, invoke, course)
+	result = request(localCapabilitiesHandler(c, registry, status, nil), studevToken, http.MethodPost, invoke, course)
 	if result.Code != http.StatusConflict || !strings.Contains(result.Body.String(), "target_ambiguous") || len(peer.actions) != 1 {
 		t.Fatalf("duplicate target must not execute: %d %s", result.Code, result.Body)
 	}
 	peer.tabs = []browser.Tab{{ID: "a", BrowserID: "owner", URL: testCourse + "/different"}}
-	result = request(localCapabilitiesHandler(c, registry, status), studevToken, http.MethodPost, invoke, course)
+	result = request(localCapabilitiesHandler(c, registry, status, nil), studevToken, http.MethodPost, invoke, course)
 	if result.Code != http.StatusConflict || !strings.Contains(result.Body.String(), "target_unavailable") || len(peer.actions) != 1 {
 		t.Fatalf("different same-site record must not execute: %d %s", result.Code, result.Body)
 	}

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hicancan/local-runtime-mcp/internal/audit"
 	"github.com/hicancan/local-runtime-mcp/internal/browser"
 	"github.com/hicancan/local-runtime-mcp/internal/capability"
 	"github.com/hicancan/local-runtime-mcp/internal/config"
@@ -45,6 +46,17 @@ func validateGrantsAndCredentials(cfg *config.Config) error {
 			if !validTargetURL(target) {
 				return fmt.Errorf("local client %q capability targets must be absolute HTTP(S) URLs without credentials", c.ID)
 			}
+		}
+	}
+
+	seenRemoteTokens := map[string]bool{}
+	for _, rt := range cfg.Grants.Remote.Tokens {
+		if !config.ValidClientID(rt.ID) || seenRemoteTokens[rt.ID] {
+			return fmt.Errorf("remote tokens require unique lowercase identifiers: %q", rt.ID)
+		}
+		seenRemoteTokens[rt.ID] = true
+		if len(rt.Token) < 32 || strings.ContainsAny(rt.Token, " \t\r\n") {
+			return fmt.Errorf("remote token %q must contain at least 32 characters without whitespace", rt.ID)
 		}
 	}
 
@@ -82,6 +94,11 @@ func validateGrantsAndCredentials(cfg *config.Config) error {
 			return err
 		}
 	}
+	for _, rt := range cfg.Grants.Remote.Tokens {
+		if err := claim("grants.remote.tokens."+rt.ID, rt.Token); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -105,7 +122,7 @@ func findClientByToken(clients []config.ClientGrant, bearer string) (config.Clie
 	return matched, found
 }
 
-func localCapabilitiesHandler(clients []config.ClientGrant, registry *capability.Registry, status func() browser.Status) http.Handler {
+func localCapabilitiesHandler(clients []config.ClientGrant, registry *capability.Registry, status func() browser.Status, store *audit.Store) http.Handler {
 	copied := append([]config.ClientGrant(nil), clients...)
 	authenticate := func(w http.ResponseWriter, r *http.Request) (config.ClientGrant, bool) {
 		provided, bearer := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
@@ -170,7 +187,23 @@ func localCapabilitiesHandler(clients []config.ClientGrant, registry *capability
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 		defer cancel()
+		rawInput, _ := json.Marshal(request.Input)
+		start := time.Now()
+		evID, sid := store.StartTool(audit.StartToolInput{
+			SessionID:  "local-client:" + client.ID,
+			AgentID:    client.ID,
+			ClientName: client.ID,
+			Wire:       "local-client",
+			ToolName:   request.Name,
+			RawArgs:    rawInput,
+		})
 		result, err := registry.CallBound(ctx, request.Name, browserID, target, request.Input)
+		dur := time.Since(start).Milliseconds()
+		if err != nil {
+			store.FinishTool(evID, sid, audit.FinishToolInput{Status: "error", ErrorText: err.Error(), DurationMS: dur})
+		} else {
+			store.FinishTool(evID, sid, audit.FinishToolInput{Status: "ok", Result: result, DurationMS: dur})
+		}
 		switch {
 		case err == nil:
 			writeLocalCapabilityJSON(w, http.StatusOK, result)

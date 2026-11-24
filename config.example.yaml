@@ -1,14 +1,17 @@
 ## Copy this file to local-runtime-mcp.yaml beside lrmcp.
 ##
-## Unified architecture (v16.0.0):
+## Unified architecture (v17.0.0):
 ##   lrmcp setup local                         # initialize 127.0.0.1:9317 local plane
 ##   lrmcp setup browser                       # initialize 127.0.0.1:9315 browser extension bridge
 ##   lrmcp serve --transport stdio             # pure thin proxy; auto-spawns detached daemon
 ##   lrmcp start | stop | status               # manage background user-session daemon
+##   lrmcp ui                                  # open local-only Sovereign Activity Studio (/ui)
+##   lrmcp audit list | search | tail | export # query or stream embedded SQLite WAL + FTS5 audit log
 ##   lrmcp tunnel up openai [--ttl 2h]         # hot-plug OpenAI wire live (0 daemon restart)
 ##   lrmcp tunnel up cloudflare [--ttl 2h]     # hot-plug Cloudflare wire live (0 daemon restart)
 ##   lrmcp tunnel down openai | cloudflare | all
 ##   lrmcp grant remote openai --read-only     # live-restrict a remote wire to read-only tools
+##   lrmcp setup remote-token --id worker-1    # mint named Bearer token on 9316 (coexists with OAuth)
 
 # Browser extension bidirectional bridge (loopback only, chrome-extension:// Origin only)
 browser:
@@ -73,8 +76,14 @@ grants:
   #     capabilities:
   #       icourse.outline: "https://www.icourse163.org/learn/COURSE#/learn/content"
   # Optional per-wire remote boundaries (empty allows the full remote-safe surface, never LocalApps).
+  # Named remote tokens under `tokens` allow multiple cloud clients to share 127.0.0.1:9316 (Cloudflare)
+  # concurrently with independent attribution and optional read-only/tool limits — even when http.auth is oauth!
   # remote:
   #   openai:
   #     read_only: false
   #   http:
   #     read_only: false
+  #   tokens:
+  #     - id: worker-1
+  #       token: "replace-with-a-separate-random-token-of-at-least-32-characters"
+  #       read_only: false

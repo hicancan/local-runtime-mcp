@@ -28,7 +28,7 @@ func TestWebOriginAndCapabilityGrants(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := webHandler(newGrantStore([]config.WebGrant{{Site: "https://studev.example", Use: true}}, config.RemoteGrants{}, "", registry, nil, nil, nil), registry)
+	handler := webHandler(newGrantStore([]config.WebGrant{{Site: "https://studev.example", Use: true}}, config.RemoteGrants{}, "", registry, nil, nil, nil, nil), registry, nil)
 	source := browser.WebSource{Origin: "https://evil.example", BrowserID: "browser-a"}
 	emit := func(browser.WebEvent) error { t.Fatal("unauthorized request emitted an event"); return nil }
 	for _, method := range []string{"capabilities.list", "capabilities.invoke", "models.list", "models.chat"} {

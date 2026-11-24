@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hicancan/local-runtime-mcp/internal/audit"
 	"github.com/hicancan/local-runtime-mcp/internal/browser"
 	"github.com/hicancan/local-runtime-mcp/internal/config"
 	"github.com/hicancan/local-runtime-mcp/internal/filesystem"
@@ -52,6 +53,7 @@ func TestToolCatalogAndIdentity(t *testing.T) {
 		"computer_targets": {true, false, true, false}, "computer_state": {true, false, true, false},
 		"computer_action": {false, true, false, false}, "computer_wait": {true, false, true, false},
 		"computer_control": {false, false, false, false},
+		"agent_report":     {true, false, false, false},
 	}
 	type propertySchema struct {
 		Enum       []string                  `json:"enum"`
@@ -289,5 +291,67 @@ func decodeStructured(t *testing.T, result *mcp.CallToolResult, output any) {
 	}
 	if err := json.Unmarshal(data, output); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAuditMiddlewareRecordsToolsImagesNotesAndTokenPolicy(t *testing.T) {
+	store, err := audit.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bridge, err := browser.Start(ctx, config.Browser{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	processes := runtimeprocess.NewManager(ctx)
+	t.Cleanup(func() { _ = bridge.Close(context.Background()); _ = processes.Close() })
+
+	managed := NewManaged(Dependencies{
+		Process:    processes,
+		Filesystem: filesystem.New(),
+		Browser:    bridge,
+		Audit:      store,
+		Wire:       "cloudflare",
+	})
+	sSide, cSide := mcp.NewInMemoryTransports()
+	go func() {
+		reqCtx := audit.WithCallMeta(ctx, audit.CallMeta{
+			Wire:    "cloudflare",
+			AgentID: "astra-1",
+		})
+		_ = managed.Server.Run(reqCtx, sSide)
+	}()
+	session, err := mcp.NewClient(&mcp.Implementation{Name: "dot-cloud", Version: "1"}, nil).Connect(ctx, cSide, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	// Normal tool call is audited automatically.
+	callOK(t, session, "browser_status", map[string]any{})
+	// agent_report records a note event and updates session title without double tool_call entry.
+	callOK(t, session, "agent_report", map[string]any{
+		"title":   "核对课程通知",
+		"message": "已完成浏览器连接检查，准备拉取页面。",
+		"status":  "working",
+	})
+
+	events, err := store.ListEvents(audit.EventFilter{SessionID: "cloudflare:astra-1", Limit: 20})
+	if err != nil || len(events) != 2 {
+		t.Fatalf("expected 2 audited events (1 tool_call + 1 note), got %d (%v): %+v", len(events), err, events)
+	}
+	if events[0].Kind != "tool_call" || events[0].ToolName != "browser_status" || events[0].Status != "ok" {
+		t.Fatalf("unexpected tool event: %+v", events[0])
+	}
+	if events[1].Kind != "note" || !strings.Contains(events[1].Summary, "拉取页面") {
+		t.Fatalf("unexpected note event: %+v", events[1])
+	}
+	sessions, err := store.ListSessions(10)
+	if err != nil || len(sessions) != 1 || sessions[0].Title != "核对课程通知" || sessions[0].ToolCount != 1 {
+		t.Fatalf("unexpected sessions: %+v (%v)", sessions, err)
 	}
 }

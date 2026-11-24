@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hicancan/local-runtime-mcp/internal/audit"
 	"github.com/hicancan/local-runtime-mcp/internal/oauth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -21,12 +22,23 @@ const DefaultHTTPListen = "127.0.0.1:9316"
 // from the MCP client's forwarded Authorization header.
 const InternalTokenHeader = "X-Local-Runtime-MCP-Internal-Token"
 
+// RemoteTokenAuth describes one explicitly configured named Bearer token on the
+// public HTTP / Cloudflare MCP wire with optional per-token tool restrictions.
+type RemoteTokenAuth struct {
+	ID       string
+	Token    string
+	ReadOnly bool
+	Tools    []string
+}
+
 type HTTPConfig struct {
 	Listen        string
 	BearerToken   string
 	PublicHost    string
 	InternalToken bool
 	OAuth         *oauth.Config
+	RemoteTokens  []RemoteTokenAuth
+	Wire          string
 }
 
 type HTTPServer struct {
@@ -45,6 +57,11 @@ func NewHTTP(server *mcp.Server, cfg HTTPConfig) (*HTTPServer, error) {
 	if err != nil {
 		return nil, err
 	}
+	for _, rt := range cfg.RemoteTokens {
+		if rt.ID == "" || len(rt.Token) < 32 {
+			return nil, fmt.Errorf("remote token %q must have an ID and at least 32 characters", rt.ID)
+		}
+	}
 	var authorization *oauth.Server
 	if cfg.OAuth != nil {
 		if cfg.InternalToken {
@@ -58,9 +75,20 @@ func NewHTTP(server *mcp.Server, cfg HTTPConfig) (*HTTPServer, error) {
 		if err != nil {
 			return nil, fmt.Errorf("configure HTTP OAuth: %w", err)
 		}
-	} else if len(cfg.BearerToken) < 32 {
+	} else if len(cfg.BearerToken) < 32 && len(cfg.RemoteTokens) == 0 {
 		return nil, errors.New("HTTP bearer token must contain at least 32 characters")
 	}
+
+	wire := cfg.Wire
+	if wire == "" {
+		if cfg.InternalToken {
+			wire = "openai"
+		} else {
+			wire = "http"
+		}
+	}
+
+	remoteTokens := append([]RemoteTokenAuth(nil), cfg.RemoteTokens...)
 
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{
 		Stateless:                    true,
@@ -90,10 +118,28 @@ func NewHTTP(server *mcp.Server, cfg HTTPConfig) (*HTTPServer, error) {
 		if cfg.InternalToken {
 			provided, bearer = request.Header.Get(InternalTokenHeader), true
 		}
-		valid := bearer && len(provided) == len(cfg.BearerToken) && subtle.ConstantTimeCompare([]byte(provided), []byte(cfg.BearerToken)) == 1
-		if authorization != nil {
-			valid = bearer && authorization.ValidateBearer(provided)
+
+		valid := false
+		defaultAgent := wire
+		var tokenPolicy audit.ToolPolicy
+
+		if cfg.InternalToken {
+			valid = bearer && len(provided) == len(cfg.BearerToken) && subtle.ConstantTimeCompare([]byte(provided), []byte(cfg.BearerToken)) == 1
+			defaultAgent = "openai-tunnel"
+		} else if bearer {
+			if matched, ok := matchRemoteToken(remoteTokens, provided); ok {
+				valid = true
+				defaultAgent = matched.ID
+				tokenPolicy = remoteTokenPolicy(matched)
+			} else if authorization != nil {
+				valid = authorization.ValidateBearer(provided)
+				defaultAgent = "oauth"
+			} else if len(cfg.BearerToken) >= 32 {
+				valid = len(provided) == len(cfg.BearerToken) && subtle.ConstantTimeCompare([]byte(provided), []byte(cfg.BearerToken)) == 1
+				defaultAgent = "remote-bearer"
+			}
 		}
+
 		if !valid {
 			if !cfg.InternalToken {
 				challenge := `Bearer realm="local-runtime-mcp"`
@@ -105,9 +151,59 @@ func NewHTTP(server *mcp.Server, cfg HTTPConfig) (*HTTPServer, error) {
 			http.Error(writer, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		mcpHandler.ServeHTTP(writer, request)
+
+		reqWire := wire
+		if !cfg.InternalToken && request.Header.Get("CF-Connecting-IP") != "" {
+			reqWire = "cloudflare"
+		}
+		agentID := audit.HeaderAgentID(request.Header, defaultAgent)
+		sessionID := ""
+		if hsid := audit.HeaderSessionID(request.Header); hsid != "" {
+			sessionID = reqWire + ":" + hsid
+		}
+		ctx := audit.WithCallMeta(request.Context(), audit.CallMeta{
+			Wire:      reqWire,
+			AgentID:   agentID,
+			SessionID: sessionID,
+			Policy:    tokenPolicy,
+		})
+		mcpHandler.ServeHTTP(writer, request.WithContext(ctx))
 	})
 	return newLoopbackHTTP(cfg.Listen, handler)
+}
+
+func matchRemoteToken(tokens []RemoteTokenAuth, provided string) (RemoteTokenAuth, bool) {
+	if provided == "" || len(tokens) == 0 {
+		return RemoteTokenAuth{}, false
+	}
+	var matched RemoteTokenAuth
+	found := false
+	for _, rt := range tokens {
+		if len(rt.Token) == len(provided) && subtle.ConstantTimeCompare([]byte(rt.Token), []byte(provided)) == 1 {
+			matched = rt
+			found = true
+		}
+	}
+	return matched, found
+}
+
+func remoteTokenPolicy(rt RemoteTokenAuth) audit.ToolPolicy {
+	if !rt.ReadOnly && len(rt.Tools) == 0 {
+		return nil
+	}
+	allowed := make(map[string]bool, len(rt.Tools))
+	for _, name := range rt.Tools {
+		allowed[name] = true
+	}
+	return func(name string, readOnly, destructive bool) bool {
+		if rt.ReadOnly && (!readOnly || destructive) {
+			return false
+		}
+		if len(allowed) > 0 && !allowed[name] {
+			return false
+		}
+		return true
+	}
 }
 
 func newLoopbackHTTP(address string, handler http.Handler) (*HTTPServer, error) {

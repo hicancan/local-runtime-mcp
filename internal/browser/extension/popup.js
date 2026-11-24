@@ -1,4 +1,4 @@
-import { covers, grants, setRemoteGrant, stopDesktop, toggleTunnel } from './grants.js';
+import { covers, grants, mintStudioURL, setRemoteGrant, stopDesktop, toggleTunnel } from './grants.js';
 let messages = {};
 let language = 'en';
 /** The owner's language: their choice in this panel, else Chinese whenever the system prefers it, else English. */
@@ -21,6 +21,16 @@ $('language').addEventListener('click', async () => {
     render();
 });
 $('settings').addEventListener('click', event => { event.preventDefault(); void chrome.runtime.openOptionsPage(); });
+$('studio').addEventListener('click', async (event) => {
+    event.preventDefault();
+    try {
+        const url = await mintStudioURL(origin);
+        await chrome.tabs.create({ url });
+    }
+    catch (error) {
+        status.textContent = t('failed', error instanceof Error ? error.message : String(error));
+    }
+});
 function el(tag, props = {}, ...children) {
     const node = document.createElement(tag);
     Object.assign(node, props);
@@ -196,10 +206,12 @@ function paintConnection() {
         const n = view.runtime?.attached_clients ?? 0;
         connection.textContent = n > 0 ? t('connectedSessions', String(n)) : t('connected');
         connection.className = '';
+        $('studio').hidden = !view.runtime?.ui_available;
     }
     else {
         connection.textContent = t('disconnected');
         connection.className = 'off';
+        $('studio').hidden = true;
     }
     // The grant covers the whole site; the page's own host is shown beneath it when they differ.
     const host = origin.replace(/^https?:\/\//, ''), site = view?.site.replace(/^https?:\/\//, '') ?? host;

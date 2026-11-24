@@ -54,11 +54,15 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return tunnelCmd(ctx, args[1:], stdout, stderr, executable, configPath)
 	case "grant":
 		return grantCmd(ctx, args[1:], stdout, stderr, configPath)
+	case "ui":
+		return uiCmd(ctx, args[1:], stdout, stderr, executable, configPath)
+	case "audit":
+		return auditCmd(ctx, args[1:], stdout, stderr, configPath)
 	case "serve":
 		return serveCmd(ctx, args[1:], stdin, stdout, stderr, executable, configPath)
 	case "setup":
 		if len(args) < 2 {
-			return errors.New("setup requires browser, local, client, or oauth")
+			return errors.New("setup requires browser, local, client, oauth, or remote-token")
 		}
 		switch args[1] {
 		case "browser":
@@ -69,8 +73,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 			return setupClient(args[2:], stdout, stderr, configPath)
 		case "oauth":
 			return setupOAuth(args[2:], stdout, stderr, configPath)
+		case "remote-token":
+			return setupRemoteToken(args[2:], stdout, stderr, configPath)
 		default:
-			return errors.New("setup requires browser, local, client, or oauth")
+			return errors.New("setup requires browser, local, client, oauth, or remote-token")
 		}
 	case "version":
 		if len(args) != 1 {
@@ -726,12 +732,20 @@ Usage:
   lrmcp tunnel down <openai|cloudflare|http|all>
   lrmcp tunnel status
   lrmcp grant remote <openai|http> [--read-only] [--tool NAME]
+  lrmcp ui [--no-open]                               Open local Sovereign Activity & Audit Studio
+  lrmcp audit list [--limit N]                       List audited agent sessions
+  lrmcp audit events [--session ID] [--agent ID]     List recorded tool calls & notes
+  lrmcp audit search <query> [--limit N]             FTS5 full-text search across audit history
+  lrmcp audit tail [--agent ID] [--session ID]       Stream live events in real time
+  lrmcp audit export [--session ID] [--output FILE]  Export audit stream as JSONL
   lrmcp setup browser [flags]
   lrmcp setup local [flags]
   lrmcp setup client --id NAME [--browser-id ID]
   lrmcp setup client --show --id NAME
   lrmcp setup oauth --client-name gemini --redirect-uri URI [flags]
   lrmcp setup oauth --show [--client-name NAME]
+  lrmcp setup remote-token --id NAME [--read-only] [--tool NAME]
+  lrmcp setup remote-token --show --id NAME
   lrmcp version
   lrmcp help
 

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hicancan/local-runtime-mcp/internal/audit"
 	"github.com/hicancan/local-runtime-mcp/internal/capability"
 	"github.com/hicancan/local-runtime-mcp/internal/computer"
 	"github.com/hicancan/local-runtime-mcp/internal/config"
@@ -30,7 +31,9 @@ type grantStore struct {
 	registry       *capability.Registry
 	machine        *machineTools
 	controller     computer.Controller
+	audit          *audit.Store
 	tunnels        TunnelController
+	uiBootstrap    func() (string, error)
 	onRemoteChange func(target string, grant config.RemoteGrant)
 }
 
@@ -41,6 +44,7 @@ func newGrantStore(
 	registry *capability.Registry,
 	machine *machineTools,
 	controller computer.Controller,
+	auditStore *audit.Store,
 	onRemoteChange func(target string, grant config.RemoteGrant),
 ) *grantStore {
 	store := &grantStore{
@@ -50,6 +54,7 @@ func newGrantStore(
 		registry:       registry,
 		machine:        machine,
 		controller:     controller,
+		audit:          auditStore,
 		onRemoteChange: onRemoteChange,
 	}
 	for _, g := range grants {
@@ -59,15 +64,31 @@ func newGrantStore(
 }
 
 func cloneRemoteGrants(r config.RemoteGrants) config.RemoteGrants {
+	tokens := make([]config.RemoteToken, len(r.Tokens))
+	for i, tok := range r.Tokens {
+		tokens[i] = config.RemoteToken{
+			ID:       tok.ID,
+			Token:    tok.Token,
+			ReadOnly: tok.ReadOnly,
+			Tools:    append([]string(nil), tok.Tools...),
+		}
+	}
 	return config.RemoteGrants{
 		OpenAI: config.RemoteGrant{ReadOnly: r.OpenAI.ReadOnly, Tools: append([]string(nil), r.OpenAI.Tools...)},
 		HTTP:   config.RemoteGrant{ReadOnly: r.HTTP.ReadOnly, Tools: append([]string(nil), r.HTTP.Tools...)},
+		Tokens: tokens,
 	}
 }
 
 func (s *grantStore) setTunnels(ctrl TunnelController) {
 	s.mu.Lock()
 	s.tunnels = ctrl
+	s.mu.Unlock()
+}
+
+func (s *grantStore) setUIBootstrap(fn func() (string, error)) {
+	s.mu.Lock()
+	s.uiBootstrap = fn
 	s.mu.Unlock()
 }
 
@@ -256,7 +277,8 @@ func (s *grantStore) setRemote(target string, g config.RemoteGrant) error {
 			s.mu.Unlock()
 			return err
 		}
-		raw.Grants.Remote = next
+		raw.Grants.Remote.OpenAI = next.OpenAI
+		raw.Grants.Remote.HTTP = next.HTTP
 		if _, err := config.Save(s.path, raw); err != nil {
 			s.mu.Unlock()
 			return fmt.Errorf("save remote grants: %w", err)
@@ -268,6 +290,7 @@ func (s *grantStore) setRemote(target string, g config.RemoteGrant) error {
 	if notify != nil {
 		notify(target, g)
 	}
+	s.audit.RecordSystem("system", fmt.Sprintf("Updated %s remote grant (read_only=%t)", target, g.ReadOnly), map[string]any{"target": target, "grant": g})
 	return nil
 }
 
@@ -278,6 +301,7 @@ func (s *grantStore) view(origin string) map[string]any {
 	s.mu.RLock()
 	ctrl := s.tunnels
 	remote := cloneRemoteGrants(s.remote)
+	hasUI := s.uiBootstrap != nil
 	s.mu.RUnlock()
 
 	tunnels := []TunnelStatus{}
@@ -303,12 +327,25 @@ func (s *grantStore) view(origin string) map[string]any {
 		"runtime": map[string]any{
 			"attached_clients": attached,
 			"desktop_owned":    desktopOwned,
+			"ui_available":     hasUI,
 		},
 	}
 }
 
 func (s *grantStore) handle(method, origin string, body json.RawMessage) (any, error) {
 	switch method {
+	case "ui_bootstrap":
+		s.mu.RLock()
+		fn := s.uiBootstrap
+		s.mu.RUnlock()
+		if fn == nil {
+			return nil, errors.New("local studio UI is unavailable in this mode")
+		}
+		url, err := fn()
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"url": url}, nil
 	case "approve", "reject":
 		var name string
 		if json.Unmarshal(body, &name) != nil {
@@ -322,6 +359,7 @@ func (s *grantStore) handle(method, origin string, body json.RawMessage) (any, e
 		if err := act(name); err != nil {
 			return nil, err
 		}
+		s.audit.RecordSystem("proposal", fmt.Sprintf("Owner %sd page tool %s", method, name), map[string]any{"name": name, "decision": method})
 	case "set":
 		var g config.WebGrant
 		if err := json.Unmarshal(body, &g); err != nil {
@@ -377,6 +415,7 @@ func (s *grantStore) handle(method, origin string, body json.RawMessage) (any, e
 	case "stop_desktop":
 		if s.controller != nil {
 			s.controller.LocalStop()
+			s.audit.RecordSystem("system", "Owner revoked desktop physical control", nil)
 		}
 	}
 	return s.view(origin), nil

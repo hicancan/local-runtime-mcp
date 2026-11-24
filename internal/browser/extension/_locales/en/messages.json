@@ -52,6 +52,9 @@
   "openSettings": {
     "message": "Connection settings"
   },
+  "openStudio": {
+    "message": "Studio"
+  },
   "notAWebsite": {
     "message": "Open a website to manage what it may use or provide."
   },
@@ -158,6 +161,9 @@
   },
   "tool_computer_action": {
     "message": "Act on the desktop"
+  },
+  "tool_agent_report": {
+    "message": "Post progress note"
   },
   "groupProposals": {
     "message": "Proposed by AI · awaiting you"

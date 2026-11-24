@@ -7,7 +7,9 @@ import (
 	"errors"
 	"io"
 	"net/url"
+	"time"
 
+	"github.com/hicancan/local-runtime-mcp/internal/audit"
 	"github.com/hicancan/local-runtime-mcp/internal/browser"
 	"github.com/hicancan/local-runtime-mcp/internal/capability"
 	"github.com/hicancan/local-runtime-mcp/internal/config"
@@ -55,7 +57,7 @@ type capabilityRequest struct {
 	Input map[string]any `json:"input"`
 }
 
-func webHandler(grants *grantStore, registry *capability.Registry) browser.WebHandler {
+func webHandler(grants *grantStore, registry *capability.Registry, store *audit.Store) browser.WebHandler {
 	return func(ctx context.Context, source browser.WebSource, request browser.WebRequest, _ func(browser.WebEvent) error) (any, error) {
 		grant, ok := grants.get(source.Origin)
 		if !ok || !grant.Use {
@@ -81,20 +83,48 @@ func webHandler(grants *grantStore, registry *capability.Registry) browser.WebHa
 			if decodeWeb(request.Params, &p) != nil || p.Input == nil {
 				return nil, errors.New("invalid capability input")
 			}
+			rawInput, _ := json.Marshal(p.Input)
+			start := time.Now()
 			if contains(grant.Tools, p.Name) {
-				return grants.machine.call(ctx, p.Name, p.Input)
+				evID, sid := store.StartTool(audit.StartToolInput{
+					SessionID:  "web:" + source.Origin,
+					AgentID:    source.Origin,
+					ClientName: source.Origin,
+					Wire:       "web",
+					ToolName:   p.Name,
+					RawArgs:    rawInput,
+				})
+				res, err := grants.machine.call(ctx, p.Name, p.Input)
+				dur := time.Since(start).Milliseconds()
+				if err != nil {
+					store.FinishTool(evID, sid, audit.FinishToolInput{Status: "error", ErrorText: err.Error(), DurationMS: dur})
+				} else {
+					store.FinishTool(evID, sid, audit.FinishToolInput{Status: "ok", Result: res, DurationMS: dur})
+				}
+				return res, err
 			}
 			target, ok := grant.Capabilities[p.Name]
 			if !ok {
 				return nil, errors.New("this capability is not granted to this website")
 			}
+			evID, sid := store.StartTool(audit.StartToolInput{
+				SessionID:  "web:" + source.Origin,
+				AgentID:    source.Origin,
+				ClientName: source.Origin,
+				Wire:       "web",
+				ToolName:   p.Name,
+				RawArgs:    rawInput,
+			})
 			result, err := registry.CallBound(ctx, p.Name, source.BrowserID, target, p.Input)
+			dur := time.Since(start).Milliseconds()
 			if err != nil {
+				store.FinishTool(evID, sid, audit.FinishToolInput{Status: "error", ErrorText: err.Error(), DurationMS: dur})
 				if errors.Is(err, capability.ErrTargetMissing) || errors.Is(err, capability.ErrTargetAmbiguous) || errors.Is(err, capability.ErrBrowserTabs) || errors.Is(err, capability.ErrInvalidInput) {
 					return nil, err
 				}
 				return nil, errors.New("capability execution failed; no request was replayed")
 			}
+			store.FinishTool(evID, sid, audit.FinishToolInput{Status: "ok", Result: result, DurationMS: dur})
 			return result, nil
 		default:
 			return nil, errors.New("unsupported local runtime operation")

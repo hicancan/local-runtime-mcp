@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hicancan/local-runtime-mcp/internal/audit"
 	"github.com/hicancan/local-runtime-mcp/internal/oauth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"golang.org/x/net/html"
@@ -301,4 +302,78 @@ func oauthFixtureRequest(t *testing.T, instance *HTTPServer, method, path string
 		t.Fatal(err)
 	}
 	return response
+}
+
+func TestHTTPOAuthCoexistsWithNamedRemoteTokensAndHeaders(t *testing.T) {
+	var seenMeta audit.CallMeta
+	server := mcp.NewServer(&mcp.Implementation{Name: "hybrid-test", Version: "1"}, nil)
+	mcp.AddTool(server, &mcp.Tool{Name: "ping", Description: "Return pong.", Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true}}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, struct {
+		Value string `json:"value"`
+	}, error) {
+		seenMeta = audit.CallMetaFromContext(ctx)
+		return nil, struct {
+			Value string `json:"value"`
+		}{Value: "pong"}, nil
+	})
+	auth := oauthFixtureConfig()
+	astraToken := "astra-cluster-token-0123456789abcdef0123456789ab"
+	public := startHTTPFixture(t, server, HTTPConfig{
+		Listen:      "127.0.0.1:0",
+		PublicHost:  "mcp.example.test",
+		BearerToken: staticFixtureToken,
+		OAuth:       &auth,
+		Wire:        "cloudflare",
+		RemoteTokens: []RemoteTokenAuth{
+			{ID: "astra-cluster", Token: astraToken, ReadOnly: true},
+		},
+	})
+	endpoint := "http://" + public.Address() + "/mcp"
+
+	// Legacy static BearerToken is STILL rejected when OAuth is enabled.
+	denied := request(t, endpoint, staticFixtureToken, "mcp.example.test", "")
+	denied.Body.Close()
+	if denied.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("legacy bearer_token accepted under OAuth: %d", denied.StatusCode)
+	}
+
+	// Explicitly configured named RemoteToken works alongside OAuth and propagates X-LRMCP-Agent + Policy.
+	client := mcp.NewClient(&mcp.Implementation{Name: "cloud-runner", Version: "1"}, nil)
+	session, err := client.Connect(context.Background(), &mcp.StreamableClientTransport{
+		Endpoint: endpoint,
+		HTTPClient: &http.Client{Timeout: 5 * time.Second, Transport: headerRoundTripper{
+			base:  http.DefaultTransport,
+			token: astraToken,
+			extra: map[string]string{"X-LRMCP-Agent": "astra-3"},
+		}},
+		DisableStandaloneSSE: true,
+	}, nil)
+	if err != nil {
+		t.Fatalf("named remote token connect failed: %v", err)
+	}
+	defer session.Close()
+
+	if _, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "ping", Arguments: map[string]any{}}); err != nil {
+		t.Fatalf("named remote token call failed: %v", err)
+	}
+	if seenMeta.Wire != "cloudflare" || seenMeta.AgentID != "astra-3" || seenMeta.Policy == nil {
+		t.Fatalf("unexpected CallMeta: %+v", seenMeta)
+	}
+	if !seenMeta.Policy("ping", true, false) || seenMeta.Policy("process_run", false, true) {
+		t.Fatal("read-only RemoteToken policy did not enforce read-only boundary")
+	}
+}
+
+type headerRoundTripper struct {
+	base  http.RoundTripper
+	token string
+	extra map[string]string
+}
+
+func (r headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	clone := req.Clone(req.Context())
+	clone.Header.Set("Authorization", "Bearer "+r.token)
+	for k, v := range r.extra {
+		clone.Header.Set(k, v)
+	}
+	return r.base.RoundTrip(clone)
 }

@@ -111,7 +111,7 @@ func (m *IngressManager) httpConfigured() bool {
 	if cfg.OAuth != nil {
 		return cfg.OAuth.OwnerToken != "" && len(cfg.OAuth.Clients) > 0
 	}
-	return len(cfg.BearerToken) >= 32
+	return len(cfg.BearerToken) >= 32 || len(cfg.RemoteTokens) > 0
 }
 
 // Status returns a deterministic snapshot of all remote wires.
@@ -299,6 +299,9 @@ func (m *IngressManager) startWire(name, address string, ttl time.Duration, run 
 	m.mu.Unlock()
 
 	fmt.Fprintf(m.log, "[%s] remote wire attached\n", name)
+	if m.host != nil && m.host.Audit() != nil {
+		m.host.Audit().RecordSystem("system", fmt.Sprintf("Attached remote wire %s", name), map[string]any{"wire": name, "address": address, "ttl_seconds": int64(ttl.Seconds())})
+	}
 	go func() {
 		defer close(done)
 		err := normalizeCancellation(run(wireCtx))
@@ -315,10 +318,16 @@ func (m *IngressManager) startWire(name, address string, ttl time.Duration, run 
 				w.state = "error"
 				w.lastError = err.Error()
 				fmt.Fprintf(m.log, "[%s] remote wire stopped with error: %v\n", name, err)
+				if m.host != nil && m.host.Audit() != nil {
+					m.host.Audit().RecordSystem("system", fmt.Sprintf("Remote wire %s error: %v", name, err), map[string]any{"wire": name, "error": err.Error()})
+				}
 			} else {
 				w.state = "stopped"
 				w.lastError = ""
 				fmt.Fprintf(m.log, "[%s] remote wire detached\n", name)
+				if m.host != nil && m.host.Audit() != nil {
+					m.host.Audit().RecordSystem("system", fmt.Sprintf("Detached remote wire %s", name), map[string]any{"wire": name})
+				}
 			}
 			w.address = ""
 			w.startedAt = nil

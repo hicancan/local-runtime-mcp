@@ -52,7 +52,7 @@ func run(ctx context.Context, server *mcp.Server, cfg Config, controlPlaneURL st
 		return err
 	}
 	token := hex.EncodeToString(secret)
-	httpServer, err := transport.NewHTTP(server, transport.HTTPConfig{Listen: "127.0.0.1:0", BearerToken: token, InternalToken: true})
+	httpServer, err := transport.NewHTTP(server, transport.HTTPConfig{Listen: "127.0.0.1:0", BearerToken: token, InternalToken: true, Wire: "openai"})
 	if err != nil {
 		return err
 	}

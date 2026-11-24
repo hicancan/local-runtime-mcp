@@ -61,3 +61,34 @@ func AdminRequest(ctx context.Context, address, token, method, path string, payl
 	}
 	return nil
 }
+
+// AdminStream opens an authenticated streaming GET request against the local
+// daemon (for SSE tail or NDJSON export). The caller must close resp.Body.
+func AdminStream(ctx context.Context, address, token, path string) (*http.Response, error) {
+	if address == "" || token == "" {
+		return nil, errors.New("local.token is required; run lrmcp setup local first")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+address+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	client := loopbackClient(token, 0)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("connect local daemon at %s: %w", address, err)
+	}
+	if resp.StatusCode >= 400 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		_ = resp.Body.Close()
+		var apiErr struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(data, &apiErr) == nil && apiErr.Error.Message != "" {
+			return nil, errors.New(apiErr.Error.Message)
+		}
+		return nil, fmt.Errorf("local daemon returned HTTP %d", resp.StatusCode)
+	}
+	return resp, nil
+}

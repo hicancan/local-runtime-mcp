@@ -2,7 +2,7 @@
 
 **English** · [简体中文](connections.zh-CN.md)
 
-One `lrmcp` process owns one Runtime Host. Its MCP entry points publish the same 22 built-in tools plus owner-registered capabilities, and share process sessions, browser targets, filesystem coordination, and desktop control.
+One `lrmcp` process owns one Runtime Host. Its MCP entry points publish the same 23 built-in tools (including `agent_report`) plus owner-registered capabilities, and share process sessions, browser targets, filesystem coordination, desktop control, and the embedded SQLite WAL + FTS5 audit log (`lrmcp ui` / `lrmcp audit`).
 
 ## Select transport and remote wires
 
@@ -65,7 +65,18 @@ These values are stored beside the executable where persistent storage is needed
    ```
 
 7. Continue the client's connection flow. On Local Runtime's consent page, verify the public hostname, registered client, and requested access, then approve using the owner approval key. The browser returns through the registered callback to the client application; token exchange and tool discovery complete the connection.
-8. Confirm the client discovers the 22 built-in tools and any capabilities enabled by the owner. Start with read-only version, browser status, and file metadata checks before testing side effects.
+8. Confirm the client discovers the 23 built-in tools and any capabilities enabled by the owner. Start with read-only version, browser status, and file metadata checks before testing side effects.
+
+### Multi-client cloud access alongside OAuth
+
+When multiple remote workers share the same Cloudflare Tunnel (`https://<public_host>/mcp`), mint one or more named Bearer tokens under `grants.remote.tokens` (which coexist cleanly with `http.auth: oauth` while preserving strict OAuth isolation against legacy `http.bearer_token`):
+
+```powershell
+./lrmcp.exe setup remote-token --id worker-1
+./lrmcp.exe setup remote-token --id worker-ro --read-only
+```
+
+Remote callers send `Authorization: Bearer <token>` and may optionally attach `X-LRMCP-Agent: <sub-id>` so every concurrent worker gets its own live timeline in `lrmcp ui` and `lrmcp audit`.
 
 The callback URI must match exactly, including its path and any query component. Repeat `--redirect-uri` to register multiple permitted callbacks for one named client. Running setup again for the same name adds its callbacks while keeping existing credentials. The client name is its client ID; the default is `gemini`. Registration and `--show` display that client's credentials locally.
 

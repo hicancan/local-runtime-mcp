@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>lrmcp — Activity Studio</title>
+  <link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <header class="brand">
+        <div class="brand-left">
+          <span class="logo">L</span>
+          <span class="brand-name">lrmcp</span>
+          <span id="sseDot" class="sse-pill" title="Live SSE Stream">LIVE</span>
+        </div>
+        <div class="brand-actions">
+          <button id="langBtn" class="icon-btn" type="button" title="Language">EN</button>
+          <button id="themeBtn" class="icon-btn" type="button" title="Theme">◐</button>
+        </div>
+      </header>
+
+      <div class="search-wrap">
+        <input id="searchInput" type="search" autocomplete="off" spellcheck="false" placeholder="搜索命令、页面、笔记…">
+      </div>
+
+      <nav class="nav-list">
+        <button class="nav-item active" data-view="all" type="button">
+          <span class="nav-icon">◎</span>
+          <span data-i18n="navAll">实时全景</span>
+          <span id="totalEventsBadge" class="badge muted">0</span>
+        </button>
+        <button class="nav-item" data-view="proposals" type="button">
+          <span class="nav-icon">✦</span>
+          <span data-i18n="navProposals">提案审批</span>
+          <span id="proposalsBadge" class="badge warn hidden">0</span>
+        </button>
+        <button class="nav-item" data-view="wires" type="button">
+          <span class="nav-icon">☍</span>
+          <span data-i18n="navWires">网线与授权</span>
+          <span id="wiresBadge" class="badge muted">0</span>
+        </button>
+      </nav>
+
+      <div id="sessionGroups" class="session-groups"></div>
+
+      <footer class="sidebar-footer">
+        <span id="versionLabel">v—</span>
+        <span id="dbStatsLabel">—</span>
+      </footer>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div class="topbar-title">
+          <h1 id="viewTitle">实时全景</h1>
+          <div id="viewMeta" class="topbar-meta"></div>
+        </div>
+        <div class="topbar-actions">
+          <button id="refreshBtn" class="btn ghost" type="button" data-i18n="refresh">刷新</button>
+          <a id="exportBtn" class="btn ghost" href="/ui/api/export" download data-i18n="exportJSONL">导出 JSONL</a>
+          <button id="kickBtn" class="btn danger-ghost hidden" type="button" data-i18n="kickSession">断开会话</button>
+        </div>
+      </header>
+
+      <section id="contentArea" class="content-area"></section>
+
+      <footer class="sovereign-bar">
+        <div id="wireControls" class="wire-pills"></div>
+        <div class="bar-right">
+          <span id="browserPill" class="meta-pill">Browser: —</span>
+          <span id="stdioPill" class="meta-pill">Local: 0</span>
+          <button id="stopDesktopBtn" class="btn stop-btn hidden" type="button" data-i18n="stopDesktop">紧急收回键鼠</button>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <div id="lightbox" class="lightbox hidden" role="dialog" aria-modal="true">
+    <img id="lightboxImg" alt="Captured image">
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/ui/app.js"></script>
+</body>
+</html>

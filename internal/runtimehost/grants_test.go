@@ -43,7 +43,7 @@ func TestGrantChangesGoBackToTheFileAndNothingElse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := newGrantStore(nil, config.RemoteGrants{}, path, registry, fixtureMachine(t), nil, nil)
+	store := newGrantStore(nil, config.RemoteGrants{}, path, registry, fixtureMachine(t), nil, nil, nil)
 	if err := store.set(config.WebGrant{Site: "https://studev.example", Use: true, Tools: []string{"echo_read"}}); err != nil {
 		t.Fatal(err)
 	}
@@ -73,8 +73,8 @@ func TestLentMachineToolsAreListedWithAnnotationsAndRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := newGrantStore([]config.WebGrant{{Site: "https://studev.example", Use: true, Tools: []string{"echo_read"}}}, config.RemoteGrants{}, "", registry, fixtureMachine(t), nil, nil)
-	handler := webHandler(store, registry)
+	store := newGrantStore([]config.WebGrant{{Site: "https://studev.example", Use: true, Tools: []string{"echo_read"}}}, config.RemoteGrants{}, "", registry, fixtureMachine(t), nil, nil, nil)
+	handler := webHandler(store, registry, nil)
 	source := browser.WebSource{Origin: "https://studev.example"}
 	listed, err := handler(context.Background(), source, browser.WebRequest{Method: "capabilities.list", Params: json.RawMessage(`{}`)}, nil)
 	if err != nil {
@@ -120,7 +120,7 @@ func TestSwitchesAreKeptWithNothingTickedAndProvidingGuardsPageTools(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := newGrantStore(nil, config.RemoteGrants{}, path, registry, fixtureMachine(t), nil, nil)
+	store := newGrantStore(nil, config.RemoteGrants{}, path, registry, fixtureMachine(t), nil, nil, nil)
 	if err := store.set(config.WebGrant{Site: "https://icourse163.org", Provide: true}); err != nil {
 		t.Fatal(err)
 	}
@@ -207,8 +207,8 @@ func TestRemoteGrantsLiveFilterAndExtensionTunnelControls(t *testing.T) {
 	t.Cleanup(func() { _ = session.Close() })
 
 	full, err := session.ListTools(ctx, nil)
-	if err != nil || len(full.Tools) != 22 {
-		t.Fatalf("expected 22 remote tools initially, got %d (%v)", len(full.Tools), err)
+	if err != nil || len(full.Tools) != 23 {
+		t.Fatalf("expected 23 remote tools initially, got %d (%v)", len(full.Tools), err)
 	}
 
 	// Switch OpenAI remote wire to read-only via the extension grant handler.
@@ -219,7 +219,7 @@ func TestRemoteGrantsLiveFilterAndExtensionTunnelControls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ro.Tools) == 0 || len(ro.Tools) >= 22 {
+	if len(ro.Tools) == 0 || len(ro.Tools) >= 23 {
 		t.Fatalf("expected read-only subset, got %d tools", len(ro.Tools))
 	}
 	for _, tool := range ro.Tools {
