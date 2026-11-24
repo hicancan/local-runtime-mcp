@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hicancan/local-runtime-mcp/internal/audit"
 	"github.com/hicancan/local-runtime-mcp/internal/config"
 	"github.com/hicancan/local-runtime-mcp/internal/mcpserver"
 	"github.com/hicancan/local-runtime-mcp/internal/runtimehost"
@@ -26,6 +27,7 @@ type Options struct {
 	HTTP            bool     // attach public loopback HTTP (9316) on daemon startup
 	Tunnels         []string // optional initial remote wires ("openai", "cloudflare")
 	Executable      string   // current executable for detached daemon auto-spawn
+	Agent           string   // optional logical client/agent label for stdio activity attribution
 	Overrides       config.Overrides
 	AutoSpawnDaemon bool // in stdio mode with local.token, spawn detached daemon instead of hosting in-process
 }
@@ -154,7 +156,7 @@ func Run(ctx context.Context, cfg *config.Config, options Options, stdin io.Read
 		}
 		if transport.ProbeLocal(ctx, cfg.Local.Listen, cfg.Local.Token) {
 			fmt.Fprintf(stderr, "[stdio] attached to running local runtime at http://%s/mcp\n", cfg.Local.Listen)
-			return normalizeCancellation(transport.ProxyStdioToLocal(ctx, cfg.Local.Listen, cfg.Local.Token, stdin, stdout))
+			return normalizeCancellation(transport.ProxyStdioToLocalWithAgent(ctx, cfg.Local.Listen, cfg.Local.Token, options.Agent, stdin, stdout))
 		}
 		if options.AutoSpawnDaemon {
 			spawned, err := EnsureDaemon(ctx, options.Executable, cfg, options.Overrides)
@@ -166,7 +168,7 @@ func Run(ctx context.Context, cfg *config.Config, options Options, stdin io.Read
 			} else {
 				fmt.Fprintf(stderr, "[stdio] attached to running local runtime at http://%s/mcp\n", cfg.Local.Listen)
 			}
-			return normalizeCancellation(transport.ProxyStdioToLocal(ctx, cfg.Local.Listen, cfg.Local.Token, stdin, stdout))
+			return normalizeCancellation(transport.ProxyStdioToLocalWithAgent(ctx, cfg.Local.Listen, cfg.Local.Token, options.Agent, stdin, stdout))
 		}
 	}
 
@@ -218,19 +220,27 @@ func Run(ctx context.Context, cfg *config.Config, options Options, stdin io.Read
 					closed = true
 					_ = closeHost()
 					fmt.Fprintf(stderr, "[stdio] attached to running local runtime at http://%s/mcp\n", cfg.Local.Listen)
-					return normalizeCancellation(transport.ProxyStdioToLocal(ctx, cfg.Local.Listen, cfg.Local.Token, stdin, stdout))
+					return normalizeCancellation(transport.ProxyStdioToLocalWithAgent(ctx, cfg.Local.Listen, cfg.Local.Token, options.Agent, stdin, stdout))
 				}
 				return localErr
 			}
 			localDone := make(chan error, 1)
 			go func() { localDone <- normalizeCancellation(localSrv.Run(daemonCtx)) }()
-			stdioErr := normalizeCancellation(transport.ServeStdio(daemonCtx, host.LocalServer(), stdin, stdout))
+			stdioCtx := daemonCtx
+			if cleanAgent := audit.SanitizeID(options.Agent); cleanAgent != "" {
+				stdioCtx = audit.WithCallMeta(stdioCtx, audit.CallMeta{Wire: "local", AgentID: cleanAgent})
+			}
+			stdioErr := normalizeCancellation(transport.ServeStdio(stdioCtx, host.LocalServer(), stdin, stdout))
 			stopDaemon()
 			ingress.Close()
 			return errors.Join(stdioErr, <-localDone)
 		}
 		// Zero-config isolated stdio mode (no local.token configured).
-		return normalizeCancellation(transport.ServeStdio(daemonCtx, host.LocalServer(), stdin, stdout))
+		stdioCtx := daemonCtx
+		if cleanAgent := audit.SanitizeID(options.Agent); cleanAgent != "" {
+			stdioCtx = audit.WithCallMeta(stdioCtx, audit.CallMeta{Wire: "local", AgentID: cleanAgent})
+		}
+		return normalizeCancellation(transport.ServeStdio(stdioCtx, host.LocalServer(), stdin, stdout))
 	}
 
 	// Unified daemon mode: always hosts 9317 (local plane + admin + /ui studio) and 9315

@@ -404,6 +404,7 @@ func grantCmd(ctx context.Context, args []string, stdout, stderr io.Writer, conf
 func serveCmd(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, executable, configPath string) error {
 	flags := flagSet("lrmcp serve", stderr)
 	protocol := flags.String("transport", "", "MCP transport: stdio (required)")
+	agent := flags.String("agent", "", "optional logical client/agent label shown in the activity stream (or LOCAL_RUNTIME_MCP_AGENT_ID)")
 	browserFlags := addBrowserFlags(flags)
 	localFlags := addLocalFlags(flags)
 	if err := flags.Parse(args); err != nil {
@@ -421,9 +422,14 @@ func serveCmd(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 	if err != nil {
 		return err
 	}
+	agentName := strings.TrimSpace(*agent)
+	if agentName == "" {
+		agentName = strings.TrimSpace(os.Getenv(config.EnvironmentPrefix + "AGENT_ID"))
+	}
 	options := connection.Options{
 		Transport:       "stdio",
 		Executable:      executable,
+		Agent:           agentName,
 		Overrides:       overrides,
 		AutoSpawnDaemon: true,
 	}
@@ -723,7 +729,7 @@ func usage(writer io.Writer) {
 	fmt.Fprint(writer, `Local Runtime MCP (lrmcp)
 
 Usage:
-  lrmcp serve --transport stdio [flags]              Pure stdio MCP proxy (auto-starts detached daemon)
+  lrmcp serve --transport stdio [--agent NAME]       Pure stdio MCP proxy (auto-starts detached daemon)
   lrmcp start [--http] [--tunnel openai|cloudflare] [--ttl 2h]
   lrmcp stop                                         Gracefully stop the running daemon
   lrmcp status                                       Inspect live daemon, browser profiles, and tunnels

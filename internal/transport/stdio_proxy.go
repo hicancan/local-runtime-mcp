@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"time"
+
+	"github.com/hicancan/local-runtime-mcp/internal/audit"
 )
 
 // loopbackClient returns an HTTP client that connects directly to loopback
@@ -71,6 +73,13 @@ func ProbeLocal(ctx context.Context, address, token string) bool {
 // This preserves exact MCP stdio framing, every protocol version, cancellations,
 // and live server-initiated notifications (such as tools/list_changed).
 func ProxyStdioToLocal(ctx context.Context, address, token string, stdin io.Reader, stdout io.Writer) error {
+	return ProxyStdioToLocalWithAgent(ctx, address, token, "", stdin, stdout)
+}
+
+// ProxyStdioToLocalWithAgent attaches a stdio MCP client to the running local
+// runtime daemon while attributing the session to an optional logical agent ID
+// (e.g. codex-1, agy, claude-wsl, dsh, workbuddy) via X-LRMCP-Agent.
+func ProxyStdioToLocalWithAgent(ctx context.Context, address, token, agentID string, stdin io.Reader, stdout io.Writer) error {
 	if address == "" || token == "" {
 		return errors.New("local address and token are required to attach")
 	}
@@ -86,9 +95,13 @@ func ProxyStdioToLocal(ctx context.Context, address, token string, stdin io.Read
 	} else {
 		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	}
+	extraHeader := ""
+	if cleanAgent := audit.SanitizeID(agentID); cleanAgent != "" {
+		extraHeader = "X-LRMCP-Agent: " + cleanAgent + "\r\n"
+	}
 	handshake := fmt.Sprintf(
-		"POST /mcp/attach HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\nConnection: Upgrade\r\nUpgrade: %s\r\n\r\n",
-		address, token, localUpgradeProto,
+		"POST /mcp/attach HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\n%sConnection: Upgrade\r\nUpgrade: %s\r\n\r\n",
+		address, token, extraHeader, localUpgradeProto,
 	)
 	if _, err := io.WriteString(conn, handshake); err != nil {
 		return fmt.Errorf("send local attach handshake: %w", err)

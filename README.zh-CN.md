@@ -77,7 +77,7 @@ Host 只创建一套 Process Manager、Filesystem Service、Browser Bridge 和 C
 
 ```text
 lrmcp
-├── serve --transport stdio              纯 stdio 薄代理（未运行时自动拉起独立后台 Daemon）
+├── serve --transport stdio [--agent NAME] 纯 stdio 薄代理（未运行时自动拉起独立后台 Daemon）
 ├── start [--http] [--tunnel ...]        确保后台用户会话 Daemon 已启动
 ├── stop                                 优雅关闭运行中的 Daemon
 ├── status                               查看 Daemon、在线浏览器与远端网线状态

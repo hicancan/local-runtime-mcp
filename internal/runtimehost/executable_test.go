@@ -273,12 +273,12 @@ func TestExecutableDetachedDaemonLifecycleAndHotPlug(t *testing.T) {
 
 	connectStdio := func(name string) *mcp.ClientSession {
 		t.Helper()
-		cmd := exec.Command(executable, "serve", "--transport", "stdio")
+		cmd := exec.Command(executable, "serve", "--transport", "stdio", "--agent", name)
 		cmd.Dir = workDir
 		cmd.Env = cleanEnv()
 		var diag bytes.Buffer
 		cmd.Stderr = &diag
-		session, err := mcp.NewClient(&mcp.Implementation{Name: name, Version: "1"}, nil).Connect(ctx, &mcp.CommandTransport{
+		session, err := mcp.NewClient(&mcp.Implementation{Name: "shared-ide-name", Version: "1"}, nil).Connect(ctx, &mcp.CommandTransport{
 			Command: cmd, TerminateDuration: 5 * time.Second,
 		}, nil)
 		if err != nil {
@@ -345,8 +345,9 @@ func TestExecutableDetachedDaemonLifecycleAndHotPlug(t *testing.T) {
 	// Verify embedded SQLite WAL + FTS5 audit CLI commands & single-use Studio UI bootstrap!
 	var auditSessions struct {
 		Sessions []struct {
-			ID    string `json:"id"`
-			Title string `json:"title"`
+			ID      string `json:"id"`
+			AgentID string `json:"agent_id"`
+			Title   string `json:"title"`
 		} `json:"sessions"`
 	}
 	if err := json.Unmarshal(runCLI("audit", "list"), &auditSessions); err != nil {
@@ -354,12 +355,12 @@ func TestExecutableDetachedDaemonLifecycleAndHotPlug(t *testing.T) {
 	}
 	foundTitle := false
 	for _, s := range auditSessions.Sessions {
-		if s.Title == "桌面巡检任务" {
+		if s.Title == "桌面巡检任务" && s.AgentID == "second-ide" {
 			foundTitle = true
 		}
 	}
 	if !foundTitle {
-		t.Fatalf("audit list missing agent_report session title: %+v", auditSessions)
+		t.Fatalf("audit list missing --agent attributed session (want agent_id=second-ide, title=桌面巡检任务): %+v", auditSessions)
 	}
 	var auditSearch struct {
 		Events []struct {

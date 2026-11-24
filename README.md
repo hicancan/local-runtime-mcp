@@ -77,7 +77,7 @@ The Host creates one Process Manager, Filesystem Service, Browser Bridge, and Co
 
 ```text
 lrmcp
-├── serve --transport stdio              Pure stdio thin proxy (auto-starts detached daemon)
+├── serve --transport stdio [--agent NAME] Pure stdio thin proxy (auto-starts detached daemon)
 ├── start [--http] [--tunnel ...]        Ensure detached user-session daemon is running
 ├── stop                                 Gracefully stop the running daemon
 ├── status                               Inspect live daemon, browser profiles, and wires
