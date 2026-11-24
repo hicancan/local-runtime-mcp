@@ -43,6 +43,9 @@
       toastKicked: '会话已断开',
       searchTitle: (q) => `全文检索：“${q}”`,
       justNow: '刚刚',
+      showMore: (n) => `展开其余 ${n} 个会话`,
+      showLess: '收起',
+      untitledTask: (id) => `会话 ${id}`,
     },
     en: {
       navAll: 'Live Feed',
@@ -87,6 +90,9 @@
       toastKicked: 'Session closed',
       searchTitle: (q) => `Search: "${q}"`,
       justNow: 'now',
+      showMore: (n) => `Show ${n} more`,
+      showLess: 'Collapse',
+      untitledTask: (id) => `Session ${id}`,
     },
   };
 
@@ -103,6 +109,8 @@
     proposals: [],
     openRows: new Set(),
     expandedGroups: new Set(),
+    collapsedAgents: new Set(JSON.parse(localStorage.getItem('lrmcp_ui_collapsed_agents') || '[]')),
+    expandedAgentLists: new Set(),
   };
 
   const $ = (id) => document.getElementById(id);
@@ -195,6 +203,19 @@
     return 'web';
   }
 
+  function sessionDisplayTitle(s) {
+    if (s.title) return s.title;
+    const raw = s.id || '';
+    const colon = raw.indexOf(':');
+    const tail = colon >= 0 ? raw.slice(colon + 1) : raw;
+    if (tail && tail !== s.agent_id) return tail;
+    return t('untitledTask', tail || s.agent_id || raw);
+  }
+
+  function saveCollapsedAgents() {
+    try { localStorage.setItem('lrmcp_ui_collapsed_agents', JSON.stringify([...state.collapsedAgents])); } catch { /* ignore */ }
+  }
+
   function renderSidebar() {
     for (const btn of document.querySelectorAll('.nav-item')) {
       btn.classList.toggle('active', state.view === btn.dataset.view);
@@ -207,45 +228,90 @@
     const activeWires = (state.status?.tunnels || []).filter((w) => w.state === 'active').length;
     $('wiresBadge').textContent = String(activeWires);
 
-    const groups = { cloud: [], local: [], web: [] };
+    // Group sessions into collapsible per-Agent folders (Codex / AGY style),
+    // keeping system daemon events neatly at the bottom.
+    const folderMap = new Map();
     for (const s of state.sessions) {
-      groups[wireBucket(s.wire)].push(s);
+      const key = s.agent_id || s.wire || 'unknown';
+      let folder = folderMap.get(key);
+      if (!folder) {
+        folder = { key, agentId: key, wire: s.wire, isSystem: s.wire === 'system', latest: s.last_seen_at || 0, sessions: [] };
+        folderMap.set(key, folder);
+      }
+      folder.sessions.push(s);
+      if ((s.last_seen_at || 0) > folder.latest) {
+        folder.latest = s.last_seen_at || 0;
+        if (s.wire) folder.wire = s.wire;
+      }
     }
+    const folders = [...folderMap.values()].sort((a, b) => {
+      if (a.isSystem !== b.isSystem) return a.isSystem ? 1 : -1;
+      return b.latest - a.latest;
+    });
 
     const host = $('sessionGroups');
     host.replaceChildren();
-    const defs = [
-      ['cloud', t('grpCloud')],
-      ['local', t('grpLocal')],
-      ['web', t('grpWeb')],
-    ];
-    for (const [key, label] of defs) {
-      const list = groups[key];
-      if (!list.length) continue;
-      const wrap = el('div', {}, el('div', { class: 'group-label' }, label));
-      for (const s of list) {
+    const PAGE_LIMIT = 6;
+    for (const f of folders) {
+      const isCollapsed = state.collapsedAgents.has(f.key);
+      const isCloud = wireBucket(f.wire) === 'cloud';
+      const showAll = state.expandedAgentLists.has(f.key);
+      const visible = showAll ? f.sessions : f.sessions.slice(0, PAGE_LIMIT);
+
+      const childrenWrap = el('div', { class: 'agent-children' });
+      for (const s of visible) {
         const isActive = state.view === 'session' && state.sessionId === s.id;
         const dotClass = s.status === 'working' ? 'working' : (s.status === 'error' ? 'error' : (Date.now() - s.last_seen_at < 300000 && s.status !== 'closed' ? 'active' : ''));
-        wrap.append(el('button', {
+        childrenWrap.append(el('button', {
           type: 'button',
           class: `session-item${isActive ? ' active' : ''}`,
+          title: `${s.agent_id} · ${s.id} (${s.tool_count} ops)`,
           onClick: () => selectSession(s.id),
         },
           el('span', { class: `s-dot ${dotClass}` }),
           el('div', { class: 's-body' },
             el('div', { class: 's-top' },
-              el('span', { class: 's-title' }, s.title || s.agent_id || s.id),
+              el('span', { class: 's-title' }, sessionDisplayTitle(s)),
               el('span', { class: 's-time' }, relTime(s.last_seen_at)),
             ),
-            el('div', { class: 's-sub' },
-              el('span', { class: 'wire-tag' }, s.wire),
+            (s.tool_count > 0 || s.error_count > 0) ? el('div', { class: 's-sub' },
               el('span', {}, `${s.tool_count} ops`),
               s.error_count > 0 ? el('span', { style: 'color:var(--err)' }, `${s.error_count} err`) : null,
-            ),
+            ) : null,
           ),
         ));
       }
-      host.append(wrap);
+      if (f.sessions.length > PAGE_LIMIT) {
+        childrenWrap.append(el('button', {
+          type: 'button',
+          class: 'more-btn',
+          onClick: () => {
+            if (showAll) state.expandedAgentLists.delete(f.key);
+            else state.expandedAgentLists.add(f.key);
+            renderSidebar();
+          },
+        }, showAll ? t('showLess') : t('showMore', f.sessions.length - PAGE_LIMIT)));
+      }
+
+      const folderEl = el('div', { class: `agent-folder${isCollapsed ? ' collapsed' : ''}` },
+        el('button', {
+          type: 'button',
+          class: 'agent-header',
+          onClick: () => {
+            if (state.collapsedAgents.has(f.key)) state.collapsedAgents.delete(f.key);
+            else state.collapsedAgents.add(f.key);
+            saveCollapsedAgents();
+            renderSidebar();
+          },
+        },
+          el('span', { class: 'agent-chev' }, '▾'),
+          el('span', { class: 'agent-name' }, f.agentId),
+          el('span', { class: `agent-wire${isCloud ? ' cloud' : ''}` }, f.wire),
+          el('span', { class: 'agent-count' }, String(f.sessions.length)),
+        ),
+        childrenWrap,
+      );
+      host.append(folderEl);
     }
 
     if (state.status) {
@@ -301,12 +367,18 @@
       exportBtn.classList.add('hidden');
     } else if (state.view === 'session') {
       const s = state.sessions.find((x) => x.id === state.sessionId);
-      $('viewTitle').textContent = s ? (s.title || s.agent_id || s.id) : state.sessionId;
+      const titleEl = $('viewTitle');
       if (s) {
+        titleEl.replaceChildren(
+          el('span', { class: 'crumb-agent' }, s.agent_id || s.wire),
+          el('span', { class: 'crumb-sep' }, '/'),
+          document.createTextNode(sessionDisplayTitle(s)),
+        );
         meta.append(el('span', { class: `pill ${wireBucket(s.wire) === 'cloud' ? 'cloud' : ''}` }, s.wire));
-        if (s.agent_id && s.agent_id !== s.title) meta.append(el('span', { class: 'pill' }, s.agent_id));
         if (s.status) meta.append(el('span', { class: `pill ${s.status === 'error' ? 'err' : (s.status === 'working' ? 'ok' : '')}` }, s.status));
         if (s.status !== 'closed' && s.wire !== 'system') kickBtn.classList.remove('hidden');
+      } else {
+        titleEl.textContent = state.sessionId;
       }
       exportBtn.href = `/ui/api/export?session_id=${encodeURIComponent(state.sessionId || '')}`;
       exportBtn.classList.remove('hidden');

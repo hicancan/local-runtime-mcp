@@ -50,6 +50,9 @@ type Managed struct {
 	registered map[string]string
 	static     []toolSpec
 	registry   *capability.Registry
+
+	taskMu      sync.RWMutex
+	activeTasks map[string]string
 }
 
 type toolSpec struct {
@@ -107,7 +110,6 @@ func NewManaged(deps Dependencies) *Managed {
 	}
 	static = append(static, browserToolSpecs(deps.Browser)...)
 	static = append(static, computerToolSpecs(deps.Computer)...)
-	static = append(static, agentReportToolSpec(deps.Audit, deps.Wire))
 	if deps.Capabilities.Proposes() {
 		static = append(static, proposeToolSpec(deps.Capabilities))
 	}
@@ -116,13 +118,15 @@ func NewManaged(deps Dependencies) *Managed {
 	}
 
 	managed := &Managed{
-		Server:     server,
-		wire:       deps.Wire,
-		filter:     deps.Filter,
-		registered: map[string]string{},
-		static:     static,
-		registry:   deps.Capabilities,
+		Server:      server,
+		wire:        deps.Wire,
+		filter:      deps.Filter,
+		registered:  map[string]string{},
+		static:      static,
+		registry:    deps.Capabilities,
+		activeTasks: map[string]string{},
 	}
+	managed.static = append(managed.static, agentReportToolSpec(managed, deps.Audit, deps.Wire))
 	managed.installMiddleware(deps.Audit, deps.Wire)
 	managed.Sync()
 	if deps.Capabilities != nil {

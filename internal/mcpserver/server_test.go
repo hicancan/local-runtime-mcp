@@ -355,3 +355,66 @@ func TestAuditMiddlewareRecordsToolsImagesNotesAndTokenPolicy(t *testing.T) {
 		t.Fatalf("unexpected sessions: %+v (%v)", sessions, err)
 	}
 }
+
+func TestPersistentConnectionCanOpenMultipleTaskSessionsUnderOneAgent(t *testing.T) {
+	store, err := audit.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bridge, err := browser.Start(ctx, config.Browser{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	processes := runtimeprocess.NewManager(ctx)
+	t.Cleanup(func() { _ = bridge.Close(context.Background()); _ = processes.Close() })
+
+	managed := NewManaged(Dependencies{
+		Process:    processes,
+		Filesystem: filesystem.New(),
+		Browser:    bridge,
+		Audit:      store,
+		Wire:       "local",
+	})
+	sSide, cSide := mcp.NewInMemoryTransports()
+	go func() {
+		reqCtx := audit.WithCallMeta(ctx, audit.CallMeta{
+			Wire:      "local",
+			AgentID:   "codex-1",
+			SessionID: "local:stdio-conn1",
+		})
+		_ = managed.Server.Run(reqCtx, sSide)
+	}()
+	session, err := mcp.NewClient(&mcp.Implementation{Name: "codex", Version: "1"}, nil).Connect(ctx, cSide, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	// Task 1 on default connection session
+	callOK(t, session, "agent_report", map[string]any{"title": "任务一：查状态", "message": "开始任务一"})
+	callOK(t, session, "browser_status", map[string]any{})
+
+	// Task 2: open a brand-new task session under the SAME codex-1 agent!
+	res2 := callOK(t, session, "agent_report", map[string]any{"new_session": true, "title": "任务二：巡检文件", "message": "切换到新任务"})
+	var rep2 agentReportOutput
+	decodeStructured(t, res2, &rep2)
+	if rep2.SessionID == "" || rep2.SessionID == "local:stdio-conn1" {
+		t.Fatalf("new_session did not allocate a fresh session ID: %+v", rep2)
+	}
+	// Subsequent tool call automatically lands in Task 2!
+	callOK(t, session, "browser_status", map[string]any{})
+
+	sessions, err := store.ListSessions(10)
+	if err != nil || len(sessions) != 2 {
+		t.Fatalf("expected 2 distinct task sessions under codex-1, got %d (%v): %+v", len(sessions), err, sessions)
+	}
+	for _, s := range sessions {
+		if s.AgentID != "codex-1" || s.ToolCount != 1 {
+			t.Fatalf("expected agent_id=codex-1 and tool_count=1 per task, got %+v", s)
+		}
+	}
+}

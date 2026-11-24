@@ -2,6 +2,8 @@ package mcpserver
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -21,10 +23,12 @@ type ActiveMCPSession struct {
 }
 
 type agentReportInput struct {
-	Message string `json:"message" jsonschema:"concise human-readable progress milestone or status note shown in the owner's live activity timeline"`
-	Title   string `json:"title,omitempty" jsonschema:"optional short session title shown in the activity sidebar"`
-	AgentID string `json:"agent_id,omitempty" jsonschema:"optional logical agent identifier when multiple sub-agents share one connection"`
-	Status  string `json:"status,omitempty" jsonschema:"optional session status hint: working, waiting, done, or error"`
+	Message    string `json:"message" jsonschema:"concise human-readable progress milestone or status note shown in the owner's live activity timeline"`
+	Title      string `json:"title,omitempty" jsonschema:"optional short task/session title shown in the activity sidebar"`
+	AgentID    string `json:"agent_id,omitempty" jsonschema:"optional logical agent identifier when multiple sub-agents share one connection"`
+	SessionID  string `json:"session_id,omitempty" jsonschema:"optional explicit task session identifier to group one task's calls into its own thread under this agent"`
+	NewSession bool   `json:"new_session,omitempty" jsonschema:"when true on a persistent connection, opens a fresh task session under this agent for this note and subsequent tool calls"`
+	Status     string `json:"status,omitempty" jsonschema:"optional session status hint: working, waiting, done, or error"`
 }
 
 type agentReportOutput struct {
@@ -33,12 +37,56 @@ type agentReportOutput struct {
 	SessionID string `json:"session_id,omitempty"`
 }
 
-func agentReportToolSpec(store *audit.Store, defaultWire string) toolSpec {
+func shortTaskID() string {
+	b := make([]byte, 5)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func (m *Managed) getActiveTask(baseKey string) string {
+	if m == nil || baseKey == "" {
+		return ""
+	}
+	m.taskMu.RLock()
+	defer m.taskMu.RUnlock()
+	return m.activeTasks[baseKey]
+}
+
+func (m *Managed) setActiveTask(baseKey, taskSID string) {
+	if m == nil || baseKey == "" || taskSID == "" {
+		return
+	}
+	m.taskMu.Lock()
+	if m.activeTasks == nil {
+		m.activeTasks = map[string]string{}
+	}
+	if len(m.activeTasks) > 256 {
+		m.activeTasks = map[string]string{}
+	}
+	m.activeTasks[baseKey] = taskSID
+	m.taskMu.Unlock()
+}
+
+func (m *Managed) clearActiveTask(keyOrTaskSID string) {
+	if m == nil || keyOrTaskSID == "" {
+		return
+	}
+	m.taskMu.Lock()
+	delete(m.activeTasks, keyOrTaskSID)
+	for k, v := range m.activeTasks {
+		if v == keyOrTaskSID {
+			delete(m.activeTasks, k)
+		}
+	}
+	m.taskMu.Unlock()
+}
+
+func agentReportToolSpec(m *Managed, store *audit.Store, defaultWire string) toolSpec {
 	reportTool := inputTool[agentReportInput](
 		tool(
 			"agent_report",
 			"Report progress note",
-			"Post a short, human-readable progress note to the owner's live local activity stream (lrmcp ui). Read-only and zero side effects on files, processes, or browser tabs. Call periodically between major steps so the owner can follow your work at a glance.",
+			"Post a short, human-readable progress note to the owner's live local activity stream (lrmcp ui). Read-only and zero side effects on files, processes, or browser tabs. Pass new_session=true (or a distinct session_id) with title when starting a brand-new task so each task appears as its own thread under your agent folder.",
 			true, false, false, false,
 		),
 		func(schema *jsonschema.Schema) {
@@ -57,7 +105,25 @@ func agentReportToolSpec(store *audit.Store, defaultWire string) toolSpec {
 				if store == nil {
 					return nil, agentReportOutput{Recorded: true}, nil
 				}
-				sid, aid, clientName, wire := resolveCaller(ctx, req.Session, defaultWire, in.AgentID)
+				sid, aid, clientName, wire, baseKey := resolveCaller(ctx, m, req.Session, defaultWire, in.AgentID)
+
+				explicitSID := audit.SanitizeID(in.SessionID)
+				if explicitSID != "" {
+					if strings.Contains(explicitSID, ":") {
+						sid = explicitSID
+					} else {
+						sid = wire + ":" + explicitSID
+					}
+					if baseKey != "" {
+						m.setActiveTask(baseKey, sid)
+					}
+				} else if in.NewSession {
+					sid = wire + ":task-" + shortTaskID()
+					if baseKey != "" {
+						m.setActiveTask(baseKey, sid)
+					}
+				}
+
 				ev, err := store.RecordNote(audit.NoteInput{
 					SessionID:  sid,
 					AgentID:    aid,
@@ -76,7 +142,7 @@ func agentReportToolSpec(store *audit.Store, defaultWire string) toolSpec {
 	}
 }
 
-func resolveCaller(ctx context.Context, session *mcp.ServerSession, defaultWire, explicitAgent string) (sessionID, agentID, clientName, wire string) {
+func resolveCaller(ctx context.Context, m *Managed, session *mcp.ServerSession, defaultWire, explicitAgent string) (sessionID, agentID, clientName, wire, baseKey string) {
 	meta := audit.CallMetaFromContext(ctx)
 	wire = meta.Wire
 	if wire == "" {
@@ -104,21 +170,37 @@ func resolveCaller(ctx context.Context, session *mcp.ServerSession, defaultWire,
 		agentID = wire
 	}
 
+	isStatelessWire := wire == "http" || wire == "cloudflare" || wire == "openai"
+
+	if !isStatelessWire {
+		switch {
+		case meta.SessionID != "":
+			baseKey = meta.SessionID
+		case session != nil && session.ID() != "":
+			baseKey = wire + ":" + session.ID()
+		}
+		if baseKey != "" {
+			if activeTask := m.getActiveTask(baseKey); activeTask != "" {
+				return activeTask, agentID, clientName, wire, baseKey
+			}
+		}
+	}
+
 	switch {
 	case meta.SessionID != "":
 		sessionID = meta.SessionID
-		if explicit := audit.SanitizeID(explicitAgent); explicit != "" && !strings.Contains(sessionID, explicit) && (wire == "http" || wire == "cloudflare" || wire == "openai") {
+		if explicit := audit.SanitizeID(explicitAgent); explicit != "" && !strings.Contains(sessionID, explicit) && isStatelessWire && !strings.Contains(meta.SessionID, ":") {
 			sessionID = wire + ":" + explicit
 		}
-	case wire == "http" || wire == "cloudflare" || wire == "openai":
-		// Stateless HTTP / tunnel calls coalesce cleanly by wire + agent identity.
+	case isStatelessWire:
+		// Stateless HTTP / tunnel calls without X-LRMCP-Session coalesce by wire + agent identity.
 		sessionID = wire + ":" + agentID
 	case session != nil && session.ID() != "":
 		sessionID = wire + ":" + session.ID()
 	default:
 		sessionID = wire + ":" + agentID
 	}
-	return sessionID, agentID, clientName, wire
+	return sessionID, agentID, clientName, wire, baseKey
 }
 
 func (m *Managed) installMiddleware(store *audit.Store, defaultWire string) {
@@ -161,7 +243,7 @@ func (m *Managed) installMiddleware(store *audit.Store, defaultWire string) {
 			if s, ok := req.GetSession().(*mcp.ServerSession); ok {
 				ss = s
 			}
-			sid, aid, clientName, wire := resolveCaller(ctx, ss, defaultWire, "")
+			sid, aid, clientName, wire, _ := resolveCaller(ctx, m, ss, defaultWire, "")
 
 			if meta.Policy != nil {
 				ro, dest, known := m.toolHints(toolName)
@@ -309,11 +391,12 @@ func (m *Managed) ActiveSessions() []ActiveMCPSession {
 }
 
 // CloseSession closes an active MCP session matching sessionID (accepting either
-// raw MCP session ID or wire-prefixed "<wire>:<id>").
+// raw MCP session ID, wire-prefixed "<wire>:<id>", or an active task session ID).
 func (m *Managed) CloseSession(sessionID string) bool {
 	if m == nil || m.Server == nil || sessionID == "" {
 		return false
 	}
+	m.clearActiveTask(sessionID)
 	bare := sessionID
 	if idx := strings.IndexByte(sessionID, ':'); idx >= 0 {
 		bare = sessionID[idx+1:]
