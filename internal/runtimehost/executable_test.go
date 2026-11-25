@@ -25,19 +25,60 @@ import (
 
 // Release smoke test against the real compiled executable.
 func TestExecutableStdio(t *testing.T) {
-	executable := os.Getenv("LOCAL_RUNTIME_MCP_EXECUTABLE")
-	if executable == "" {
+	srcExe := os.Getenv("LOCAL_RUNTIME_MCP_EXECUTABLE")
+	if srcExe == "" {
 		t.Skip("set LOCAL_RUNTIME_MCP_EXECUTABLE to a release executable")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	command := exec.Command(executable, "serve", "--transport", "stdio", "--browser-listen", "127.0.0.1:0", "--browser-token", "release-smoke-test-credential-0001")
-	command.Dir = t.TempDir()
+
+	workDir := t.TempDir()
+	binName := "lrmcp"
+	if runtime.GOOS == "windows" {
+		binName = "lrmcp.exe"
+	}
+	executable := filepath.Join(workDir, binName)
+	srcData, err := os.ReadFile(srcExe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(executable, srcData, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	freePort := func() string {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := l.Addr().String()
+		_ = l.Close()
+		return addr
+	}
+	cfgYAML := "browser:\n  listen: " + freePort() + "\n  token: release-smoke-test-credential-0001\n  disable_auto_cdp: true\n" +
+		"local:\n  listen: " + freePort() + "\n  token: " + strings.Repeat("s", 32) + "\n"
+	if err := os.WriteFile(filepath.Join(workDir, config.FileName), []byte(cfgYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var cleanEnv []string
 	for _, entry := range os.Environ() {
 		if !strings.HasPrefix(strings.ToUpper(entry), config.EnvironmentPrefix) {
-			command.Env = append(command.Env, entry)
+			cleanEnv = append(cleanEnv, entry)
 		}
 	}
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		cmd := exec.CommandContext(stopCtx, executable, "stop")
+		cmd.Dir = workDir
+		cmd.Env = cleanEnv
+		_ = cmd.Run()
+	})
+
+	command := exec.Command(executable, "serve", "--transport", "stdio")
+	command.Dir = workDir
+	command.Env = cleanEnv
 	var diagnostics bytes.Buffer
 	command.Stderr = &diagnostics
 	session, err := mcp.NewClient(&mcp.Implementation{Name: "release-smoke", Version: "1"}, nil).Connect(ctx, &mcp.CommandTransport{

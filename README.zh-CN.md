@@ -5,6 +5,7 @@
 **一枚单文件常驻守护进程，让本地与云端 MCP 客户端通过 4 个正交原语和有状态并发 JS 编排引擎，统一掌控你的本机进程、原子文件、完整 Chrome DevTools（原生根级 CDP + 进程级 `Tracing.start`）与 Windows 原生桌面。**
 
 [![Release](https://img.shields.io/github/v/release/hicancan/local-runtime-mcp?style=flat-square)](https://github.com/hicancan/local-runtime-mcp/releases/latest)
+[![CI](https://img.shields.io/github/actions/workflow/status/hicancan/local-runtime-mcp/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/hicancan/local-runtime-mcp/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-blue?style=flat-square)](LICENSE)
 [![Go](https://img.shields.io/badge/Go-1.27-00ADD8?style=flat-square&logo=go&logoColor=white)](go.mod)
 [![Rust](https://img.shields.io/badge/Rust-Windows%20UIA-DEA584?style=flat-square&logo=rust&logoColor=black)](native/computer-windows)

@@ -1,0 +1,147 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to package and publish (e.g. v18.2.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            executable: lrmcp.exe
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            executable: lrmcp
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            executable: lrmcp
+    runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.0'
+          cache: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: browser-extension/package-lock.json
+      - working-directory: browser-extension
+        run: npm ci
+      - working-directory: browser-extension
+        run: npm run build
+      - working-directory: browser-extension
+        run: npm test
+      - if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        name: Package the shared browser SDK
+        working-directory: browser-extension
+        run: npm run sdk:pack -- ../dist
+      - if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: web-sdk
+          path: |
+            dist/*.tgz
+          if-no-files-found: error
+      - run: git diff --exit-code -- internal/browser/extension
+      - if: runner.os == 'Windows'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.96.0'
+          components: rustfmt, clippy
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/build-native.ps1
+      - if: runner.os == 'Windows'
+        run: cargo fmt --manifest-path native/computer-windows/Cargo.toml --check
+      - if: runner.os == 'Windows'
+        run: cargo clippy --manifest-path native/computer-windows/Cargo.toml --all-targets -- -D warnings
+      - if: runner.os == 'Windows'
+        run: cargo test --manifest-path native/computer-windows/Cargo.toml --locked
+      - run: go test ./...
+      - run: go vet ./...
+      - name: Build
+        shell: pwsh
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          $tag = $env:RELEASE_TAG
+          $name = "local-runtime-mcp_${tag}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          New-Item -ItemType Directory -Path "dist/$name" -Force | Out-Null
+          go build -trimpath -ldflags "-s -w" -o "dist/$name/${{ matrix.executable }}" ./cmd/lrmcp
+          if ($LASTEXITCODE -ne 0) { throw 'release executable build failed' }
+          if ((go env GOHOSTARCH) -eq "${{ matrix.goarch }}") {
+            $env:LOCAL_RUNTIME_MCP_EXECUTABLE = (Get-Item -LiteralPath "dist/$name/${{ matrix.executable }}").FullName
+            go test ./internal/runtimehost -run 'TestExecutable(Stdio|DetachedDaemonLifecycleAndHotPlug)' -count=2 -v
+            if ($LASTEXITCODE -ne 0) { throw 'release executable MCP smoke test failed' }
+          }
+          ./scripts/fetch-cloudflared.ps1 -OperatingSystem "${{ matrix.goos }}" -Architecture "${{ matrix.goarch }}" -DestinationDirectory "dist/$name" -TemporaryDirectory (Join-Path $env:RUNNER_TEMP 'cloudflared-download')
+          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/cloudflare/cloudflared/2026.9.1/LICENSE' -OutFile "dist/$name/cloudflared-LICENSE"
+          Copy-Item README.md,README.zh-CN.md,SECURITY.md,PRIVACY.md,config.example.yaml,LICENSE,THIRD_PARTY_NOTICES.md "dist/$name/"
+          Copy-Item -LiteralPath licenses -Destination "dist/$name/licenses" -Recurse
+          Copy-Item -LiteralPath docs -Destination "dist/$name/docs" -Recurse
+          Copy-Item -LiteralPath capabilities -Destination "dist/$name/capabilities" -Recurse
+          if ("${{ matrix.goos }}" -eq 'windows') {
+            Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
+          }
+          else {
+            Push-Location "dist/$name"
+            try {
+              zip -q -r "../$name.zip" .
+              if ($LASTEXITCODE -ne 0) { throw 'failed to create release archive' }
+            }
+            finally {
+              Pop-Location
+            }
+          }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: '*-*'
+          merge-multiple: true
+          path: dist
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $tag = $env:RELEASE_TAG
+          $checksums = Get-ChildItem -LiteralPath dist -File | Where-Object Extension -in '.zip','.tgz' | Sort-Object Name | ForEach-Object {
+            "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
+          }
+          $checksums | Set-Content -LiteralPath dist/SHA256SUMS -Encoding utf8NoBOM
+          $assets = @(Get-ChildItem -LiteralPath dist -File | ForEach-Object FullName)
+          gh release create "$tag" @assets --repo "${{ github.repository }}" --verify-tag --generate-notes --title "Local Runtime MCP $tag"
+          if ($LASTEXITCODE -ne 0) { throw 'release publication failed' }

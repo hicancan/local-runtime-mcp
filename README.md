@@ -5,6 +5,7 @@
 **One single-binary daemon for local & cloud MCP clients — stateful concurrent JS orchestration, native browser-level Chrome DevTools (CDP + `Tracing.start`), atomic OS control, and Windows UI Automation through 4 orthogonal primitives.**
 
 [![Release](https://img.shields.io/github/v/release/hicancan/local-runtime-mcp?style=flat-square)](https://github.com/hicancan/local-runtime-mcp/releases/latest)
+[![CI](https://img.shields.io/github/actions/workflow/status/hicancan/local-runtime-mcp/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/hicancan/local-runtime-mcp/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-blue?style=flat-square)](LICENSE)
 [![Go](https://img.shields.io/badge/Go-1.27-00ADD8?style=flat-square&logo=go&logoColor=white)](go.mod)
 [![Rust](https://img.shields.io/badge/Rust-Windows%20UIA-DEA584?style=flat-square&logo=rust&logoColor=black)](native/computer-windows)
