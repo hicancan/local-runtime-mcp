@@ -122,6 +122,7 @@ func NewHTTP(server *mcp.Server, cfg HTTPConfig) (*HTTPServer, error) {
 		valid := false
 		defaultAgent := wire
 		var tokenPolicy audit.ToolPolicy
+		tokenReadOnly := false
 
 		if cfg.InternalToken {
 			valid = bearer && len(provided) == len(cfg.BearerToken) && subtle.ConstantTimeCompare([]byte(provided), []byte(cfg.BearerToken)) == 1
@@ -130,6 +131,7 @@ func NewHTTP(server *mcp.Server, cfg HTTPConfig) (*HTTPServer, error) {
 			if matched, ok := matchRemoteToken(remoteTokens, provided); ok {
 				valid = true
 				defaultAgent = matched.ID
+				tokenReadOnly = matched.ReadOnly
 				tokenPolicy = remoteTokenPolicy(matched)
 			} else if authorization != nil {
 				valid = authorization.ValidateBearer(provided)
@@ -165,6 +167,7 @@ func NewHTTP(server *mcp.Server, cfg HTTPConfig) (*HTTPServer, error) {
 			Wire:      reqWire,
 			AgentID:   agentID,
 			SessionID: sessionID,
+			ReadOnly:  tokenReadOnly,
 			Policy:    tokenPolicy,
 		})
 		mcpHandler.ServeHTTP(writer, request.WithContext(ctx))

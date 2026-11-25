@@ -1,6 +1,6 @@
 ## Copy this file to local-runtime-mcp.yaml beside lrmcp.
 ##
-## Unified architecture (v17.0.0):
+## Unified architecture (v18.0.0 — 4-primitive stateful JS runtime + browser-level CDP):
 ##   lrmcp setup local                         # initialize 127.0.0.1:9317 local plane
 ##   lrmcp setup browser                       # initialize 127.0.0.1:9315 browser extension bridge
 ##   lrmcp serve --transport stdio             # pure thin proxy; auto-spawns detached daemon
@@ -13,10 +13,13 @@
 ##   lrmcp grant remote openai --read-only     # live-restrict a remote wire to read-only tools
 ##   lrmcp setup remote-token --id worker-1    # mint named Bearer token on 9316 (coexists with OAuth)
 
-# Browser extension bidirectional bridge (loopback only, chrome-extension:// Origin only)
+# Browser-level CDP (auto-discovers Edge/Chrome DevToolsActivePort) + slim extension bridge (Web Bridge, L panel, Tab Groups)
 browser:
   listen: 127.0.0.1:9315
   token: "replace-with-a-random-token-of-at-least-32-characters"
+  # Optional explicit CDP endpoints (ws://... or http://127.0.0.1:9222):
+  # cdp_endpoints: []
+  # disable_auto_cdp: false
 
 # Local-only control & MCP plane (loopback only, never tunneled, rejects Origin & proxy headers)
 # Serves same-host /mcp (with LocalApps & stdio thin-proxy attach), /admin/*, and /capabilities/*

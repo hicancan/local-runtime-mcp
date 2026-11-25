@@ -130,14 +130,17 @@ func TestUnifiedDaemonSharesOneHostAcrossStdioProxiesAndHotPlugsHTTP(t *testing.
 		t.Fatalf("hot-plug http wire failed: %v", err)
 	}
 
-	// Both proxies still see the SAME configured browser bridge.
+	// Both proxies still see the SAME configured browser bridge via `run`.
 	for idx, session := range []*mcp.ClientSession{client1, client2} {
-		res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "browser_status", Arguments: map[string]any{}})
+		res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "run", Arguments: map[string]any{
+			"title": "Check shared browser bridge",
+			"code":  "return await browser.status();",
+		}})
 		if err != nil || res.IsError {
-			t.Fatalf("client-%d browser_status failed: %v %+v", idx+1, err, res)
+			t.Fatalf("client-%d browser.status failed: %v %+v", idx+1, err, res)
 		}
 		raw, _ := json.Marshal(res.StructuredContent)
-		if !strings.Contains(string(raw), browserAddr) || strings.Contains(string(raw), "not listening") {
+		if !strings.Contains(string(raw), browserAddr) || strings.Contains(string(raw), "unavailable") {
 			t.Fatalf("client-%d lost shared browser bridge: %s", idx+1, raw)
 		}
 	}
@@ -228,12 +231,15 @@ func TestFirstStdioHostsLocalPlaneInProcessWhenAutoSpawnDisabled(t *testing.T) {
 		t.Fatalf("second stdio did not attach to first: %s", log2.String())
 	}
 	for idx, s := range []*mcp.ClientSession{first, second} {
-		res, err := s.CallTool(ctx, &mcp.CallToolParams{Name: "browser_status", Arguments: map[string]any{}})
+		res, err := s.CallTool(ctx, &mcp.CallToolParams{Name: "run", Arguments: map[string]any{
+			"title": "Check shared browser bridge",
+			"code":  "return await browser.status();",
+		}})
 		if err != nil || res.IsError {
-			t.Fatalf("session %d browser_status failed: %v %+v", idx+1, err, res)
+			t.Fatalf("session %d browser.status failed: %v %+v", idx+1, err, res)
 		}
 		raw, _ := json.Marshal(res.StructuredContent)
-		if !strings.Contains(string(raw), browserAddr) || strings.Contains(string(raw), "not listening") {
+		if !strings.Contains(string(raw), browserAddr) || strings.Contains(string(raw), "unavailable") {
 			t.Fatalf("session %d did not share browser bridge: %s", idx+1, raw)
 		}
 	}

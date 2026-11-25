@@ -21,8 +21,9 @@ import (
 )
 
 const (
-	maxBlobBytes   = 8 << 20
-	maxSubscribers = 64
+	maxBlobBytes     = 8 << 20
+	maxSubscribers   = 64
+	sessionIdleAfter = 15 * time.Minute
 )
 
 var validBlobHash = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -103,12 +104,13 @@ type StartToolInput struct {
 
 // FinishToolInput describes the completion of an audited tool call.
 type FinishToolInput struct {
-	Status     string // "ok", "error", "canceled"
-	Result     any
-	ImageData  []byte
-	ImageMIME  string
-	ErrorText  string
-	DurationMS int64
+	Status       string // "ok", "error", "canceled"
+	FinalSummary string // optional completed summary (e.g. run.done_title)
+	Result       any
+	ImageData    []byte
+	ImageMIME    string
+	ErrorText    string
+	DurationMS   int64
 }
 
 // NoteInput describes a lightweight progress update from agent_report.
@@ -303,13 +305,23 @@ func (s *Store) upsertSession(id, agentID, clientName, wire, title, status strin
 	return s.getSession(id)
 }
 
+func normalizeSessionStatus(s Session, nowMS int64) Session {
+	if (s.Status == "active" || s.Status == "working") && s.Wire != "system" && s.LastSeenAt > 0 && nowMS-s.LastSeenAt > sessionIdleAfter.Milliseconds() {
+		s.Status = "idle"
+	}
+	return s
+}
+
 func (s *Store) getSession(id string) (Session, error) {
 	var out Session
 	err := s.db.QueryRow(`
 		SELECT id, agent_id, client_name, wire, title, status, tool_count, error_count, started_at, last_seen_at, ended_at
 		FROM sessions WHERE id = ?
 	`, id).Scan(&out.ID, &out.AgentID, &out.ClientName, &out.Wire, &out.Title, &out.Status, &out.ToolCount, &out.ErrorCount, &out.StartedAt, &out.LastSeenAt, &out.EndedAt)
-	return out, err
+	if err != nil {
+		return out, err
+	}
+	return normalizeSessionStatus(out, time.Now().UnixMilli()), nil
 }
 
 // StartTool records the start of a tool invocation and broadcasts it live.
@@ -382,11 +394,21 @@ func (s *Store) FinishTool(eventID int64, sessionID string, in FinishToolInput) 
 			blobMIME = in.ImageMIME
 		}
 	}
-	_, err := s.db.Exec(`
-		UPDATE events
-		SET status = ?, result_json = ?, image_blob = ?, image_mime = ?, error_text = ?, duration_ms = ?
-		WHERE id = ?
-	`, status, resultJSON, blobHash, blobMIME, errText, in.DurationMS, eventID)
+	finalSummary := strings.TrimSpace(in.FinalSummary)
+	var err error
+	if finalSummary != "" {
+		_, err = s.db.Exec(`
+			UPDATE events
+			SET status = ?, summary = ?, result_json = ?, image_blob = ?, image_mime = ?, error_text = ?, duration_ms = ?
+			WHERE id = ?
+		`, status, finalSummary, resultJSON, blobHash, blobMIME, errText, in.DurationMS, eventID)
+	} else {
+		_, err = s.db.Exec(`
+			UPDATE events
+			SET status = ?, result_json = ?, image_blob = ?, image_mime = ?, error_text = ?, duration_ms = ?
+			WHERE id = ?
+		`, status, resultJSON, blobHash, blobMIME, errText, in.DurationMS, eventID)
+	}
 	if err != nil {
 		return
 	}
@@ -440,10 +462,16 @@ func (s *Store) RecordNote(in NoteInput) (Event, error) {
 	argsJSON := RedactAny(map[string]any{"title": title, "status": st, "message": msg})
 	res, err := s.db.Exec(`
 		INSERT INTO events (session_id, agent_id, wire, kind, tool_name, summary, args_json, result_json, status, created_at)
-		VALUES (?, ?, ?, 'note', 'agent_report', ?, ?, '{}', ?, ?)
+		VALUES (?, ?, ?, 'note', 'session', ?, ?, '{}', ?, ?)
 	`, sid, aid, wire, msg, argsJSON, st, now)
 	if err != nil {
 		return Event{}, err
+	}
+	if st == "done" || st == "closed" {
+		_, _ = s.db.Exec(`UPDATE sessions SET ended_at = ? WHERE id = ?`, now, sid)
+		if updated, err := s.getSession(sid); err == nil {
+			sess = updated
+		}
 	}
 	id, _ := res.LastInsertId()
 	ev := Event{
@@ -452,7 +480,7 @@ func (s *Store) RecordNote(in NoteInput) (Event, error) {
 		AgentID:   aid,
 		Wire:      wire,
 		Kind:      "note",
-		ToolName:  "agent_report",
+		ToolName:  "session",
 		Summary:   msg,
 		ArgsJSON:  argsJSON,
 		Status:    st,
@@ -544,13 +572,14 @@ func (s *Store) ListSessions(limit int) ([]Session, error) {
 		return nil, err
 	}
 	defer rows.Close()
+	nowMS := time.Now().UnixMilli()
 	out := make([]Session, 0)
 	for rows.Next() {
 		var item Session
 		if err := rows.Scan(&item.ID, &item.AgentID, &item.ClientName, &item.Wire, &item.Title, &item.Status, &item.ToolCount, &item.ErrorCount, &item.StartedAt, &item.LastSeenAt, &item.EndedAt); err != nil {
 			return nil, err
 		}
-		out = append(out, item)
+		out = append(out, normalizeSessionStatus(item, nowMS))
 	}
 	return out, rows.Err()
 }

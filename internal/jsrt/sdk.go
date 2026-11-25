@@ -1,0 +1,1417 @@
+package jsrt
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"runtime"
+	"strings"
+	"time"
+
+	"github.com/dop251/goja"
+	"github.com/hicancan/local-runtime-mcp/internal/browser"
+	"github.com/hicancan/local-runtime-mcp/internal/computer"
+	"github.com/hicancan/local-runtime-mcp/internal/filesystem"
+	runtimeimage "github.com/hicancan/local-runtime-mcp/internal/image"
+	runtimeprocess "github.com/hicancan/local-runtime-mcp/internal/process"
+)
+
+func (v *sessionVM) installGlobals() {
+	_ = v.vm.Set("proc", v.buildProcSDK())
+	_ = v.vm.Set("fs", v.buildFSSDK())
+	_ = v.vm.Set("browser", v.buildBrowserSDK())
+	_ = v.vm.Set("desktop", v.buildDesktopSDK())
+	_ = v.vm.Set("img", v.buildImageSDK())
+	_ = v.vm.Set("caps", v.buildCapsSDK())
+
+	printFn := v.vm.ToValue(func(call goja.FunctionCall) goja.Value {
+		if cell := v.currentCell(); cell != nil {
+			parts := make([]string, 0, len(call.Arguments))
+			for _, arg := range call.Arguments {
+				parts = append(parts, formatJSArg(arg))
+			}
+			cell.appendOutput(strings.Join(parts, " ") + "\n")
+		}
+		return goja.Undefined()
+	})
+	writeFn := v.vm.ToValue(func(call goja.FunctionCall) goja.Value {
+		if cell := v.currentCell(); cell != nil {
+			for _, arg := range call.Arguments {
+				cell.appendOutput(formatJSArg(arg))
+			}
+		}
+		return goja.Undefined()
+	})
+	consoleObj := v.vm.NewObject()
+	_ = consoleObj.Set("log", printFn)
+	_ = consoleObj.Set("info", printFn)
+	_ = consoleObj.Set("warn", printFn)
+	_ = consoleObj.Set("error", printFn)
+
+	emitImageFn := v.vm.ToValue(func(call goja.FunctionCall) goja.Value {
+		cell := v.currentCell()
+		if cell == nil {
+			panic(v.vm.NewTypeError("no active execution cell"))
+		}
+		if len(call.Arguments) == 0 {
+			panic(v.vm.NewTypeError("emitImage requires an image result or file path"))
+		}
+		label := ""
+		if len(call.Arguments) > 1 && !goja.IsUndefined(call.Arguments[1]) && !goja.IsNull(call.Arguments[1]) {
+			label = call.Arguments[1].String()
+		}
+		arg := call.Arguments[0]
+		if s, ok := arg.Export().(string); ok && s != "" {
+			data, meta, err := runtimeimage.Read(cell.ctx, s, runtimeimage.ReadOptions{})
+			if err != nil {
+				panic(v.vm.NewGoError(err))
+			}
+			cell.addImage(ImagePayload{Data: data, MIMEType: meta.MIMEType, Label: label, Width: meta.Width, Height: meta.Height})
+			return v.vm.ToValue(map[string]any{"emitted": true, "mime_type": meta.MIMEType, "width": meta.Width, "height": meta.Height, "bytes": len(data)})
+		}
+		if obj := arg.ToObject(v.vm); obj != nil {
+			if raw := obj.Get("__image_bytes"); raw != nil && !goja.IsUndefined(raw) {
+				if data, ok := raw.Export().([]byte); ok && len(data) > 0 {
+					mime := "image/png"
+					if m := obj.Get("mime_type"); m != nil && !goja.IsUndefined(m) {
+						mime = m.String()
+					}
+					w, h := 0, 0
+					if wv := obj.Get("width"); wv != nil && !goja.IsUndefined(wv) {
+						w = int(wv.ToInteger())
+					}
+					if hv := obj.Get("height"); hv != nil && !goja.IsUndefined(hv) {
+						h = int(hv.ToInteger())
+					}
+					cell.addImage(ImagePayload{Data: data, MIMEType: mime, Label: label, Width: w, Height: h})
+					return v.vm.ToValue(map[string]any{"emitted": true, "mime_type": mime, "width": w, "height": h, "bytes": len(data)})
+				}
+			}
+		}
+		panic(v.vm.NewTypeError("emitImage expects an image path or a result from img.read / tab.screenshot / desktop.state"))
+	})
+
+	sleepFn := v.vm.ToValue(func(call goja.FunctionCall) goja.Value {
+		ms := int64(0)
+		if len(call.Arguments) > 0 {
+			ms = call.Arguments[0].ToInteger()
+		}
+		if ms < 0 {
+			ms = 0
+		}
+		if ms > 300_000 {
+			ms = 300_000
+		}
+		return v.spawnAsync("sleep", fmt.Sprintf("%dms", ms), func(ctx context.Context) (any, error) {
+			t := time.NewTimer(time.Duration(ms) * time.Millisecond)
+			defer t.Stop()
+			select {
+			case <-t.C:
+				return true, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		})
+	})
+
+	_ = v.vm.Set("print", printFn)
+	_ = v.vm.Set("write", writeFn)
+	_ = v.vm.Set("console", consoleObj)
+	_ = v.vm.Set("emitImage", emitImageFn)
+	_ = v.vm.Set("sleep", sleepFn)
+}
+
+func (v *sessionVM) isReadOnly() bool {
+	cell := v.currentCell()
+	return cell != nil && cell.readOnly
+}
+
+func (v *sessionVM) currentSessionID() string {
+	if cell := v.currentCell(); cell != nil {
+		return cell.sessionID
+	}
+	return v.sessionID
+}
+
+func (v *sessionVM) buildProcSDK() goja.Value {
+	obj := v.vm.NewObject()
+	_ = obj.Set("run", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids process execution"))
+		}
+		if v.deps.Process == nil {
+			return v.rejected(errors.New("process manager unavailable"))
+		}
+		opts, target, err := parseProcRunArgs(call)
+		if err != nil {
+			return v.rejected(err)
+		}
+		return v.spawnAsync("proc.run", target, func(ctx context.Context) (any, error) {
+			res, err := v.deps.Process.Run(ctx, opts)
+			if err != nil {
+				return nil, err
+			}
+			return toPlain(res), nil
+		})
+	})
+
+	_ = obj.Set("continue", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids process control"))
+		}
+		if v.deps.Process == nil {
+			return v.rejected(errors.New("process manager unavailable"))
+		}
+		var opts runtimeprocess.ContinueOptions
+		if len(call.Arguments) > 0 {
+			if err := decodeArg(call.Arguments[0], &opts); err != nil {
+				return v.rejected(err)
+			}
+		}
+		return v.spawnAsync("proc.continue", opts.SessionID, func(ctx context.Context) (any, error) {
+			res, err := v.deps.Process.Continue(ctx, opts)
+			if err != nil {
+				return nil, err
+			}
+			return toPlain(res), nil
+		})
+	})
+
+	_ = obj.Set("kill", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids process control"))
+		}
+		if v.deps.Process == nil || len(call.Arguments) == 0 {
+			return v.rejected(errors.New("session_id is required"))
+		}
+		sid := call.Arguments[0].String()
+		return v.spawnAsync("proc.kill", sid, func(ctx context.Context) (any, error) {
+			res, err := v.deps.Process.Continue(ctx, runtimeprocess.ContinueOptions{SessionID: sid, Terminate: true, YieldTimeMS: 2000})
+			if err != nil {
+				return nil, err
+			}
+			return toPlain(res), nil
+		})
+	})
+	return obj
+}
+
+func parseProcRunArgs(call goja.FunctionCall) (runtimeprocess.Options, string, error) {
+	if len(call.Arguments) == 0 {
+		return runtimeprocess.Options{}, "", errors.New("proc.run requires a program string or options object")
+	}
+	var opts runtimeprocess.Options
+	var cmdStr, shellName string
+	maxTokens := 0
+
+	if prog, ok := call.Arguments[0].Export().(string); ok {
+		opts.Program = prog
+		if len(call.Arguments) > 1 && !goja.IsUndefined(call.Arguments[1]) && !goja.IsNull(call.Arguments[1]) {
+			_ = decodeArg(call.Arguments[1], &opts.Args)
+		}
+		if len(call.Arguments) > 2 && !goja.IsUndefined(call.Arguments[2]) && !goja.IsNull(call.Arguments[2]) {
+			var extra struct {
+				Cwd             string            `json:"cwd"`
+				Directory       string            `json:"directory"`
+				Environment     map[string]string `json:"environment"`
+				Env             map[string]string `json:"env"`
+				Stdin           string            `json:"stdin"`
+				KeepStdinOpen   bool              `json:"keep_stdin_open"`
+				TimeoutSeconds  int               `json:"timeout_seconds"`
+				MaxOutputBytes  int               `json:"max_output_bytes"`
+				MaxOutputTokens int               `json:"max_output_tokens"`
+				YieldTimeMS     int               `json:"yield_time_ms"`
+				IOMode          string            `json:"io_mode"`
+				Columns         int               `json:"columns"`
+				Rows            int               `json:"rows"`
+			}
+			if err := decodeArg(call.Arguments[2], &extra); err != nil {
+				return runtimeprocess.Options{}, "", err
+			}
+			opts.Directory = firstNonEmpty(extra.Directory, extra.Cwd)
+			if len(extra.Environment) > 0 {
+				opts.Environment = extra.Environment
+			} else if len(extra.Env) > 0 {
+				opts.Environment = extra.Env
+			}
+			opts.Stdin = extra.Stdin
+			opts.KeepStdinOpen = extra.KeepStdinOpen
+			opts.TimeoutSeconds = extra.TimeoutSeconds
+			opts.MaxOutputBytes = extra.MaxOutputBytes
+			maxTokens = extra.MaxOutputTokens
+			opts.YieldTimeMS = extra.YieldTimeMS
+			opts.IOMode = extra.IOMode
+			opts.Columns = extra.Columns
+			opts.Rows = extra.Rows
+		}
+	} else {
+		var raw struct {
+			Program         string            `json:"program"`
+			Args            []string          `json:"args"`
+			Cmd             string            `json:"cmd"`
+			Shell           string            `json:"shell"`
+			Cwd             string            `json:"cwd"`
+			Workdir         string            `json:"workdir"`
+			Directory       string            `json:"directory"`
+			Environment     map[string]string `json:"environment"`
+			Env             map[string]string `json:"env"`
+			Stdin           string            `json:"stdin"`
+			KeepStdinOpen   bool              `json:"keep_stdin_open"`
+			TimeoutSeconds  int               `json:"timeout_seconds"`
+			MaxOutputBytes  int               `json:"max_output_bytes"`
+			MaxOutputTokens int               `json:"max_output_tokens"`
+			YieldTimeMS     int               `json:"yield_time_ms"`
+			IOMode          string            `json:"io_mode"`
+			Columns         int               `json:"columns"`
+			Rows            int               `json:"rows"`
+		}
+		if err := decodeArg(call.Arguments[0], &raw); err != nil {
+			return runtimeprocess.Options{}, "", err
+		}
+		opts.Program = raw.Program
+		opts.Args = raw.Args
+		cmdStr = raw.Cmd
+		shellName = raw.Shell
+		opts.Directory = firstNonEmpty(raw.Directory, raw.Cwd, raw.Workdir)
+		if len(raw.Environment) > 0 {
+			opts.Environment = raw.Environment
+		} else if len(raw.Env) > 0 {
+			opts.Environment = raw.Env
+		}
+		opts.Stdin = raw.Stdin
+		opts.KeepStdinOpen = raw.KeepStdinOpen
+		opts.TimeoutSeconds = raw.TimeoutSeconds
+		opts.MaxOutputBytes = raw.MaxOutputBytes
+		maxTokens = raw.MaxOutputTokens
+		opts.YieldTimeMS = raw.YieldTimeMS
+		opts.IOMode = raw.IOMode
+		opts.Columns = raw.Columns
+		opts.Rows = raw.Rows
+	}
+
+	if opts.Program == "" && cmdStr != "" {
+		sh := strings.ToLower(strings.TrimSpace(shellName))
+		if sh == "" {
+			if runtime.GOOS == "windows" {
+				sh = "pwsh"
+			} else {
+				sh = "bash"
+			}
+		}
+		switch sh {
+		case "pwsh", "powershell":
+			opts.Program = "pwsh.exe"
+			if runtime.GOOS != "windows" {
+				opts.Program = "pwsh"
+			}
+			opts.Args = []string{"-NoProfile", "-NonInteractive", "-Command", cmdStr}
+		case "cmd":
+			opts.Program = "cmd.exe"
+			opts.Args = []string{"/C", cmdStr}
+		case "sh":
+			opts.Program = "sh"
+			opts.Args = []string{"-c", cmdStr}
+		default:
+			opts.Program = "bash"
+			opts.Args = []string{"-lc", cmdStr}
+		}
+	}
+	if opts.Program == "" {
+		return runtimeprocess.Options{}, "", errors.New("proc.run requires program or cmd")
+	}
+	if opts.MaxOutputBytes == 0 && maxTokens > 0 {
+		opts.MaxOutputBytes = max(1024, min(16<<20, maxTokens*4))
+	}
+	target := opts.Program
+	if cmdStr != "" {
+		target = clipStr(cmdStr, 80)
+	} else if len(opts.Args) > 0 {
+		target = clipStr(opts.Program+" "+strings.Join(opts.Args, " "), 80)
+	}
+	return opts, target, nil
+}
+
+func (v *sessionVM) buildFSSDK() goja.Value {
+	obj := v.vm.NewObject()
+	_ = obj.Set("list", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) == 0 {
+			return v.rejected(errors.New("fs.list requires path"))
+		}
+		path := call.Arguments[0].String()
+		var opts struct {
+			MaxDepth      int  `json:"max_depth"`
+			IncludeHidden bool `json:"include_hidden"`
+			MaxEntries    int  `json:"max_entries"`
+		}
+		if len(call.Arguments) > 1 {
+			_ = decodeArg(call.Arguments[1], &opts)
+		}
+		return v.spawnAsync("fs.list", path, func(_ context.Context) (any, error) {
+			res, err := filesystem.List(path, opts.MaxDepth, opts.IncludeHidden, opts.MaxEntries)
+			return toPlain(res), err
+		})
+	})
+	_ = obj.Set("stat", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) == 0 {
+			return v.rejected(errors.New("fs.stat requires path"))
+		}
+		path := call.Arguments[0].String()
+		withSHA := false
+		if len(call.Arguments) > 1 {
+			if b, ok := call.Arguments[1].Export().(bool); ok {
+				withSHA = b
+			} else {
+				var opts struct {
+					WithSHA256 bool `json:"with_sha256"`
+				}
+				_ = decodeArg(call.Arguments[1], &opts)
+				withSHA = opts.WithSHA256
+			}
+		}
+		return v.spawnAsync("fs.stat", path, func(_ context.Context) (any, error) {
+			res, err := filesystem.Stat(path, withSHA)
+			return toPlain(res), err
+		})
+	})
+	_ = obj.Set("read", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) == 0 {
+			return v.rejected(errors.New("fs.read requires path"))
+		}
+		path := call.Arguments[0].String()
+		var opts filesystem.ReadTextOptions
+		if len(call.Arguments) > 1 {
+			_ = decodeArg(call.Arguments[1], &opts)
+		}
+		return v.spawnAsync("fs.read", path, func(_ context.Context) (any, error) {
+			res, err := filesystem.ReadText(path, opts)
+			return toPlain(res), err
+		})
+	})
+	_ = obj.Set("write", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids fs.write"))
+		}
+		if v.deps.Filesystem == nil || len(call.Arguments) < 2 {
+			return v.rejected(errors.New("fs.write requires path and content"))
+		}
+		path := call.Arguments[0].String()
+		content := call.Arguments[1].String()
+		opts := filesystem.WriteTextOptions{Mode: "create"}
+		if len(call.Arguments) > 2 {
+			_ = decodeArg(call.Arguments[2], &opts)
+		}
+		return v.spawnAsync("fs.write", path, func(ctx context.Context) (any, error) {
+			res, err := v.deps.Filesystem.WriteText(ctx, path, content, opts)
+			return toPlain(res), err
+		})
+	})
+	_ = obj.Set("patch", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids fs.patch"))
+		}
+		if v.deps.Filesystem == nil || len(call.Arguments) < 3 {
+			return v.rejected(errors.New("fs.patch requires path, hunks, and expected_sha256"))
+		}
+		path := call.Arguments[0].String()
+		var hunks []filesystem.TextPatchHunk
+		if err := decodeArg(call.Arguments[1], &hunks); err != nil {
+			return v.rejected(err)
+		}
+		sha := call.Arguments[2].String()
+		return v.spawnAsync("fs.patch", path, func(ctx context.Context) (any, error) {
+			res, err := v.deps.Filesystem.PatchText(ctx, path, filesystem.PatchTextOptions{Hunks: hunks, ExpectedSHA256: sha})
+			return toPlain(res), err
+		})
+	})
+	_ = obj.Set("search", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) < 2 {
+			return v.rejected(errors.New("fs.search requires path and query"))
+		}
+		path := call.Arguments[0].String()
+		query := call.Arguments[1].String()
+		var opts struct {
+			Regex         bool `json:"regex"`
+			CaseSensitive bool `json:"case_sensitive"`
+			IncludeHidden bool `json:"include_hidden"`
+			MaxResults    int  `json:"max_results"`
+		}
+		if len(call.Arguments) > 2 {
+			_ = decodeArg(call.Arguments[2], &opts)
+		}
+		return v.spawnAsync("fs.search", query+" in "+path, func(_ context.Context) (any, error) {
+			res, err := filesystem.SearchText(path, query, opts.Regex, opts.CaseSensitive, opts.IncludeHidden, opts.MaxResults)
+			return toPlain(res), err
+		})
+	})
+	return obj
+}
+
+func (v *sessionVM) buildBrowserSDK() goja.Value {
+	obj := v.vm.NewObject()
+	b := v.deps.Browser
+
+	_ = obj.Set("status", func(call goja.FunctionCall) goja.Value {
+		if b == nil {
+			return v.rejected(errors.New("browser engine unavailable"))
+		}
+		return v.spawnAsync("browser.status", "", func(_ context.Context) (any, error) {
+			return toPlain(b.Status()), nil
+		})
+	})
+	_ = obj.Set("connect", func(call goja.FunctionCall) goja.Value {
+		if b == nil {
+			return v.rejected(errors.New("browser engine unavailable"))
+		}
+		browserID := ""
+		if len(call.Arguments) > 0 && !goja.IsUndefined(call.Arguments[0]) && !goja.IsNull(call.Arguments[0]) {
+			browserID = call.Arguments[0].String()
+		}
+		return v.spawnAsync("browser.connect", browserID, func(ctx context.Context) (any, error) {
+			inst, err := b.Connect(ctx, browserID)
+			return toPlain(inst), err
+		})
+	})
+	_ = obj.Set("tabs", func(call goja.FunctionCall) goja.Value {
+		if b == nil {
+			return v.rejected(errors.New("browser engine unavailable"))
+		}
+		browserID := ""
+		includeWorkers := false
+		if len(call.Arguments) > 0 && !goja.IsUndefined(call.Arguments[0]) && !goja.IsNull(call.Arguments[0]) {
+			if s, ok := call.Arguments[0].Export().(string); ok {
+				browserID = s
+			} else {
+				var opts struct {
+					BrowserID      string `json:"browser_id"`
+					IncludeWorkers bool   `json:"include_workers"`
+				}
+				_ = decodeArg(call.Arguments[0], &opts)
+				browserID = opts.BrowserID
+				includeWorkers = opts.IncludeWorkers
+			}
+		}
+		if len(call.Arguments) > 1 && !goja.IsUndefined(call.Arguments[1]) {
+			var opts struct {
+				IncludeWorkers bool `json:"include_workers"`
+			}
+			_ = decodeArg(call.Arguments[1], &opts)
+			includeWorkers = opts.IncludeWorkers
+		}
+		return v.spawnAsync("browser.tabs", browserID, func(ctx context.Context) (any, error) {
+			tabs, err := b.TabsWithOptions(ctx, browserID, includeWorkers)
+			if err != nil {
+				return nil, err
+			}
+			return tabs, nil
+		}, func(raw any) goja.Value {
+			tabs := raw.([]browser.Tab)
+			arr := make([]goja.Value, len(tabs))
+			for i, t := range tabs {
+				arr[i] = v.makeTabHandle(t)
+			}
+			return v.vm.ToValue(arr)
+		})
+	})
+	_ = obj.Set("open", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids browser.open"))
+		}
+		if b == nil || len(call.Arguments) == 0 {
+			return v.rejected(errors.New("browser.open requires url"))
+		}
+		urlStr := call.Arguments[0].String()
+		var opts struct {
+			BrowserID   string `json:"browser_id"`
+			Active      bool   `json:"active"`
+			ControlID   string `json:"control_id"`
+			SessionName string `json:"session_name"`
+			Group       string `json:"group"`
+		}
+		if len(call.Arguments) > 1 {
+			_ = decodeArg(call.Arguments[1], &opts)
+		}
+		groupName := firstNonEmpty(opts.SessionName, opts.Group)
+		sid := v.currentSessionID()
+		return v.spawnAsync("browser.open", clipStr(urlStr, 90), func(ctx context.Context) (any, error) {
+			return b.OpenWithOptions(ctx, browser.OpenOptions{
+				BrowserID:   opts.BrowserID,
+				URL:         urlStr,
+				Active:      opts.Active,
+				ControlID:   opts.ControlID,
+				SessionID:   sid,
+				SessionName: groupName,
+			})
+		}, func(raw any) goja.Value {
+			return v.makeTabHandle(raw.(browser.Tab))
+		})
+	})
+	_ = obj.Set("tab", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) == 0 {
+			panic(v.vm.NewTypeError("browser.tab requires tab_id"))
+		}
+		id := call.Arguments[0].String()
+		return v.makeTabHandle(browser.Tab{ID: id})
+	})
+	_ = obj.Set("cdp", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids raw browser.cdp"))
+		}
+		if b == nil || len(call.Arguments) == 0 {
+			return v.rejected(errors.New("browser.cdp requires method"))
+		}
+		method := call.Arguments[0].String()
+		var params map[string]any
+		if len(call.Arguments) > 1 && !goja.IsUndefined(call.Arguments[1]) && !goja.IsNull(call.Arguments[1]) {
+			_ = decodeArg(call.Arguments[1], &params)
+		}
+		browserID := ""
+		if len(call.Arguments) > 2 && !goja.IsUndefined(call.Arguments[2]) && !goja.IsNull(call.Arguments[2]) {
+			browserID = call.Arguments[2].String()
+		}
+		return v.spawnAsync("browser.cdp", method, func(ctx context.Context) (any, error) {
+			return b.RawCDP(ctx, browserID, "", method, params)
+		})
+	})
+	_ = obj.Set("traceStart", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids browser.traceStart"))
+		}
+		if b == nil {
+			return v.rejected(errors.New("browser engine unavailable"))
+		}
+		var opts browser.TraceStartOptions
+		if len(call.Arguments) > 0 && !goja.IsUndefined(call.Arguments[0]) {
+			_ = decodeArg(call.Arguments[0], &opts)
+		}
+		return v.spawnAsync("browser.traceStart", opts.BrowserID, func(ctx context.Context) (any, error) {
+			return map[string]any{"tracing": true}, b.TraceStart(ctx, opts)
+		})
+	})
+	_ = obj.Set("traceStop", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids browser.traceStop"))
+		}
+		if b == nil {
+			return v.rejected(errors.New("browser engine unavailable"))
+		}
+		filePath := ""
+		browserID := ""
+		if len(call.Arguments) > 0 && !goja.IsUndefined(call.Arguments[0]) && !goja.IsNull(call.Arguments[0]) {
+			if s, ok := call.Arguments[0].Export().(string); ok {
+				filePath = s
+			} else {
+				var opts struct {
+					FilePath  string `json:"file_path"`
+					BrowserID string `json:"browser_id"`
+				}
+				_ = decodeArg(call.Arguments[0], &opts)
+				filePath = opts.FilePath
+				browserID = opts.BrowserID
+			}
+		}
+		if len(call.Arguments) > 1 && !goja.IsUndefined(call.Arguments[1]) && !goja.IsNull(call.Arguments[1]) {
+			browserID = call.Arguments[1].String()
+		}
+		return v.spawnAsync("browser.traceStop", filePath, func(ctx context.Context) (any, error) {
+			res, err := b.TraceStop(ctx, browserID, filePath)
+			return toPlain(res), err
+		})
+	})
+	_ = obj.Set("cleanup", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() || b == nil {
+			return v.rejected(errors.New("cleanup unavailable"))
+		}
+		sid := v.currentSessionID()
+		return v.spawnAsync("browser.cleanup", sid, func(ctx context.Context) (any, error) {
+			closed := b.CleanupSessionTabs(ctx, sid)
+			return map[string]any{"closed": closed}, nil
+		})
+	})
+	return obj
+}
+
+func (v *sessionVM) makeTabHandle(tab browser.Tab) goja.Value {
+	b := v.deps.Browser
+	obj := v.vm.NewObject()
+	_ = obj.Set("id", tab.ID)
+	_ = obj.Set("target_id", tab.TargetID)
+	_ = obj.Set("browser_id", tab.BrowserID)
+	_ = obj.Set("type", tab.Type)
+	_ = obj.Set("title", tab.Title)
+	_ = obj.Set("url", tab.URL)
+	_ = obj.Set("active", tab.Active)
+	_ = obj.Set("handed_off", tab.HandedOff)
+
+	tabID := tab.ID
+	label := firstNonEmpty(tab.Title, tab.URL, tabID)
+
+	_ = obj.Set("goto", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids tab.goto"))
+		}
+		if len(call.Arguments) == 0 {
+			return v.rejected(errors.New("tab.goto requires url"))
+		}
+		u := call.Arguments[0].String()
+		return v.spawnAsync("tab.goto", clipStr(u, 90), func(ctx context.Context) (any, error) {
+			updated, err := b.Navigate(ctx, browser.Navigation{TabID: tabID, Kind: "url", URL: u})
+			return toPlain(updated), err
+		})
+	})
+	_ = obj.Set("reload", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids tab.reload"))
+		}
+		return v.spawnAsync("tab.reload", label, func(ctx context.Context) (any, error) {
+			updated, err := b.Navigate(ctx, browser.Navigation{TabID: tabID, Kind: "reload"})
+			return toPlain(updated), err
+		})
+	})
+	_ = obj.Set("back", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids tab.back"))
+		}
+		return v.spawnAsync("tab.back", label, func(ctx context.Context) (any, error) {
+			updated, err := b.Navigate(ctx, browser.Navigation{TabID: tabID, Kind: "back"})
+			return toPlain(updated), err
+		})
+	})
+	_ = obj.Set("forward", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids tab.forward"))
+		}
+		return v.spawnAsync("tab.forward", label, func(ctx context.Context) (any, error) {
+			updated, err := b.Navigate(ctx, browser.Navigation{TabID: tabID, Kind: "forward"})
+			return toPlain(updated), err
+		})
+	})
+	_ = obj.Set("close", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids tab.close"))
+		}
+		return v.spawnAsync("tab.close", label, func(ctx context.Context) (any, error) {
+			return map[string]any{"closed": true}, b.CloseTab(ctx, tabID, "")
+		})
+	})
+	_ = obj.Set("markHandoff", func(call goja.FunctionCall) goja.Value {
+		if err := b.MarkHandoff(tabID); err != nil {
+			panic(v.vm.NewGoError(err))
+		}
+		_ = obj.Set("handed_off", true)
+		return v.vm.ToValue(true)
+	})
+	_ = obj.Set("snapshot", func(call goja.FunctionCall) goja.Value {
+		opts := browser.SnapshotOptions{MaxElements: 500, MaxText: 50000, Diff: true}
+		if len(call.Arguments) > 0 && !goja.IsUndefined(call.Arguments[0]) {
+			var raw struct {
+				MaxElements int   `json:"max_elements"`
+				MaxText     int   `json:"max_text"`
+				Diff        *bool `json:"diff"`
+			}
+			_ = decodeArg(call.Arguments[0], &raw)
+			if raw.MaxElements > 0 {
+				opts.MaxElements = raw.MaxElements
+			}
+			if raw.MaxText > 0 {
+				opts.MaxText = raw.MaxText
+			}
+			if raw.Diff != nil {
+				opts.Diff = *raw.Diff
+			}
+		}
+		return v.spawnAsync("tab.snapshot", clipStr(label, 64), func(ctx context.Context) (any, error) {
+			snap, err := b.SnapshotWithOptions(ctx, tabID, opts)
+			return toPlain(snap), err
+		})
+	})
+	_ = obj.Set("screenshot", func(call goja.FunctionCall) goja.Value {
+		opts := browser.ScreenshotOptions{TabID: tabID}
+		if len(call.Arguments) > 0 && !goja.IsUndefined(call.Arguments[0]) {
+			_ = decodeArg(call.Arguments[0], &opts)
+			opts.TabID = tabID
+		}
+		return v.spawnAsync("tab.screenshot", clipStr(label, 64), func(ctx context.Context) (any, error) {
+			data, info, err := b.Screenshot(ctx, opts)
+			if err != nil {
+				return nil, err
+			}
+			m := toPlainMap(info)
+			m["__image_bytes"] = data
+			m["bytes"] = len(data)
+			return m, nil
+		})
+	})
+	_ = obj.Set("eval", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids tab.eval"))
+		}
+		if len(call.Arguments) == 0 {
+			return v.rejected(errors.New("tab.eval requires script"))
+		}
+		script := call.Arguments[0].String()
+		return v.spawnAsync("tab.eval", clipStr(firstCommentOrCode(script), 72), func(ctx context.Context) (any, error) {
+			res, err := b.Act(ctx, browser.Action{TabID: tabID, Kind: "evaluate", Script: script})
+			if err != nil {
+				return nil, err
+			}
+			return res.Value, nil
+		})
+	})
+	_ = obj.Set("cdp", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids tab.cdp"))
+		}
+		if len(call.Arguments) == 0 {
+			return v.rejected(errors.New("tab.cdp requires method"))
+		}
+		method := call.Arguments[0].String()
+		var params map[string]any
+		if len(call.Arguments) > 1 && !goja.IsUndefined(call.Arguments[1]) && !goja.IsNull(call.Arguments[1]) {
+			_ = decodeArg(call.Arguments[1], &params)
+		}
+		return v.spawnAsync("tab.cdp", method, func(ctx context.Context) (any, error) {
+			return b.RawCDP(ctx, "", tabID, method, params)
+		})
+	})
+	_ = obj.Set("action", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids tab.action"))
+		}
+		var act browser.Action
+		if len(call.Arguments) > 0 {
+			_ = decodeArg(call.Arguments[0], &act)
+		}
+		act.TabID = tabID
+		return v.spawnAsync("tab."+act.Kind, clipStr(label, 64), func(ctx context.Context) (any, error) {
+			res, err := b.Act(ctx, act)
+			return toPlain(res), err
+		})
+	})
+
+	_ = obj.Set("locator", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) == 0 {
+			panic(v.vm.NewTypeError("tab.locator requires CSS selector or locator object"))
+		}
+		var loc browser.Locator
+		if s, ok := call.Arguments[0].Export().(string); ok {
+			loc.CSS = s
+		} else {
+			_ = decodeArg(call.Arguments[0], &loc)
+		}
+		return v.makeLocatorHandle(tabID, loc)
+	})
+	_ = obj.Set("getByRole", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) == 0 {
+			panic(v.vm.NewTypeError("tab.getByRole requires role"))
+		}
+		loc := browser.Locator{Role: call.Arguments[0].String()}
+		if len(call.Arguments) > 1 && !goja.IsUndefined(call.Arguments[1]) {
+			if s, ok := call.Arguments[1].Export().(string); ok {
+				loc.Name = s
+			} else {
+				_ = decodeArg(call.Arguments[1], &loc)
+				loc.Role = call.Arguments[0].String()
+			}
+		}
+		return v.makeLocatorHandle(tabID, loc)
+	})
+	_ = obj.Set("getByText", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) == 0 {
+			panic(v.vm.NewTypeError("tab.getByText requires text"))
+		}
+		loc := browser.Locator{Text: call.Arguments[0].String()}
+		if len(call.Arguments) > 1 {
+			_ = decodeArg(call.Arguments[1], &loc)
+			loc.Text = call.Arguments[0].String()
+		}
+		return v.makeLocatorHandle(tabID, loc)
+	})
+	_ = obj.Set("getByLabel", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) == 0 {
+			panic(v.vm.NewTypeError("tab.getByLabel requires label"))
+		}
+		loc := browser.Locator{Label: call.Arguments[0].String()}
+		if len(call.Arguments) > 1 {
+			_ = decodeArg(call.Arguments[1], &loc)
+			loc.Label = call.Arguments[0].String()
+		}
+		return v.makeLocatorHandle(tabID, loc)
+	})
+	_ = obj.Set("getByPlaceholder", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) == 0 {
+			panic(v.vm.NewTypeError("tab.getByPlaceholder requires placeholder"))
+		}
+		loc := browser.Locator{Placeholder: call.Arguments[0].String()}
+		if len(call.Arguments) > 1 {
+			_ = decodeArg(call.Arguments[1], &loc)
+			loc.Placeholder = call.Arguments[0].String()
+		}
+		return v.makeLocatorHandle(tabID, loc)
+	})
+
+	_ = obj.Set("click", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids tab.click"))
+		}
+		act := browser.Action{TabID: tabID, Kind: "click"}
+		if len(call.Arguments) > 0 {
+			if s, ok := call.Arguments[0].Export().(string); ok {
+				act.Ref = s
+			} else {
+				_ = decodeArg(call.Arguments[0], &act)
+				act.TabID = tabID
+				act.Kind = "click"
+			}
+		}
+		return v.spawnAsync("tab.click", firstNonEmpty(act.Ref, act.Locator.CSS, act.Locator.Name), func(ctx context.Context) (any, error) {
+			res, err := b.Act(ctx, act)
+			return toPlain(res), err
+		})
+	})
+	_ = obj.Set("fill", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids tab.fill"))
+		}
+		if len(call.Arguments) < 2 {
+			return v.rejected(errors.New("tab.fill requires ref and text"))
+		}
+		ref, txt := call.Arguments[0].String(), call.Arguments[1].String()
+		return v.spawnAsync("tab.fill", ref, func(ctx context.Context) (any, error) {
+			res, err := b.Act(ctx, browser.Action{TabID: tabID, Kind: "fill", Ref: ref, Text: txt})
+			return toPlain(res), err
+		})
+	})
+	_ = obj.Set("press", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids tab.press"))
+		}
+		if len(call.Arguments) == 0 {
+			return v.rejected(errors.New("tab.press requires key"))
+		}
+		key := call.Arguments[0].String()
+		ref := ""
+		if len(call.Arguments) > 1 && !goja.IsUndefined(call.Arguments[1]) {
+			ref = call.Arguments[1].String()
+		}
+		return v.spawnAsync("tab.press", key, func(ctx context.Context) (any, error) {
+			res, err := b.Act(ctx, browser.Action{TabID: tabID, Kind: "press_key", Key: key, Ref: ref})
+			return toPlain(res), err
+		})
+	})
+	_ = obj.Set("scroll", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids tab.scroll"))
+		}
+		dx, dy := 0, 0
+		if len(call.Arguments) > 0 {
+			dx = int(call.Arguments[0].ToInteger())
+		}
+		if len(call.Arguments) > 1 {
+			dy = int(call.Arguments[1].ToInteger())
+		}
+		return v.spawnAsync("tab.scroll", fmt.Sprintf("(%d,%d)", dx, dy), func(ctx context.Context) (any, error) {
+			res, err := b.Act(ctx, browser.Action{TabID: tabID, Kind: "scroll", ScrollX: dx, ScrollY: dy})
+			return toPlain(res), err
+		})
+	})
+	_ = obj.Set("handleDialog", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids tab.handleDialog"))
+		}
+		accept := true
+		if len(call.Arguments) > 0 {
+			accept = call.Arguments[0].ToBoolean()
+		}
+		prompt := ""
+		if len(call.Arguments) > 1 && !goja.IsUndefined(call.Arguments[1]) {
+			prompt = call.Arguments[1].String()
+		}
+		return v.spawnAsync("tab.handleDialog", fmt.Sprintf("accept=%t", accept), func(ctx context.Context) (any, error) {
+			res, err := b.Act(ctx, browser.Action{TabID: tabID, Kind: "handle_dialog", Accept: &accept, PromptText: prompt})
+			return toPlain(res), err
+		})
+	})
+	_ = obj.Set("network", func(call goja.FunctionCall) goja.Value {
+		var filter browser.NetworkFilter
+		if len(call.Arguments) > 0 && !goja.IsUndefined(call.Arguments[0]) {
+			_ = decodeArg(call.Arguments[0], &filter)
+		}
+		return v.spawnAsync("tab.network", clipStr(label, 64), func(ctx context.Context) (any, error) {
+			entries, err := b.Network(ctx, tabID, filter)
+			return toPlain(entries), err
+		})
+	})
+	_ = obj.Set("networkBody", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) == 0 {
+			return v.rejected(errors.New("tab.networkBody requires request_id"))
+		}
+		reqID := call.Arguments[0].String()
+		return v.spawnAsync("tab.networkBody", reqID, func(ctx context.Context) (any, error) {
+			res, err := b.NetworkBody(ctx, tabID, reqID)
+			return toPlain(res), err
+		})
+	})
+	_ = obj.Set("console", func(call goja.FunctionCall) goja.Value {
+		var filter browser.ConsoleFilter
+		if len(call.Arguments) > 0 && !goja.IsUndefined(call.Arguments[0]) {
+			_ = decodeArg(call.Arguments[0], &filter)
+		}
+		return v.spawnAsync("tab.console", clipStr(label, 64), func(ctx context.Context) (any, error) {
+			entries, err := b.Console(ctx, tabID, filter)
+			return toPlain(entries), err
+		})
+	})
+	_ = obj.Set("emulate", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids tab.emulate"))
+		}
+		var opts browser.EmulateOptions
+		if len(call.Arguments) > 0 {
+			_ = decodeArg(call.Arguments[0], &opts)
+		}
+		return v.spawnAsync("tab.emulate", clipStr(label, 64), func(ctx context.Context) (any, error) {
+			return map[string]any{"ok": true}, b.Emulate(ctx, tabID, opts)
+		})
+	})
+	_ = obj.Set("css", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) == 0 {
+			return v.rejected(errors.New("tab.css requires CSS selector or locator"))
+		}
+		var loc browser.Locator
+		if s, ok := call.Arguments[0].Export().(string); ok {
+			loc.CSS = s
+		} else {
+			_ = decodeArg(call.Arguments[0], &loc)
+		}
+		return v.spawnAsync("tab.css", firstNonEmpty(loc.CSS, loc.Ref, loc.Name), func(ctx context.Context) (any, error) {
+			res, err := b.CSS(ctx, tabID, loc)
+			return toPlain(res), err
+		})
+	})
+	_ = obj.Set("heapSnapshot", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids tab.heapSnapshot"))
+		}
+		filePath := ""
+		if len(call.Arguments) > 0 && !goja.IsUndefined(call.Arguments[0]) {
+			filePath = call.Arguments[0].String()
+		}
+		return v.spawnAsync("tab.heapSnapshot", filePath, func(ctx context.Context) (any, error) {
+			res, err := b.HeapSnapshot(ctx, tabID, filePath)
+			return toPlain(res), err
+		})
+	})
+	_ = obj.Set("logpoint", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids tab.logpoint"))
+		}
+		if len(call.Arguments) < 3 {
+			return v.rejected(errors.New("tab.logpoint requires url, line, expression"))
+		}
+		u := call.Arguments[0].String()
+		line := int(call.Arguments[1].ToInteger())
+		expr := call.Arguments[2].String()
+		col := 0
+		if len(call.Arguments) > 3 {
+			col = int(call.Arguments[3].ToInteger())
+		}
+		return v.spawnAsync("tab.logpoint", fmt.Sprintf("%s:%d", clipStr(u, 48), line), func(ctx context.Context) (any, error) {
+			id, err := b.Logpoint(ctx, tabID, u, line, col, expr)
+			return map[string]any{"breakpoint_id": id}, err
+		})
+	})
+	_ = obj.Set("screencastStart", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids tab.screencastStart"))
+		}
+		var opts struct {
+			MaxWidth  int `json:"max_width"`
+			MaxHeight int `json:"max_height"`
+			Quality   int `json:"quality"`
+		}
+		if len(call.Arguments) > 0 {
+			_ = decodeArg(call.Arguments[0], &opts)
+		}
+		return v.spawnAsync("tab.screencastStart", label, func(ctx context.Context) (any, error) {
+			return map[string]any{"recording": true}, b.ScreencastStart(ctx, tabID, opts.MaxWidth, opts.MaxHeight, opts.Quality)
+		})
+	})
+	_ = obj.Set("screencastStop", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids tab.screencastStop"))
+		}
+		return v.spawnAsync("tab.screencastStop", label, func(ctx context.Context) (any, error) {
+			frames, err := b.ScreencastStop(ctx, tabID)
+			if err != nil {
+				return nil, err
+			}
+			out := make([]map[string]any, len(frames))
+			for i, f := range frames {
+				out[i] = map[string]any{
+					"seq":           f.Seq,
+					"timestamp":     f.Timestamp,
+					"width":         f.Width,
+					"height":        f.Height,
+					"mime_type":     f.MIMEType,
+					"bytes":         len(f.Data),
+					"__image_bytes": f.Data,
+				}
+			}
+			return out, nil
+		})
+	})
+	return obj
+}
+
+func (v *sessionVM) makeLocatorHandle(tabID string, loc browser.Locator) goja.Value {
+	b := v.deps.Browser
+	obj := v.vm.NewObject()
+	desc := firstNonEmpty(loc.CSS, loc.Role+":"+loc.Name, loc.Text, loc.Label, loc.Placeholder, loc.Ref)
+
+	act := func(kind string, mut func(*browser.Action)) goja.Value {
+		if v.isReadOnly() && kind != "wait_for" {
+			return v.rejected(errors.New("read-only grant forbids locator." + kind))
+		}
+		a := browser.Action{TabID: tabID, Kind: kind, Locator: loc}
+		if mut != nil {
+			mut(&a)
+		}
+		return v.spawnAsync("locator."+kind, clipStr(desc, 64), func(ctx context.Context) (any, error) {
+			res, err := b.Act(ctx, a)
+			return toPlain(res), err
+		})
+	}
+
+	_ = obj.Set("click", func(call goja.FunctionCall) goja.Value { return act("click", nil) })
+	_ = obj.Set("doubleClick", func(call goja.FunctionCall) goja.Value { return act("double_click", nil) })
+	_ = obj.Set("hover", func(call goja.FunctionCall) goja.Value { return act("hover", nil) })
+	_ = obj.Set("fill", func(call goja.FunctionCall) goja.Value {
+		txt := ""
+		if len(call.Arguments) > 0 {
+			txt = call.Arguments[0].String()
+		}
+		return act("fill", func(a *browser.Action) { a.Text = txt })
+	})
+	_ = obj.Set("type", func(call goja.FunctionCall) goja.Value {
+		txt := ""
+		if len(call.Arguments) > 0 {
+			txt = call.Arguments[0].String()
+		}
+		return act("type_text", func(a *browser.Action) { a.Text = txt })
+	})
+	_ = obj.Set("press", func(call goja.FunctionCall) goja.Value {
+		key := ""
+		if len(call.Arguments) > 0 {
+			key = call.Arguments[0].String()
+		}
+		return act("press_key", func(a *browser.Action) { a.Key = key })
+	})
+	_ = obj.Set("select", func(call goja.FunctionCall) goja.Value {
+		opt := ""
+		if len(call.Arguments) > 0 {
+			opt = call.Arguments[0].String()
+		}
+		return act("select", func(a *browser.Action) { a.Option = opt })
+	})
+	_ = obj.Set("check", func(call goja.FunctionCall) goja.Value {
+		checked := true
+		if len(call.Arguments) > 0 {
+			checked = call.Arguments[0].ToBoolean()
+		}
+		return act("check", func(a *browser.Action) { a.Checked = &checked })
+	})
+	_ = obj.Set("uploadFiles", func(call goja.FunctionCall) goja.Value {
+		var files []string
+		if len(call.Arguments) > 0 {
+			_ = decodeArg(call.Arguments[0], &files)
+		}
+		return act("upload_files", func(a *browser.Action) { a.Files = files })
+	})
+	_ = obj.Set("waitFor", func(call goja.FunctionCall) goja.Value {
+		timeoutMS := loc.TimeoutMS
+		if len(call.Arguments) > 0 && !goja.IsUndefined(call.Arguments[0]) {
+			var opts struct {
+				TimeoutMS int `json:"timeout_ms"`
+			}
+			_ = decodeArg(call.Arguments[0], &opts)
+			if opts.TimeoutMS > 0 {
+				timeoutMS = opts.TimeoutMS
+			}
+		}
+		return act("wait_for", func(a *browser.Action) { a.Locator.TimeoutMS = timeoutMS })
+	})
+	_ = obj.Set("nth", func(call goja.FunctionCall) goja.Value {
+		next := loc
+		if len(call.Arguments) > 0 {
+			next.Nth = int(call.Arguments[0].ToInteger())
+		}
+		return v.makeLocatorHandle(tabID, next)
+	})
+	return obj
+}
+
+func (v *sessionVM) buildDesktopSDK() goja.Value {
+	obj := v.vm.NewObject()
+	ctrl := v.deps.Computer
+
+	_ = obj.Set("targets", func(call goja.FunctionCall) goja.Value {
+		if ctrl == nil {
+			return v.rejected(errors.New("desktop controller unavailable"))
+		}
+		var opts computer.TargetsOptions
+		if len(call.Arguments) > 0 {
+			_ = decodeArg(call.Arguments[0], &opts)
+		}
+		return v.spawnAsync("desktop.targets", firstNonEmpty(opts.Process, opts.Title, "all"), func(ctx context.Context) (any, error) {
+			res, err := ctrl.Targets(ctx, opts)
+			return toPlain(res), err
+		})
+	})
+	_ = obj.Set("state", func(call goja.FunctionCall) goja.Value {
+		if ctrl == nil {
+			return v.rejected(errors.New("desktop controller unavailable"))
+		}
+		var opts computer.StateOptions
+		if len(call.Arguments) > 0 {
+			_ = decodeArg(call.Arguments[0], &opts)
+		}
+		return v.spawnAsync("desktop.state", firstNonEmpty(opts.TargetID, opts.DisplayID, "desktop"), func(ctx context.Context) (any, error) {
+			data, st, err := ctrl.State(ctx, opts)
+			if err != nil {
+				return nil, err
+			}
+			m := toPlainMap(st)
+			if len(data) > 0 {
+				m["__image_bytes"] = data
+				m["bytes"] = len(data)
+			}
+			return m, nil
+		})
+	})
+	_ = obj.Set("wait", func(call goja.FunctionCall) goja.Value {
+		if ctrl == nil {
+			return v.rejected(errors.New("desktop controller unavailable"))
+		}
+		var opts computer.WaitOptions
+		if len(call.Arguments) > 0 {
+			_ = decodeArg(call.Arguments[0], &opts)
+		}
+		return v.spawnAsync("desktop.wait", firstNonEmpty(opts.Name, opts.AutomationID, opts.Role), func(ctx context.Context) (any, error) {
+			data, st, err := ctrl.Wait(ctx, opts)
+			if err != nil {
+				return nil, err
+			}
+			m := toPlainMap(st)
+			if len(data) > 0 {
+				m["__image_bytes"] = data
+			}
+			return m, nil
+		})
+	})
+	_ = obj.Set("action", func(call goja.FunctionCall) goja.Value {
+		if v.isReadOnly() {
+			return v.rejected(errors.New("read-only grant forbids desktop.action"))
+		}
+		if ctrl == nil {
+			return v.rejected(errors.New("desktop controller unavailable"))
+		}
+		var act computer.Action
+		if len(call.Arguments) > 0 {
+			_ = decodeArg(call.Arguments[0], &act)
+		}
+		return v.spawnAsync("desktop."+act.Kind, firstNonEmpty(act.ElementRef, act.TargetID), func(ctx context.Context) (any, error) {
+			res, err := ctrl.Act(ctx, act)
+			return toPlain(res), err
+		})
+	})
+	_ = obj.Set("control", func(call goja.FunctionCall) goja.Value {
+		if ctrl == nil {
+			return v.rejected(errors.New("desktop controller unavailable"))
+		}
+		var opts computer.ControlOptions
+		if len(call.Arguments) > 0 {
+			if s, ok := call.Arguments[0].Export().(string); ok {
+				opts.Kind = s
+				if len(call.Arguments) > 1 {
+					_ = decodeArg(call.Arguments[1], &opts)
+					opts.Kind = s
+				}
+			} else {
+				_ = decodeArg(call.Arguments[0], &opts)
+			}
+		}
+		if v.isReadOnly() && opts.Kind != "status" {
+			return v.rejected(errors.New("read-only grant forbids desktop.control " + opts.Kind))
+		}
+		return v.spawnAsync("desktop.control", opts.Kind, func(ctx context.Context) (any, error) {
+			res, err := ctrl.Control(ctx, opts)
+			return toPlain(res), err
+		})
+	})
+	return obj
+}
+
+func (v *sessionVM) buildImageSDK() goja.Value {
+	obj := v.vm.NewObject()
+	_ = obj.Set("read", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) == 0 {
+			return v.rejected(errors.New("img.read requires path"))
+		}
+		path := call.Arguments[0].String()
+		var opts runtimeimage.ReadOptions
+		if len(call.Arguments) > 1 {
+			_ = decodeArg(call.Arguments[1], &opts)
+		}
+		return v.spawnAsync("img.read", path, func(ctx context.Context) (any, error) {
+			data, meta, err := runtimeimage.Read(ctx, path, opts)
+			if err != nil {
+				return nil, err
+			}
+			m := toPlainMap(meta)
+			m["__image_bytes"] = data
+			m["bytes"] = len(data)
+			return m, nil
+		})
+	})
+	return obj
+}
+
+func (v *sessionVM) buildCapsSDK() goja.Value {
+	obj := v.vm.NewObject()
+	reg := v.deps.Capabilities
+	_ = obj.Set("list", func(call goja.FunctionCall) goja.Value {
+		if reg == nil {
+			return v.vm.ToValue([]any{})
+		}
+		defs := reg.List()
+		if v.deps.LocalApps {
+			defs = append(defs, reg.AppDefinitions()...)
+		}
+		return v.vm.ToValue(toPlain(defs))
+	})
+	_ = obj.Set("call", func(call goja.FunctionCall) goja.Value {
+		if reg == nil || len(call.Arguments) == 0 {
+			return v.rejected(errors.New("caps.call requires capability name"))
+		}
+		name := call.Arguments[0].String()
+		args := map[string]any{}
+		if len(call.Arguments) > 1 && !goja.IsUndefined(call.Arguments[1]) && !goja.IsNull(call.Arguments[1]) {
+			_ = decodeArg(call.Arguments[1], &args)
+		}
+		browserID, tabID := "", ""
+		if len(call.Arguments) > 2 && !goja.IsUndefined(call.Arguments[2]) {
+			browserID = call.Arguments[2].String()
+		}
+		if len(call.Arguments) > 3 && !goja.IsUndefined(call.Arguments[3]) {
+			tabID = call.Arguments[3].String()
+		}
+		if v.isReadOnly() {
+			allowed := false
+			for _, d := range reg.List() {
+				if d.Name == name && d.Annotations.ReadOnlyHint && !d.Annotations.DestructiveHint {
+					allowed = true
+				}
+			}
+			if !allowed {
+				return v.rejected(fmt.Errorf("read-only grant forbids capability %q", name))
+			}
+		}
+		return v.spawnAsync("caps.call", name, func(ctx context.Context) (any, error) {
+			if v.deps.LocalApps {
+				for _, d := range reg.AppDefinitions() {
+					if d.Name == name {
+						return reg.CallApp(ctx, name, args)
+					}
+				}
+			}
+			return reg.Call(ctx, name, browserID, tabID, args)
+		})
+	})
+	return obj
+}
+
+func decodeArg(val goja.Value, target any) error {
+	if val == nil || goja.IsUndefined(val) || goja.IsNull(val) {
+		return nil
+	}
+	b, err := json.Marshal(val.Export())
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(b, target)
+}
+
+func toPlain(v any) any {
+	if v == nil {
+		return nil
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return v
+	}
+	var out any
+	if json.Unmarshal(b, &out) != nil {
+		return v
+	}
+	return out
+}
+
+func toPlainMap(v any) map[string]any {
+	if m, ok := toPlain(v).(map[string]any); ok {
+		return m
+	}
+	return map[string]any{}
+}
+
+func formatJSArg(val goja.Value) string {
+	if val == nil || goja.IsUndefined(val) {
+		return "undefined"
+	}
+	if goja.IsNull(val) {
+		return "null"
+	}
+	exp := val.Export()
+	switch x := exp.(type) {
+	case string:
+		return x
+	case bool, int, int64, float64:
+		return fmt.Sprint(x)
+	default:
+		b, err := json.Marshal(x)
+		if err != nil {
+			return val.String()
+		}
+		return string(b)
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, s := range values {
+		if strings.TrimSpace(s) != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func clipStr(s string, maxLen int) string {
+	s = strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", " "), "\n", " ")
+	r := []rune(strings.TrimSpace(s))
+	if len(r) <= maxLen {
+		return string(r)
+	}
+	return string(r[:maxLen]) + "…"
+}
+
+func firstCommentOrCode(script string) string {
+	for _, line := range strings.Split(script, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		line = strings.TrimPrefix(line, "//")
+		return strings.TrimSpace(line)
+	}
+	return script
+}

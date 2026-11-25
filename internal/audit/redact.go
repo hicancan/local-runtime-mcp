@@ -2,7 +2,6 @@ package audit
 
 import (
 	"encoding/json"
-	"fmt"
 	"strings"
 )
 
@@ -135,78 +134,28 @@ func SummarizeTool(name string, rawArgs json.RawMessage) string {
 	}
 
 	switch name {
-	case "agent_report":
+	case "run":
+		if title := str("title"); title != "" {
+			return clip(title, 140)
+		}
+		return "run script"
+	case "wait":
+		cid := clip(str("cell_id"), 24)
+		if term, _ := args["terminate"].(bool); term {
+			return "terminate cell " + cid
+		}
+		return "wait cell " + cid
+	case "session":
 		if msg := str("message"); msg != "" {
 			return clip(msg, 140)
 		}
-		return "status update"
-	case "process_run":
-		prog := str("program")
-		if rawList, ok := args["args"].([]any); ok && len(rawList) > 0 {
-			parts := make([]string, 0, len(rawList)+1)
-			parts = append(parts, prog)
-			for _, item := range rawList {
-				if s, ok := item.(string); ok {
-					parts = append(parts, s)
-				}
-			}
-			return clip(strings.Join(parts, " "), 120)
+		if title := str("title"); title != "" {
+			return clip(title, 140)
 		}
-		return clip("run "+prog, 120)
-	case "process_continue":
-		if term, _ := args["terminate"].(bool); term {
-			return "terminate session " + clip(str("session_id"), 24)
+		if act := str("action"); act != "" {
+			return "session " + act
 		}
-		return "continue session " + clip(str("session_id"), 24)
-	case "filesystem_read_text":
-		return "read " + clip(str("path"), 110)
-	case "filesystem_write_text":
-		return fmt.Sprintf("write(%s) %s", str("mode"), clip(str("path"), 100))
-	case "filesystem_patch_text":
-		return "patch " + clip(str("path"), 110)
-	case "filesystem_list":
-		return "list " + clip(str("path"), 110)
-	case "filesystem_stat":
-		return "stat " + clip(str("path"), 110)
-	case "filesystem_search_text":
-		return fmt.Sprintf("search %q in %s", clip(str("query"), 40), clip(str("path"), 70))
-	case "image_read":
-		return "read image " + clip(str("path"), 100)
-	case "browser_status":
-		return "check browser profiles"
-	case "browser_tabs":
-		return "list browser tabs"
-	case "browser_open":
-		return "open " + clip(str("url"), 110)
-	case "browser_close":
-		return "close tab " + clip(str("tab_id"), 32)
-	case "browser_navigate":
-		if u := str("url"); u != "" {
-			return "navigate " + clip(u, 110)
-		}
-		return "navigate " + str("kind")
-	case "browser_snapshot":
-		return "snapshot page " + clip(str("tab_id"), 32)
-	case "browser_screenshot":
-		return "screenshot page " + clip(str("tab_id"), 32)
-	case "browser_action":
-		return "browser." + str("kind")
-	case "computer_targets":
-		if p := str("process"); p != "" {
-			return "list windows (" + clip(p, 40) + ")"
-		}
-		return "list displays & windows"
-	case "computer_state":
-		if tid := str("target_id"); tid != "" {
-			return "observe window " + clip(tid, 32)
-		}
-		return "observe desktop"
-	case "computer_wait":
-		return "wait for desktop element"
-	case "computer_action":
-		return "desktop." + str("kind")
-	case "computer_control":
-		return "desktop control " + str("kind")
+		return "session update"
 	case "capability_propose":
 		return "propose page tool " + clip(str("name"), 64)
 	default:

@@ -13,7 +13,7 @@
       grpLocal: '本机客户端',
       grpWeb: '网页与系统',
       emptyTimelineTitle: '等待 Agent 接入活动流',
-      emptyTimelineSub: '任何本地或云端 Agent 调用工具或发送 agent_report 后，时间线会在这里毫秒级实时出现。',
+      emptyTimelineSub: '任何本地或云端 Agent 调用 run / session 后，时间线会在这里毫秒级实时出现。',
       emptySearchTitle: '没有匹配记录',
       emptySearchSub: '换一个关键词试试（支持中英文全文检索）。',
       emptyProposalsTitle: '暂无待审批网页能力提案',
@@ -60,7 +60,7 @@
       grpLocal: 'Local Clients',
       grpWeb: 'Web & System',
       emptyTimelineTitle: 'Waiting for live runtime activity',
-      emptyTimelineSub: 'Tool calls and agent_report progress notes from local or cloud clients appear here in real time.',
+      emptyTimelineSub: 'Runtime scripts (run) and task milestones (session) from local or cloud clients appear here in real time.',
       emptySearchTitle: 'No matching events',
       emptySearchSub: 'Try another keyword (FTS5 full-text search across tools, args, outputs, and notes).',
       emptyProposalsTitle: 'No pending Web MCP proposals',
@@ -441,6 +441,22 @@
         ));
       }
       if (isOpen) {
+        try {
+          const parsedRes = ev.result_json ? JSON.parse(ev.result_json) : null;
+          const subOps = Array.isArray(parsedRes?.sub_ops) ? parsedRes.sub_ops : [];
+          if (subOps.length > 0) {
+            const list = el('div', { style: 'display:flex;flex-direction:column;gap:4px;margin-bottom:8px' },
+              el('div', { class: 'kv-label' }, `Sub-operations (${subOps.length})`),
+              ...subOps.map((op) => el('div', { style: 'display:flex;gap:8px;align-items:center;font-family:var(--mono);font-size:12px;opacity:.9' },
+                el('span', { style: op.status === 'error' ? 'color:var(--err)' : 'color:var(--ok)' }, op.status === 'error' ? '✕' : '✓'),
+                el('span', { style: 'font-weight:600' }, op.op),
+                op.target ? el('span', { style: 'opacity:.75;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, op.target) : null,
+                op.duration_ms ? el('span', { style: 'margin-left:auto;opacity:.6' }, formatDur(op.duration_ms)) : null,
+              )),
+            );
+            detail.append(list);
+          }
+        } catch { /* ignore */ }
         const argsStr = prettyJSON(ev.args_json);
         if (argsStr) detail.append(el('div', {}, el('div', { class: 'kv-label' }, t('argsLabel')), el('pre', { class: 'code-box' }, argsStr)));
         if (ev.error_text) detail.append(el('div', {}, el('div', { class: 'kv-label' }, t('errorLabel')), el('pre', { class: 'code-box err-box' }, ev.error_text)));
@@ -601,16 +617,32 @@
     }
     col.append(tokCard);
 
-    // Connected browsers
+    // Discovered / connected CDP browsers
     const bList = st.browser?.instances || [];
     const bCard = el('div', { class: 'card' }, el('div', { class: 'card-title' }, t('browsersTitle')));
     if (!bList.length) {
       bCard.append(el('p', { class: 'card-desc' }, t('browsersEmpty')));
     } else {
       for (const b of bList) {
+        const stLabel = b.state || (b.connected ? 'connected' : 'offline');
         bCard.append(el('div', { class: 'card-row' },
-          el('span', { style: 'font-family:var(--mono)' }, b.browser_id),
-          el('span', { class: `pill ${b.connected ? 'ok' : ''}` }, b.connected ? 'connected' : 'offline'),
+          el('span', { style: 'font-family:var(--mono)' }, `${b.label || b.browser_id} (${b.browser_id})`),
+          el('div', { style: 'display:flex;gap:8px;align-items:center' },
+            el('span', { class: `pill ${b.connected ? 'ok' : (stLabel === 'awaiting_approval' ? 'cloud' : '')}` }, stLabel),
+            !b.connected ? el('button', {
+              type: 'button',
+              class: 'btn primary',
+              onClick: async () => {
+                try {
+                  await apiPost('/ui/api/browser/connect', { browser_id: b.browser_id });
+                  showToast(`Connected ${b.browser_id}`);
+                  await loadAll();
+                } catch (err) {
+                  showToast(err.message);
+                }
+              },
+            }, 'Connect') : null,
+          ),
         ));
       }
     }

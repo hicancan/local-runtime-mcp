@@ -14,407 +14,241 @@ import (
 
 	"github.com/hicancan/local-runtime-mcp/internal/audit"
 	"github.com/hicancan/local-runtime-mcp/internal/browser"
+	"github.com/hicancan/local-runtime-mcp/internal/capability"
+	"github.com/hicancan/local-runtime-mcp/internal/computer"
 	"github.com/hicancan/local-runtime-mcp/internal/config"
 	"github.com/hicancan/local-runtime-mcp/internal/filesystem"
+	"github.com/hicancan/local-runtime-mcp/internal/jsrt"
 	runtimeprocess "github.com/hicancan/local-runtime-mcp/internal/process"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-type annotationExpectation struct {
-	readOnly, destructive, idempotent, openWorld bool
-}
-
-func TestToolCatalogAndIdentity(t *testing.T) {
-	session := connect(t)
-	initialized := session.InitializeResult()
-	if initialized.ServerInfo.Name != "local-runtime-mcp" || initialized.ServerInfo.Version != Version {
-		t.Fatalf("unexpected identity: %+v", initialized.ServerInfo)
-	}
-	if !strings.HasPrefix(initialized.Instructions, "Local Runtime MCP exposes the machine") {
-		t.Fatalf("unexpected instructions: %q", initialized.Instructions)
-	}
-	if initialized.Capabilities.Resources != nil {
-		t.Fatalf("resources capability must be absent: %+v", initialized.Capabilities.Resources)
-	}
-	listed, err := session.ListTools(context.Background(), nil)
+func testSession(t *testing.T, store *audit.Store, readOnly bool) (*mcp.ClientSession, *Managed) {
+	t.Helper()
+	ctx := context.Background()
+	procMgr := runtimeprocess.NewManager(ctx)
+	t.Cleanup(func() { _ = procMgr.Close() })
+	br, err := browser.Start(ctx, config.Browser{DisableAutoCDP: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := map[string]annotationExpectation{
-		"filesystem_list": {true, false, true, false}, "filesystem_stat": {true, false, true, false},
-		"filesystem_read_text": {true, false, true, false}, "filesystem_write_text": {false, true, true, false},
-		"filesystem_patch_text": {false, true, true, false}, "filesystem_search_text": {true, false, true, false},
-		"image_read": {true, false, true, false}, "process_run": {false, true, false, true},
-		"process_continue": {false, true, false, true},
-		"browser_status":   {true, false, true, false}, "browser_tabs": {true, false, true, false},
-		"browser_open": {false, false, false, true}, "browser_close": {false, true, true, false},
-		"browser_navigate": {false, false, false, true}, "browser_snapshot": {true, false, true, true},
-		"browser_screenshot": {true, false, true, true}, "browser_action": {false, true, false, true},
-		"computer_targets": {true, false, true, false}, "computer_state": {true, false, true, false},
-		"computer_action": {false, true, false, false}, "computer_wait": {true, false, true, false},
-		"computer_control": {false, false, false, false},
-		"agent_report":     {true, false, false, false},
-	}
-	type propertySchema struct {
-		Enum       []string                  `json:"enum"`
-		Type       any                       `json:"type"`
-		Properties map[string]propertySchema `json:"properties"`
-		Required   []string                  `json:"required"`
-	}
-	schemas := make(map[string]map[string]propertySchema, len(expected))
-	required := make(map[string][]string, len(expected))
-	if len(listed.Tools) != len(expected) {
-		t.Fatalf("tool count = %d, want %d", len(listed.Tools), len(expected))
-	}
-	for _, registered := range listed.Tools {
-		want, ok := expected[registered.Name]
-		if !ok {
-			t.Fatalf("unexpected tool %q", registered.Name)
-		}
-		got := registered.Annotations
-		if registered.Title == "" || got == nil || got.DestructiveHint == nil || got.OpenWorldHint == nil {
-			t.Fatalf("tool %q has incomplete metadata: %+v", registered.Name, registered)
-		}
-		if registered.InputSchema == nil || registered.OutputSchema == nil {
-			t.Fatalf("tool %q has incomplete schemas", registered.Name)
-		}
-		if got.ReadOnlyHint != want.readOnly || *got.DestructiveHint != want.destructive || got.IdempotentHint != want.idempotent || *got.OpenWorldHint != want.openWorld {
-			t.Fatalf("tool %q annotations = %+v, want %+v", registered.Name, got, want)
-		}
-		data, err := json.Marshal(registered.InputSchema)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var schema struct {
-			Properties map[string]propertySchema `json:"properties"`
-			Required   []string                  `json:"required"`
-		}
-		if err := json.Unmarshal(data, &schema); err != nil {
-			t.Fatalf("decode input schema for %q: %v", registered.Name, err)
-		}
-		schemas[registered.Name] = schema.Properties
-		required[registered.Name] = schema.Required
-	}
-	assertEnum(t, schemas["browser_navigate"]["kind"].Enum, []string{"url", "back", "forward", "reload"})
-	assertEnum(t, schemas["browser_action"]["kind"].Enum, []string{"click", "double_click", "hover", "drag", "type_text", "set_value", "press_key", "scroll", "select", "check", "upload_files", "handle_dialog", "evaluate"})
-	assertEnum(t, schemas["computer_action"]["kind"].Enum, []string{"invoke", "toggle", "select", "expand", "collapse", "set_value", "scroll_into_view", "scroll_by", "place", "activate", "move", "click", "double_click", "drag", "type_text", "press_key", "scroll"})
-	assertEnum(t, schemas["computer_control"]["kind"].Enum, []string{"acquire", "status", "release"})
-	assertEnum(t, schemas["filesystem_write_text"]["mode"].Enum, []string{"create", "replace"})
-	for name, fields := range map[string][]string{
-		"browser_tabs": {"browser_id"}, "browser_open": {"browser_id", "url"},
-		"browser_close": {"tab_id"}, "browser_navigate": {"tab_id", "kind"},
-		"browser_snapshot": {"tab_id"}, "browser_screenshot": {"tab_id"}, "browser_action": {"tab_id", "kind"},
-		"computer_control": {"kind"}, "computer_action": {"kind"}, "computer_wait": {"target_id"},
-		"filesystem_write_text": {"mode", "path", "content"},
-	} {
-		for _, field := range fields {
-			if kind, ok := schemas[name][field].Type.(string); !ok || kind != "string" {
-				t.Fatalf("%s.%s must be a string", name, field)
-			}
-			found := false
-			for _, value := range required[name] {
-				if value == field {
-					found = true
-				}
-			}
-			if !found {
-				t.Fatalf("%s.%s must be required", name, field)
-			}
-		}
-	}
-	if _, ok := schemas["filesystem_write_text"]["create_parents"]; !ok {
-		t.Fatal("filesystem_write_text is missing explicit create_parents")
-	}
-	cursorSchema, ok := schemas["process_continue"]["output_cursor"]
-	if !ok {
-		t.Fatal("process_continue is missing its explicit output cursor")
-	}
-	for _, field := range required["process_continue"] {
-		if field == "output_cursor" {
-			t.Fatal("output_cursor must be optional for an initial reread")
-		}
-	}
-	for _, field := range []string{"stdout", "stderr"} {
-		if cursorSchema.Properties[field].Type != "integer" {
-			t.Fatalf("output_cursor.%s must use integer byte offsets", field)
-		}
-		found := false
-		for _, name := range cursorSchema.Required {
-			found = found || name == field
-		}
-		if !found {
-			t.Fatalf("an explicit output_cursor must contain %s", field)
-		}
-	}
-	for _, registered := range listed.Tools {
-		if registered.Name != "process_run" && registered.Name != "process_continue" {
-			continue
-		}
-		data, err := json.Marshal(registered.OutputSchema)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var schema struct {
-			Properties map[string]json.RawMessage `json:"properties"`
-		}
-		if err := json.Unmarshal(data, &schema); err != nil {
-			t.Fatal(err)
-		}
-		for _, field := range []string{"output_cursor", "stdout_offset", "stderr_offset"} {
-			if _, ok := schema.Properties[field]; !ok {
-				t.Fatalf("%s result is missing %s", registered.Name, field)
-			}
-		}
-	}
-	if !strings.Contains(initialized.Instructions, "last successfully received output_cursor") || !strings.Contains(initialized.Instructions, "Do not automatically repeat process_run") {
-		t.Fatal("server instructions must explain cursor collection and uncertain side effects")
-	}
-	if _, ok := schemas["computer_action"]["element_ref"]; !ok {
-		t.Fatal("computer_action is missing UI Automation element_ref")
-	}
-	for toolName, forbidden := range map[string][]string{
-		"computer_state":        {"include_accessibility"},
-		"browser_action":        {"selector"},
-		"filesystem_write_text": {"create_only"},
-	} {
-		for _, name := range forbidden {
-			if _, ok := schemas[toolName][name]; ok {
-				t.Fatalf("tool %q still exposes removed field %q", toolName, name)
-			}
-		}
-	}
-}
-
-func assertEnum(t *testing.T, got, want []string) {
-	t.Helper()
-	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
-		t.Fatalf("enum = %q, want %q", got, want)
-	}
-}
-
-func TestFilesystemImageAndProcessTools(t *testing.T) {
-	root := t.TempDir()
-	session := connect(t)
-	note := filepath.Join(root, "docs", "note.txt")
-	write := callOK(t, session, "filesystem_write_text", map[string]any{"path": note, "content": "hello from MCP\n", "mode": "create", "create_parents": true})
-	var written filesystem.TextWriteResult
-	decodeStructured(t, write, &written)
-	if !written.Created || written.Path != note {
-		t.Fatalf("unexpected write: %+v", written)
-	}
-	read := callOK(t, session, "filesystem_read_text", map[string]any{"path": note})
-	var readResult filesystem.TextReadResult
-	decodeStructured(t, read, &readResult)
-	if readResult.Content != "hello from MCP\n" {
-		t.Fatalf("unexpected read: %+v", readResult)
-	}
-	callOK(t, session, "filesystem_patch_text", map[string]any{"path": note, "expected_sha256": written.SHA256, "hunks": []map[string]any{{"old": "hello", "new": "hi", "after": " from MCP"}}})
-	callOK(t, session, "filesystem_stat", map[string]any{"path": note})
-	callOK(t, session, "filesystem_list", map[string]any{"path": root})
-	search := callOK(t, session, "filesystem_search_text", map[string]any{"path": root, "query": "hi"})
-	var searched filesystem.SearchResult
-	decodeStructured(t, search, &searched)
-	if len(searched.Matches) != 1 {
-		t.Fatalf("unexpected search: %+v", searched)
-	}
-
-	frame := image.NewRGBA(image.Rect(0, 0, 3, 2))
-	frame.Set(1, 1, color.RGBA{R: 255, A: 255})
-	var encoded bytes.Buffer
-	if err := png.Encode(&encoded, frame); err != nil {
-		t.Fatal(err)
-	}
-	imagePath := filepath.Join(root, "figure.png")
-	if err := os.WriteFile(imagePath, encoded.Bytes(), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	imageResult := callOK(t, session, "image_read", map[string]any{"path": imagePath})
-	if len(imageResult.Content) == 0 {
-		t.Fatal("image tool returned no content")
-	}
-	content, ok := imageResult.Content[0].(*mcp.ImageContent)
-	if !ok || content.MIMEType != "image/png" || !bytes.Equal(content.Data, encoded.Bytes()) {
-		t.Fatalf("unexpected image content: %#v", imageResult.Content[0])
-	}
-
-	processResultRaw := callOK(t, session, "process_run", map[string]any{"program": "go", "args": []string{"version"}, "directory": root})
-	var processResult runtimeprocess.Result
-	decodeStructured(t, processResultRaw, &processResult)
-	if processResult.ExitCode != 0 || !strings.Contains(processResult.Stdout, "go version") || processResult.Directory != root {
-		t.Fatalf("unexpected process result: %+v", processResult)
-	}
-
-	status := callOK(t, session, "browser_status", map[string]any{})
-	var browserStatus browser.Status
-	decodeStructured(t, status, &browserStatus)
-	if browserStatus.Configured {
-		t.Fatalf("test bridge should be unconfigured: %+v", browserStatus)
-	}
-}
-
-func connect(t *testing.T) *mcp.ClientSession {
-	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	bridge, err := browser.Start(ctx, config.Browser{})
+	t.Cleanup(func() { _ = br.Close(context.Background()) })
+	ctrl := computer.New(ctx)
+	t.Cleanup(func() { _ = ctrl.Close() })
+	capDir := t.TempDir()
+	reg, err := capability.Load(capDir, br)
 	if err != nil {
 		t.Fatal(err)
 	}
-	serverTransport, clientTransport := mcp.NewInMemoryTransports()
-	processes := runtimeprocess.NewManager(ctx)
-	go func() {
-		_ = New(Dependencies{Process: processes, Filesystem: filesystem.New(), Browser: bridge}).Run(ctx, serverTransport)
-	}()
-	client := mcp.NewClient(&mcp.Implementation{Name: "lrmcp-test", Version: Version}, nil)
-	session, err := client.Connect(ctx, clientTransport, nil)
+	fsSvc := filesystem.New()
+	eng := jsrt.NewEngine(ctx, jsrt.Dependencies{
+		Process:      procMgr,
+		Filesystem:   fsSvc,
+		Browser:      br,
+		Computer:     ctrl,
+		Capabilities: reg,
+		LocalApps:    true,
+	})
+	t.Cleanup(eng.Close)
+
+	managed := NewManaged(Dependencies{
+		Runtime:      eng,
+		Process:      procMgr,
+		Filesystem:   fsSvc,
+		Browser:      br,
+		Computer:     ctrl,
+		Capabilities: reg,
+		Audit:        store,
+		Wire:         "local",
+		LocalApps:    true,
+		ReadOnly:     readOnly,
+	})
+
+	cSide, sSide := mcp.NewInMemoryTransports()
+	if _, err := managed.Server.Connect(ctx, sSide, nil); err != nil {
+		t.Fatal(err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-agent", Version: "1"}, nil)
+	sess, err := client.Connect(ctx, cSide, nil)
 	if err != nil {
-		cancel()
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = session.Close(); cancel(); _ = bridge.Close(context.Background()); _ = processes.Close() })
-	return session
+	t.Cleanup(func() { _ = sess.Close() })
+	return sess, managed
 }
 
-func callOK(t *testing.T, session *mcp.ClientSession, name string, arguments map[string]any) *mcp.CallToolResult {
+func decodeStructured(t *testing.T, res *mcp.CallToolResult, target any) {
 	t.Helper()
-	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: name, Arguments: arguments})
-	if err != nil || result.IsError {
-		t.Fatalf("%s failed: err=%v result=%+v", name, err, result)
-	}
-	return result
-}
-
-func decodeStructured(t *testing.T, result *mcp.CallToolResult, output any) {
-	t.Helper()
-	data, err := json.Marshal(result.StructuredContent)
+	b, err := json.Marshal(res.StructuredContent)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(data, output); err != nil {
+	if err := json.Unmarshal(b, target); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestAuditMiddlewareRecordsToolsImagesNotesAndTokenPolicy(t *testing.T) {
+func callOK(t *testing.T, sess *mcp.ClientSession, name string, args map[string]any) *mcp.CallToolResult {
+	t.Helper()
+	res, err := sess.CallTool(context.Background(), &mcp.CallToolParams{Name: name, Arguments: args})
+	if err != nil {
+		t.Fatalf("CallTool(%s) transport error: %v", name, err)
+	}
+	if res.IsError {
+		t.Fatalf("CallTool(%s) returned error: %+v", name, res.Content)
+	}
+	return res
+}
+
+func TestMinimalFourPrimitiveCatalog(t *testing.T) {
+	sess, _ := testSession(t, nil, false)
+	listed, err := sess.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{
+		"run":                true,
+		"wait":               true,
+		"session":            true,
+		"capability_propose": true,
+	}
+	if len(listed.Tools) != len(want) {
+		names := make([]string, len(listed.Tools))
+		for i, tl := range listed.Tools {
+			names[i] = tl.Name
+		}
+		t.Fatalf("expected exactly 4 orthogonal primitives %v, got %d: %v", want, len(listed.Tools), names)
+	}
+	for _, tl := range listed.Tools {
+		if !want[tl.Name] {
+			t.Fatalf("unexpected tool in v18 catalog: %s", tl.Name)
+		}
+	}
+}
+
+func TestRunDualStateSummaryImagesAndAudit(t *testing.T) {
 	store, err := audit.Open("")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = store.Close() })
+	defer store.Close()
+	sess, _ := testSession(t, store, false)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	bridge, err := browser.Start(ctx, config.Browser{})
+	// Open named task session
+	sRes := callOK(t, sess, "session", map[string]any{
+		"action":  "start",
+		"title":   "多工具并行巡检",
+		"message": "启动任务线",
+	})
+	var sOut sessionOutput
+	b, _ := json.Marshal(sRes.StructuredContent)
+	_ = json.Unmarshal(b, &sOut)
+	if !sOut.Recorded || sOut.SessionID == "" {
+		t.Fatalf("unexpected session start output: %+v", sOut)
+	}
+
+	// Prepare test file & PNG image
+	dir := t.TempDir()
+	imgPath := filepath.Join(dir, "dot.png")
+	im := image.NewRGBA(image.Rect(0, 0, 4, 4))
+	im.Set(1, 1, color.RGBA{G: 200, A: 255})
+	var buf bytes.Buffer
+	_ = png.Encode(&buf, im)
+	_ = os.WriteFile(imgPath, buf.Bytes(), 0o600)
+
+	// Call `run` with dual-state title -> done_title and native ImageContent emission
+	runRes := callOK(t, sess, "run", map[string]any{
+		"title":      "正在读写测试文件并输出图片",
+		"done_title": "已完成测试文件校验与图片输出",
+		"code": `
+			const f = ` + "`" + filepath.ToSlash(filepath.Join(dir, "a.txt")) + "`" + `;
+			const p = ` + "`" + filepath.ToSlash(imgPath) + "`" + `;
+			await fs.write(f, "hello v18\n", { mode: "create" });
+			const [rd, shot] = await Promise.all([fs.read(f), img.read(p)]);
+			emitImage(shot, "dot");
+			return { text: rd.content.trim(), w: shot.width };
+		`,
+	})
+	hasImage := false
+	for _, c := range runRes.Content {
+		if ic, ok := c.(*mcp.ImageContent); ok && ic.MIMEType == "image/png" && len(ic.Data) > 0 {
+			hasImage = true
+		}
+	}
+	if !hasImage {
+		t.Fatalf("expected native MCP ImageContent from emitImage inside run")
+	}
+
+	// Verify audit recorded done_title and image blob under the active task session
+	events, err := store.ListEvents(audit.EventFilter{SessionID: sOut.SessionID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	processes := runtimeprocess.NewManager(ctx)
-	t.Cleanup(func() { _ = bridge.Close(context.Background()); _ = processes.Close() })
+	foundRun := false
+	for _, ev := range events {
+		if ev.ToolName == "run" {
+			foundRun = true
+			if ev.Summary != "已完成测试文件校验与图片输出" {
+				t.Fatalf("expected done_title flip in audit summary, got %q", ev.Summary)
+			}
+			if ev.ImageBlob == "" {
+				t.Fatalf("expected emitted image persisted to audit blob store")
+			}
+		}
+	}
+	if !foundRun {
+		t.Fatalf("missing audited run event under session %s: %+v", sOut.SessionID, events)
+	}
 
-	managed := NewManaged(Dependencies{
-		Process:    processes,
-		Filesystem: filesystem.New(),
-		Browser:    bridge,
-		Audit:      store,
-		Wire:       "cloudflare",
+	// Finish session cleanly
+	callOK(t, sess, "session", map[string]any{
+		"action":  "done",
+		"message": "任务完成",
 	})
-	sSide, cSide := mcp.NewInMemoryTransports()
-	go func() {
-		reqCtx := audit.WithCallMeta(ctx, audit.CallMeta{
-			Wire:    "cloudflare",
-			AgentID: "astra-1",
-		})
-		_ = managed.Server.Run(reqCtx, sSide)
-	}()
-	session, err := mcp.NewClient(&mcp.Implementation{Name: "dot-cloud", Version: "1"}, nil).Connect(ctx, cSide, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer session.Close()
-
-	// Normal tool call is audited automatically.
-	callOK(t, session, "browser_status", map[string]any{})
-	// agent_report records a note event and updates session title without double tool_call entry.
-	callOK(t, session, "agent_report", map[string]any{
-		"title":   "核对课程通知",
-		"message": "已完成浏览器连接检查，准备拉取页面。",
-		"status":  "working",
-	})
-
-	events, err := store.ListEvents(audit.EventFilter{SessionID: "cloudflare:astra-1", Limit: 20})
-	if err != nil || len(events) != 2 {
-		t.Fatalf("expected 2 audited events (1 tool_call + 1 note), got %d (%v): %+v", len(events), err, events)
-	}
-	if events[0].Kind != "tool_call" || events[0].ToolName != "browser_status" || events[0].Status != "ok" {
-		t.Fatalf("unexpected tool event: %+v", events[0])
-	}
-	if events[1].Kind != "note" || !strings.Contains(events[1].Summary, "拉取页面") {
-		t.Fatalf("unexpected note event: %+v", events[1])
-	}
 	sessions, err := store.ListSessions(10)
-	if err != nil || len(sessions) != 1 || sessions[0].Title != "核对课程通知" || sessions[0].ToolCount != 1 {
-		t.Fatalf("unexpected sessions: %+v (%v)", sessions, err)
+	if err != nil || len(sessions) == 0 || sessions[0].Status != "done" {
+		t.Fatalf("expected session status=done, got %+v err=%v", sessions, err)
 	}
 }
 
-func TestPersistentConnectionCanOpenMultipleTaskSessionsUnderOneAgent(t *testing.T) {
-	store, err := audit.Open("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	bridge, err := browser.Start(ctx, config.Browser{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	processes := runtimeprocess.NewManager(ctx)
-	t.Cleanup(func() { _ = bridge.Close(context.Background()); _ = processes.Close() })
-
-	managed := NewManaged(Dependencies{
-		Process:    processes,
-		Filesystem: filesystem.New(),
-		Browser:    bridge,
-		Audit:      store,
-		Wire:       "local",
+func TestRunWaitAndReadOnlyGuard(t *testing.T) {
+	sess, _ := testSession(t, nil, false)
+	r1 := callOK(t, sess, "run", map[string]any{
+		"title":    "后台等待测试",
+		"yield_ms": 40,
+		"code":     `await sleep(160); return "ok-async";`,
 	})
-	sSide, cSide := mcp.NewInMemoryTransports()
-	go func() {
-		reqCtx := audit.WithCallMeta(ctx, audit.CallMeta{
-			Wire:      "local",
-			AgentID:   "codex-1",
-			SessionID: "local:stdio-conn1",
-		})
-		_ = managed.Server.Run(reqCtx, sSide)
-	}()
-	session, err := mcp.NewClient(&mcp.Implementation{Name: "codex", Version: "1"}, nil).Connect(ctx, cSide, nil)
+	var c1 jsrt.CellResult
+	b1, _ := json.Marshal(r1.StructuredContent)
+	_ = json.Unmarshal(b1, &c1)
+	if c1.Status != "running" || c1.CellID == "" {
+		t.Fatalf("expected running cell_id, got %+v", c1)
+	}
+	r2 := callOK(t, sess, "wait", map[string]any{"cell_id": c1.CellID, "yield_ms": 2000})
+	var c2 jsrt.CellResult
+	b2, _ := json.Marshal(r2.StructuredContent)
+	_ = json.Unmarshal(b2, &c2)
+	if c2.Status != "done" || c2.Value != "ok-async" {
+		t.Fatalf("expected wait completion, got %+v", c2)
+	}
+
+	// Read-only server must reject mutations inside `run`
+	roSess, _ := testSession(t, nil, true)
+	roRes, err := roSess.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "run",
+		Arguments: map[string]any{
+			"title": "尝试越权写文件",
+			"code":  `await fs.write("` + filepath.ToSlash(filepath.Join(t.TempDir(), "x.txt")) + `", "nope", { mode: "create" });`,
+		},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer session.Close()
-
-	// Task 1 on default connection session
-	callOK(t, session, "agent_report", map[string]any{"title": "任务一：查状态", "message": "开始任务一"})
-	callOK(t, session, "browser_status", map[string]any{})
-
-	// Task 2: open a brand-new task session under the SAME codex-1 agent!
-	res2 := callOK(t, session, "agent_report", map[string]any{"new_session": true, "title": "任务二：巡检文件", "message": "切换到新任务"})
-	var rep2 agentReportOutput
-	decodeStructured(t, res2, &rep2)
-	if rep2.SessionID == "" || rep2.SessionID == "local:stdio-conn1" {
-		t.Fatalf("new_session did not allocate a fresh session ID: %+v", rep2)
+	if !roRes.IsError {
+		t.Fatalf("read-only run should have rejected fs.write")
 	}
-	// Subsequent tool call automatically lands in Task 2!
-	callOK(t, session, "browser_status", map[string]any{})
-
-	sessions, err := store.ListSessions(10)
-	if err != nil || len(sessions) != 2 {
-		t.Fatalf("expected 2 distinct task sessions under codex-1, got %d (%v): %+v", len(sessions), err, sessions)
-	}
-	for _, s := range sessions {
-		if s.AgentID != "codex-1" || s.ToolCount != 1 {
-			t.Fatalf("expected agent_id=codex-1 and tool_count=1 per task, got %+v", s)
-		}
+	raw, _ := json.Marshal(roRes.Content)
+	if !strings.Contains(string(raw), "read-only") {
+		t.Fatalf("expected read-only error message, got %s", raw)
 	}
 }

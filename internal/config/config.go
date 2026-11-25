@@ -144,8 +144,10 @@ type WebGrant struct {
 }
 
 type Browser struct {
-	Listen string `yaml:"listen,omitempty"`
-	Token  string `yaml:"token,omitempty"`
+	Listen         string   `yaml:"listen,omitempty"`
+	Token          string   `yaml:"token,omitempty"`
+	CDPEndpoints   []string `yaml:"cdp_endpoints,omitempty"`
+	DisableAutoCDP bool     `yaml:"disable_auto_cdp,omitempty"`
 }
 
 type OpenAI struct {

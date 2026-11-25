@@ -1,15 +1,13 @@
 # Local Runtime MCP
 
-[![CI](https://github.com/hicancan/local-runtime-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/hicancan/local-runtime-mcp/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/hicancan/local-runtime-mcp)](https://github.com/hicancan/local-runtime-mcp/releases/latest)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
-[![M8ven Verified](https://m8ven.ai/badge/mcp/hicancan/local-runtime-mcp?variant=verified)](https://m8ven.ai/mcp/hicancan/local-runtime-mcp)
 
 [English](README.md) · **简体中文**
 
-让 AI 客户端使用运行 `lrmcp` 的机器上的程序、文件、图像、浏览器配置文件和桌面。Local Runtime MCP 是一个统一常驻的本机能力内核，提供 **23 个核心内建 MCP 工具**（含只读零副作用的 `agent_report` 进度播报）、用于沉淀可复用网页工具（Web MCP）的 `capability_propose`，以及本机原生软件绑定（App MCP）。
+让本地与云端 AI 客户端通过 **4 个正交 MCP 原语**（`run`、`wait`、`session`、`capability_propose`）和内嵌有状态并发 JavaScript 编排引擎，统一接管运行 `lrmcp` 的机器：并发进程、原子文件、原生图片、完整浏览器自动化与 Chrome DevTools（含浏览器进程级 `Tracing.start`、Network/Console 缓冲、Emulation、CSS、HeapSnapshot、AX 增量 Diff 与语义定位器），以及 Windows UI Automation 原生桌面控制。
 
-`lrmcp` 与配套 Chromium 扩展抽象上是同一个双向双核运行时：唯一的用户会话常驻守护进程（`127.0.0.1:9317`）负责操作系统能力、内置纯 Go SQLite WAL + FTS5 高性能活动审计引擎（`lrmcp-audit.db`）与仅本机可访问的极简主权活动台（`lrmcp ui`），扩展桥（`127.0.0.1:9315`）接入多 Profile 浏览器环境并提供网页互联与 `L` 主权控制面板。所有本地 AI 客户端均作为无状态 `stdio` 薄代理并发接入；云端客户端（支持 OAuth 与 `grants.remote.tokens` 多客户端独立 Bearer Token 共存）通过 OpenAI Secure MCP Tunnel / Cloudflare Tunnel 像热插拔网线一样随时接入或断开，无需重启守护进程。见 [v17.0.0 发布说明](docs/releases/v17.0.0.md)。
+`lrmcp` 以单一用户会话常驻守护进程（`127.0.0.1:9317`）运行，内置纯 Go SQLite WAL + FTS5 审计引擎（`lrmcp-audit.db`）、仅本机可访问的活动台（`lrmcp ui`）、直连 `DevToolsActivePort` 的浏览器级 CDP 引擎与内嵌 Rust Windows UIA 工作器；配套轻量扩展（`127.0.0.1:9315`）已彻底剥离 `chrome.debugger`，仅负责网页互联（Web Bridge）、`L` 授权面板与原生标签组视觉归类。所有本地客户端作为无状态 `stdio` 薄代理并发接入；云端客户端通过 OpenAI / Cloudflare 隧道热插拔接入，零重启、零中断。详见 [v18.0.0 发布说明](docs/releases/v18.0.0.md)。
 
 不同进程会话、文件路径和浏览器标签页均可并发执行，共享文件和桌面物理输入遵循明确的资源协调规则。
 

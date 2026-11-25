@@ -1,2 +1,2 @@
 // Generated from package.json; do not edit.
-export const VERSION = "17.2.0";
+export const VERSION = "18.0.0";

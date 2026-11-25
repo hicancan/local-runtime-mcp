@@ -1,0 +1,276 @@
+package browser
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/hicancan/local-runtime-mcp/internal/config"
+	"golang.org/x/net/websocket"
+)
+
+func startMockCDPServer(t *testing.T) (*httptest.Server, string) {
+	t.Helper()
+	var mu sync.Mutex
+	targets := map[string]map[string]any{
+		"T1": {"targetId": "T1", "type": "page", "title": "Home", "url": "https://example.com"},
+	}
+	axCount := 0
+	var traceStreamData string
+
+	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		var writeMu sync.Mutex
+		sendJSON := func(v any) {
+			b, _ := json.Marshal(v)
+			writeMu.Lock()
+			_ = websocket.Message.Send(ws, string(b))
+			writeMu.Unlock()
+		}
+		for {
+			var raw string
+			if err := websocket.Message.Receive(ws, &raw); err != nil {
+				return
+			}
+			var req cdpRequest
+			if json.Unmarshal([]byte(raw), &req) != nil {
+				continue
+			}
+			var params map[string]any
+			if b, err := json.Marshal(req.Params); err == nil {
+				_ = json.Unmarshal(b, &params)
+			}
+			switch req.Method {
+			case "Browser.getVersion":
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"product": "Edg/158.0.0.0", "userAgent": "MockEdge/158"}})
+			case "Target.getTargets":
+				mu.Lock()
+				infos := make([]map[string]any, 0, len(targets))
+				for _, info := range targets {
+					infos = append(infos, info)
+				}
+				mu.Unlock()
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"targetInfos": infos}})
+			case "Target.createTarget":
+				u, _ := params["url"].(string)
+				mu.Lock()
+				id := "T_NEW_" + strings.ReplaceAll(u, "https://", "")
+				targets[id] = map[string]any{"targetId": id, "type": "page", "title": "Opened " + u, "url": u}
+				mu.Unlock()
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"targetId": id}})
+			case "Target.closeTarget":
+				tid, _ := params["targetId"].(string)
+				mu.Lock()
+				delete(targets, tid)
+				mu.Unlock()
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"success": true}})
+			case "Target.attachToTarget":
+				tid, _ := params["targetId"].(string)
+				sessID := "S_" + tid
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"sessionId": sessID}})
+			case "Network.enable":
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{}})
+				sendJSON(map[string]any{
+					"method":    "Network.requestWillBeSent",
+					"sessionId": req.SessionID,
+					"params": map[string]any{
+						"requestId": "req-1",
+						"type":      "Fetch",
+						"request":   map[string]any{"url": "https://example.com/api/data", "method": "GET"},
+					},
+				})
+				sendJSON(map[string]any{
+					"method":    "Network.responseReceived",
+					"sessionId": req.SessionID,
+					"params": map[string]any{
+						"requestId": "req-1",
+						"type":      "Fetch",
+						"response":  map[string]any{"status": 200, "statusText": "OK", "mimeType": "application/json"},
+					},
+				})
+			case "Runtime.enable":
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{}})
+				sendJSON(map[string]any{
+					"method":    "Runtime.consoleAPICalled",
+					"sessionId": req.SessionID,
+					"params": map[string]any{
+						"type": "warn",
+						"args": []map[string]any{{"type": "string", "value": "deprecation notice"}},
+					},
+				})
+			case "Network.getResponseBody":
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"body": `{"ok":true}`, "base64Encoded": false}})
+			case "Accessibility.getFullAXTree":
+				mu.Lock()
+				axCount++
+				n := axCount
+				mu.Unlock()
+				nodes := []map[string]any{
+					{"role": map[string]any{"value": "heading"}, "name": map[string]any{"value": "Welcome"}},
+					{"role": map[string]any{"value": "button"}, "name": map[string]any{"value": "Search"}, "backendDOMNodeId": 42},
+				}
+				if n >= 2 {
+					nodes = append(nodes, map[string]any{"role": map[string]any{"value": "StaticText"}, "name": map[string]any{"value": "3 results found"}})
+				}
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"nodes": nodes}})
+			case "DOM.getBoxModel":
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"model": map[string]any{"content": []float64{10, 10, 110, 10, 110, 50, 10, 50}}}})
+			case "Runtime.evaluate":
+				expr, _ := params["expression"].(string)
+				if expr == "document.readyState" {
+					sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"result": map[string]any{"value": "complete"}}})
+				} else {
+					sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"result": map[string]any{"value": "eval:" + expr}}})
+				}
+			case "Page.getLayoutMetrics":
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"visualViewport": map[string]any{"clientWidth": 800, "clientHeight": 600}}})
+			case "Page.captureScreenshot":
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"data": base64.StdEncoding.EncodeToString([]byte("fakepng"))}})
+			case "Tracing.start":
+				traceStreamData = `{"traceEvents":[{"name":"navigationStart","cat":"blink.user_timing","ph":"R","ts":1000000},{"name":"firstContentfulPaint","cat":"loading","ph":"R","ts":1250000},{"name":"largestContentfulPaint::Candidate","cat":"loading","ph":"R","ts":1450000},{"name":"RunTask","cat":"toplevel","ph":"X","ts":1500000,"dur":85000}]}`
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{}})
+			case "Tracing.end":
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{}})
+				sendJSON(map[string]any{"method": "Tracing.tracingComplete", "params": map[string]any{"stream": "stream-1"}})
+			case "IO.read":
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"data": traceStreamData, "eof": true}})
+			case "HeapProfiler.takeHeapSnapshot":
+				sendJSON(map[string]any{"method": "HeapProfiler.addHeapSnapshotChunk", "sessionId": req.SessionID, "params": map[string]any{"chunk": `{"snapshot":{"node_count":1}}`}})
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{}})
+			case "Debugger.setBreakpointByUrl":
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"breakpointId": "bp-1"}})
+			default:
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{}})
+			}
+		}
+	}))
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	return srv, wsURL
+}
+
+func TestBrowserLevelCDPEngineFullSuite(t *testing.T) {
+	srv, wsURL := startMockCDPServer(t)
+	defer srv.Close()
+
+	ctx := context.Background()
+	bridge, err := Start(ctx, config.Browser{
+		CDPEndpoints:   []string{wsURL},
+		DisableAutoCDP: true,
+	})
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer bridge.Close(ctx)
+
+	inst, err := bridge.Connect(ctx, "cdp-1")
+	if err != nil || !inst.Connected || inst.Browser != "MockEdge/158" {
+		t.Fatalf("Connect failed: %#v err=%v", inst, err)
+	}
+
+	// Tabs listing
+	tabs, err := bridge.Tabs(ctx, "cdp-1")
+	if err != nil || len(tabs) != 1 || tabs[0].URL != "https://example.com" {
+		t.Fatalf("unexpected tabs: %#v err=%v", tabs, err)
+	}
+	tabID := tabs[0].ID
+
+	// Snapshot 1 (full) + Snapshot 2 (incremental diff)
+	s1, err := bridge.SnapshotWithOptions(ctx, tabID, SnapshotOptions{Diff: true})
+	if err != nil || s1.Diff || !strings.Contains(s1.Text, "Welcome") {
+		t.Fatalf("unexpected s1: %#v err=%v", s1, err)
+	}
+	s2, err := bridge.SnapshotWithOptions(ctx, tabID, SnapshotOptions{Diff: true})
+	if err != nil || !s2.Diff || s2.AddedLines != 1 || !strings.Contains(s2.Text, "+ 3 results found") {
+		t.Fatalf("expected incremental AX diff (+1 line), got %#v err=%v", s2, err)
+	}
+
+	// Passive Network + NetworkBody + Console
+	time.Sleep(30 * time.Millisecond)
+	reqs, err := bridge.Network(ctx, tabID, NetworkFilter{})
+	if err != nil || len(reqs) != 1 || reqs[0].Status != 200 {
+		t.Fatalf("unexpected network entries: %#v err=%v", reqs, err)
+	}
+	body, err := bridge.NetworkBody(ctx, tabID, "req-1")
+	if err != nil || body.Body != `{"ok":true}` {
+		t.Fatalf("unexpected network body: %#v err=%v", body, err)
+	}
+	logs, err := bridge.Console(ctx, tabID, ConsoleFilter{})
+	if err != nil || len(logs) != 1 || logs[0].Level != "warn" {
+		t.Fatalf("unexpected console logs: %#v err=%v", logs, err)
+	}
+
+	// Semantic Locator click (zero snapshot ping-pong)
+	actRes, err := bridge.Act(ctx, Action{
+		TabID:   tabID,
+		Kind:    "click",
+		Locator: Locator{Role: "button", Name: "Search", Exact: true},
+	})
+	if err != nil || !actRes.Success {
+		t.Fatalf("semantic locator click failed: %#v err=%v", actRes, err)
+	}
+
+	// Browser-process-level Tracing.start / Tracing.stop + Web Vitals parsing
+	tmpDir := t.TempDir()
+	tracePath := filepath.Join(tmpDir, "perf.json")
+	if err := bridge.TraceStart(ctx, TraceStartOptions{BrowserID: "cdp-1"}); err != nil {
+		t.Fatalf("TraceStart failed: %v", err)
+	}
+	summary, err := bridge.TraceStop(ctx, "cdp-1", tracePath)
+	if err != nil {
+		t.Fatalf("TraceStop failed: %v", err)
+	}
+	if summary.EventCount != 4 || summary.LongTaskCount != 1 || summary.LCPMS == nil || *summary.LCPMS != 450 {
+		t.Fatalf("unexpected trace summary: %#v", summary)
+	}
+	if _, err := os.Stat(tracePath); err != nil {
+		t.Fatalf("trace file missing: %v", err)
+	}
+
+	// Emulate + HeapSnapshot + Logpoint + RawCDP
+	if err := bridge.Emulate(ctx, tabID, EmulateOptions{Width: 390, Height: 844, Mobile: true, NetworkPreset: "Fast 3G", ColorScheme: "dark"}); err != nil {
+		t.Fatalf("Emulate failed: %v", err)
+	}
+	heapPath := filepath.Join(tmpDir, "mem.heapsnapshot")
+	heapRes, err := bridge.HeapSnapshot(ctx, tabID, heapPath)
+	if err != nil || heapRes.Bytes == 0 {
+		t.Fatalf("HeapSnapshot failed: %#v err=%v", heapRes, err)
+	}
+	bpID, err := bridge.Logpoint(ctx, tabID, "https://example.com/app.js", 12, 0, "user.id")
+	if err != nil || bpID != "bp-1" {
+		t.Fatalf("Logpoint failed: %q err=%v", bpID, err)
+	}
+	rawRes, err := bridge.RawCDP(ctx, "cdp-1", "", "Browser.getVersion", nil)
+	if err != nil || rawRes == nil {
+		t.Fatalf("RawCDP failed: %#v err=%v", rawRes, err)
+	}
+
+	// Concurrent Open + MarkHandoff + CleanupSessionTabs
+	tA, err := bridge.OpenWithOptions(ctx, OpenOptions{BrowserID: "cdp-1", URL: "https://a.test", SessionID: "s1"})
+	if err != nil {
+		t.Fatalf("Open A failed: %v", err)
+	}
+	tB, err := bridge.OpenWithOptions(ctx, OpenOptions{BrowserID: "cdp-1", URL: "https://b.test", SessionID: "s1"})
+	if err != nil {
+		t.Fatalf("Open B failed: %v", err)
+	}
+	if err := bridge.MarkHandoff(tA.ID); err != nil {
+		t.Fatalf("MarkHandoff failed: %v", err)
+	}
+	if closed := bridge.CleanupSessionTabs(ctx, "s1"); closed != 1 {
+		t.Fatalf("expected 1 temp tab closed (B) and 1 handed-off tab kept (A), closed=%d", closed)
+	}
+	remaining, _ := bridge.Tabs(ctx, "cdp-1")
+	for _, rt := range remaining {
+		if rt.ID == tB.ID {
+			t.Fatalf("temp tab B should have been closed")
+		}
+	}
+	_ = http.StatusOK
+}

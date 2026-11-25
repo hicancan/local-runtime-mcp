@@ -81,7 +81,7 @@ func (b *Bridge) receiveWeb(writer http.ResponseWriter, request *http.Request) {
 		http.Error(writer, "web capability access is not enabled by the owner", http.StatusForbidden)
 		return
 	}
-	if old, exists := b.tabs[envelope.Source.TabID]; exists && (old.browserID != envelope.InstanceID || old.bootID != envelope.BootID) {
+	if old, exists := b.extTabs[envelope.Source.TabID]; exists && (old.browserID != envelope.InstanceID || old.bootID != envelope.BootID) {
 		b.mu.Unlock()
 		http.Error(writer, "sender tab belongs to a different browser generation", http.StatusConflict)
 		return
@@ -92,10 +92,22 @@ func (b *Bridge) receiveWeb(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	b.webActive++
-	b.tabs[envelope.Source.TabID] = tabRoute{envelope.InstanceID, envelope.BootID}
+	b.extTabs[envelope.Source.TabID] = tabRoute{envelope.InstanceID, envelope.BootID}
 	b.mu.Unlock()
 	defer func() { b.mu.Lock(); b.webActive--; b.mu.Unlock() }()
-	envelope.Source.BrowserID = envelope.InstanceID
+	// Route web-initiated capability calls through the active CDP browser engine.
+	cdpBrowserID := ""
+	for _, inst := range b.Status().Instances {
+		if inst.Connected {
+			cdpBrowserID = inst.BrowserID
+			break
+		}
+	}
+	if cdpBrowserID != "" {
+		envelope.Source.BrowserID = cdpBrowserID
+	} else {
+		envelope.Source.BrowserID = envelope.InstanceID
+	}
 	ctx, cancel := context.WithTimeout(request.Context(), 10*time.Minute)
 	defer cancel()
 	writer.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")

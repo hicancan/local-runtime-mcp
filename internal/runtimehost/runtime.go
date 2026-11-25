@@ -14,6 +14,7 @@ import (
 	"github.com/hicancan/local-runtime-mcp/internal/computer"
 	"github.com/hicancan/local-runtime-mcp/internal/config"
 	"github.com/hicancan/local-runtime-mcp/internal/filesystem"
+	"github.com/hicancan/local-runtime-mcp/internal/jsrt"
 	"github.com/hicancan/local-runtime-mcp/internal/mcpserver"
 	runtimeprocess "github.com/hicancan/local-runtime-mcp/internal/process"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -53,6 +54,8 @@ type Host struct {
 	httpServer        *mcpserver.Managed
 	openaiServer      *mcpserver.Managed
 	localServer       *mcpserver.Managed
+	remoteRuntime     *jsrt.Engine
+	localRuntime      *jsrt.Engine
 	audit             *audit.Store
 	bridge            *browser.Bridge
 	controller        computer.Controller
@@ -125,7 +128,25 @@ func Start(ctx context.Context, cfg *config.Config) (*Host, error) {
 	processes := runtimeprocess.NewManager(ctx)
 	fs := filesystem.New()
 
+	remoteRT := jsrt.NewEngine(ctx, jsrt.Dependencies{
+		Process:      processes,
+		Filesystem:   fs,
+		Browser:      bridge,
+		Computer:     controller,
+		Capabilities: registry,
+		LocalApps:    false,
+	})
+	localRT := jsrt.NewEngine(ctx, jsrt.Dependencies{
+		Process:      processes,
+		Filesystem:   fs,
+		Browser:      bridge,
+		Computer:     controller,
+		Capabilities: registry,
+		LocalApps:    true,
+	})
+
 	baseDeps := mcpserver.Dependencies{
+		Runtime:      remoteRT,
 		Process:      processes,
 		Filesystem:   fs,
 		Browser:      bridge,
@@ -136,16 +157,19 @@ func Start(ctx context.Context, cfg *config.Config) (*Host, error) {
 	httpDeps := baseDeps
 	httpDeps.Wire = "http"
 	httpDeps.LocalApps = false
+	httpDeps.ReadOnly = cfg.Grants.Remote.HTTP.ReadOnly
 	httpDeps.Filter = remoteFilter(cfg.Grants.Remote.HTTP)
 	httpServer := mcpserver.NewManaged(httpDeps)
 
 	openaiDeps := baseDeps
 	openaiDeps.Wire = "openai"
 	openaiDeps.LocalApps = false
+	openaiDeps.ReadOnly = cfg.Grants.Remote.OpenAI.ReadOnly
 	openaiDeps.Filter = remoteFilter(cfg.Grants.Remote.OpenAI)
 	openaiServer := mcpserver.NewManaged(openaiDeps)
 
 	localDeps := baseDeps
+	localDeps.Runtime = localRT
 	localDeps.Wire = "local"
 	localDeps.LocalApps = true
 	localServer := mcpserver.NewManaged(localDeps)
@@ -161,6 +185,8 @@ func Start(ctx context.Context, cfg *config.Config) (*Host, error) {
 	machine, err := connectMachineTools(ctx, machineServer)
 	if err != nil {
 		cancel()
+		remoteRT.Close()
+		localRT.Close()
 		_ = bridge.Close(context.Background())
 		_ = auditStore.Close()
 		return nil, err
@@ -168,9 +194,9 @@ func Start(ctx context.Context, cfg *config.Config) (*Host, error) {
 	grants := newGrantStore(cfg.Grants.Web, cfg.Grants.Remote, cfg.Path, registry, machine, controller, auditStore, func(target string, rg config.RemoteGrant) {
 		switch target {
 		case "openai":
-			openaiServer.SetFilter(remoteFilter(rg))
+			openaiServer.SetFilter(remoteFilter(rg), rg.ReadOnly)
 		case "http":
-			httpServer.SetFilter(remoteFilter(rg))
+			httpServer.SetFilter(remoteFilter(rg), rg.ReadOnly)
 		}
 	})
 	if err := grants.checkAll(grants.bySite); err != nil {
@@ -205,6 +231,8 @@ func Start(ctx context.Context, cfg *config.Config) (*Host, error) {
 		httpServer:        httpServer,
 		openaiServer:      openaiServer,
 		localServer:       localServer,
+		remoteRuntime:     remoteRT,
+		localRuntime:      localRT,
 		audit:             auditStore,
 		bridge:            bridge,
 		controller:        controller,
@@ -337,9 +365,20 @@ func (h *Host) CapabilitiesSummary() CapabilitySummary {
 // StartedAt returns the timestamp when the Host started.
 func (h *Host) StartedAt() time.Time { return h.startedAt }
 
+// ConnectBrowser connects (or reconnects) a discovered Chromium CDP instance.
+func (h *Host) ConnectBrowser(ctx context.Context, browserID string) (browser.InstanceStatus, error) {
+	return h.bridge.Connect(ctx, browserID)
+}
+
 func (h *Host) Close(ctx context.Context) error {
 	h.closeOnce.Do(func() {
 		h.cancel()
+		if h.remoteRuntime != nil {
+			h.remoteRuntime.Close()
+		}
+		if h.localRuntime != nil {
+			h.localRuntime.Close()
+		}
 		h.closeErr = errors.Join(h.bridge.Close(ctx), h.controller.Close(), h.processes.Close(), h.audit.Close())
 	})
 	return h.closeErr

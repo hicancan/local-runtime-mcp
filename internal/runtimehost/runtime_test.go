@@ -34,17 +34,21 @@ func TestConcurrentClientsShareHostButNotResponseIdentity(t *testing.T) {
 	for index, session := range []*mcp.ClientSession{a, b} {
 		go func(index int, session *mcp.ClientSession) {
 			name := []string{"A.txt", "B.txt"}[index]
-			result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "filesystem_write_text", Arguments: map[string]any{
-				"path": filepath.Join(directory, name), "content": name, "mode": "create",
+			target := filepath.ToSlash(filepath.Join(directory, name))
+			result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "run", Arguments: map[string]any{
+				"title": "Write " + name,
+				"code":  `return await fs.write("` + target + `", "` + name + `", { mode: "create" });`,
 			}})
 			if err == nil && result.IsError {
 				err = &toolFailure{result}
 			}
 			if err == nil {
-				var written filesystem.TextWriteResult
+				var cell struct {
+					Value filesystem.TextWriteResult `json:"value"`
+				}
 				data, _ := json.Marshal(result.StructuredContent)
-				err = json.Unmarshal(data, &written)
-				if err == nil && written.Path != filepath.Join(directory, name) {
+				err = json.Unmarshal(data, &cell)
+				if err == nil && cell.Value.Path != filepath.Join(directory, name) {
 					err = &toolFailure{result}
 				}
 			}
@@ -58,7 +62,7 @@ func TestConcurrentClientsShareHostButNotResponseIdentity(t *testing.T) {
 	}
 	_ = a.Close()
 	tools, err := b.ListTools(ctx, nil)
-	if err != nil || len(tools.Tools) != 23 {
+	if err != nil || len(tools.Tools) != 3 {
 		t.Fatalf("remaining client: count=%v err=%v", tools, err)
 	}
 }

@@ -1,15 +1,13 @@
 # Local Runtime MCP
 
-[![CI](https://github.com/hicancan/local-runtime-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/hicancan/local-runtime-mcp/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/hicancan/local-runtime-mcp)](https://github.com/hicancan/local-runtime-mcp/releases/latest)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
-[![M8ven Verified](https://m8ven.ai/badge/mcp/hicancan/local-runtime-mcp?variant=verified)](https://m8ven.ai/mcp/hicancan/local-runtime-mcp)
 
 **English** · [简体中文](README.zh-CN.md)
 
-Give AI clients the programs, files, images, browser profiles, and desktop of the machine running `lrmcp`. Local Runtime MCP is a unified personal capability runtime with **23 core built-in MCP tools** (including `agent_report` live progress notes), `capability_propose` for distilling reusable webpage tools (Web MCP), and owner-authored local app bindings (App MCP).
+Give local and cloud AI clients unified, concurrent control over the machine running `lrmcp` — processes, atomic files, native images, full browser automation + Chrome DevTools (including browser-process-level `Tracing.start`), and Windows UI Automation desktop control — through **4 orthogonal MCP primitives** (`run`, `wait`, `session`, `capability_propose`) backed by an embedded stateful JavaScript orchestration engine.
 
-`lrmcp` and its paired Chromium extension form one bidirectional dual-core runtime: one persistent user-session daemon owns the OS side (`127.0.0.1:9317`), an embedded pure-Go SQLite WAL + FTS5 audit engine (`lrmcp-audit.db`), and the local-only Sovereign Activity Studio (`lrmcp ui`), while bridging multiple Chromium profiles (`127.0.0.1:9315`). Every local client attaches concurrently over stateless `stdio` thin proxies; remote cloud clients (OAuth or named per-client Bearer tokens under `grants.remote.tokens`) plug and unplug live through OpenAI Secure MCP Tunnel or Cloudflare Tunnel with zero daemon restarts and per-wire remote grants (`grants.remote`). See [v17.0.0 release notes](docs/releases/v17.0.0.md).
+`lrmcp` runs as one persistent user-session Go daemon (`127.0.0.1:9317`) with an embedded SQLite WAL + FTS5 audit store (`lrmcp-audit.db`), local-only Activity Studio (`lrmcp ui`), native browser-level CDP connections (via `DevToolsActivePort` or `browser.cdp_endpoints`), an embedded Rust Windows UIA worker, and a slim companion extension (`127.0.0.1:9315`) strictly for Web-to-Local capabilities, the owner `L` grants panel, and visual Tab Groups (zero `chrome.debugger`). Local clients attach concurrently over stateless `stdio` thin proxies; remote clients connect live through OpenAI Secure MCP Tunnel or Cloudflare Tunnel with zero daemon restarts. See [v18.0.0 release notes](docs/releases/v18.0.0.md).
 
 Independent process sessions, filesystem paths, and browser tabs run concurrently; shared files and desktop physical input have explicit coordination rules.
 

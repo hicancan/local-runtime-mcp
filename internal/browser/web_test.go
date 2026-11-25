@@ -2,6 +2,7 @@ package browser
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,7 +11,55 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hicancan/local-runtime-mcp/internal/config"
+	"golang.org/x/net/websocket"
 )
+
+const testWebToken = "0123456789abcdef0123456789abcdef"
+
+func testBridge(t *testing.T) (*Bridge, context.Context) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	b, err := Start(ctx, config.Browser{Listen: "127.0.0.1:0", Token: testWebToken, DisableAutoCDP: true})
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cancel(); _ = b.Close(context.Background()) })
+	return b, ctx
+}
+
+func peer(id, boot string) Peer {
+	return Peer{InstanceID: id, BootID: boot, Label: "Test", Browser: "TestBrowser", ExtensionVersion: ExtensionVersion}
+}
+
+func register(t *testing.T, b *Bridge, p Peer) {
+	t.Helper()
+	b.mu.Lock()
+	b.instances[p.InstanceID] = &instance{
+		peer:     p,
+		lastSeen: time.Now(),
+		commands: make(chan command, 8),
+		controls: make(chan command, 8),
+		socket:   &websocket.Conn{},
+	}
+	b.mu.Unlock()
+}
+
+func postBridge(ctx context.Context, b *Bridge, endpoint string, body any) (*http.Response, error) {
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+b.Status().Address+"/v1/"+endpoint, bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+testWebToken)
+	req.Header.Set("Content-Type", "application/json")
+	return (&http.Client{Transport: &http.Transport{Proxy: nil}}).Do(req)
+}
 
 type testWebCodedError struct{}
 

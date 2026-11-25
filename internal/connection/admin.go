@@ -93,6 +93,7 @@ func newStudio(
 		ApproveProposal: host.ApproveProposal,
 		RejectProposal:  host.RejectProposal,
 		KickSession:     kickSession,
+		ConnectBrowser:  host.ConnectBrowser,
 	})
 }
 

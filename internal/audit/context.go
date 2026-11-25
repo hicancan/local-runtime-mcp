@@ -17,6 +17,7 @@ type CallMeta struct {
 	AgentID    string
 	SessionID  string
 	ClientName string
+	ReadOnly   bool
 	Policy     ToolPolicy
 }
 

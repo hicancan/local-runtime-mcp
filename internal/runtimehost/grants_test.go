@@ -207,8 +207,8 @@ func TestRemoteGrantsLiveFilterAndExtensionTunnelControls(t *testing.T) {
 	t.Cleanup(func() { _ = session.Close() })
 
 	full, err := session.ListTools(ctx, nil)
-	if err != nil || len(full.Tools) != 23 {
-		t.Fatalf("expected 23 remote tools initially, got %d (%v)", len(full.Tools), err)
+	if err != nil || len(full.Tools) != 3 {
+		t.Fatalf("expected 3 remote core tools initially (run, wait, session), got %d (%v)", len(full.Tools), err)
 	}
 
 	// Switch OpenAI remote wire to read-only via the extension grant handler.
@@ -216,16 +216,19 @@ func TestRemoteGrantsLiveFilterAndExtensionTunnelControls(t *testing.T) {
 		t.Fatal(err)
 	}
 	ro, err := session.ListTools(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || len(ro.Tools) != 3 {
+		t.Fatalf("expected 3 read-only-capable tools, got %d (%v)", len(ro.Tools), err)
 	}
-	if len(ro.Tools) == 0 || len(ro.Tools) >= 23 {
-		t.Fatalf("expected read-only subset, got %d tools", len(ro.Tools))
-	}
-	for _, tool := range ro.Tools {
-		if tool.Name == "process_run" || tool.Name == "filesystem_write_text" || tool.Name == "computer_action" || tool.Name == "browser_action" {
-			t.Fatalf("mutating tool %q leaked into read-only remote wire", tool.Name)
-		}
+	// Verify mutating SDK operation inside `run` is enforced as read-only!
+	mutRes, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "run",
+		Arguments: map[string]any{
+			"title": "Attempt write under read-only wire",
+			"code":  `await proc.run("echo", ["nope"]);`,
+		},
+	})
+	if err != nil || !mutRes.IsError {
+		t.Fatalf("mutating proc.run leaked through read-only remote wire: err=%v res=%+v", err, mutRes)
 	}
 
 	// Verify persistence in YAML.

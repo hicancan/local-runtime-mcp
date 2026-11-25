@@ -2,14 +2,14 @@
   "manifest_version": 3,
   "minimum_chrome_version": "120",
   "name": "__MSG_extName__",
-  "version": "17.2.0",
+  "version": "18.0.0",
   "description": "__MSG_extDescription__",
   "homepage_url": "https://github.com/hicancan/local-runtime-mcp",
   "permissions": [
-    "debugger",
     "alarms",
     "storage",
-    "tabs"
+    "tabs",
+    "tabGroups"
   ],
   "host_permissions": [
     "http://127.0.0.1/*",

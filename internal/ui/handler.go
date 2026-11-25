@@ -66,6 +66,7 @@ type Backend struct {
 	ApproveProposal func(name string) error
 	RejectProposal  func(name string) error
 	KickSession     func(sessionID string) bool
+	ConnectBrowser  func(ctx context.Context, browserID string) (browser.InstanceStatus, error)
 }
 
 // Studio serves /ui and /ui/api/* behind single-use bootstrap cookie auth.
@@ -408,6 +409,23 @@ func (s *Studio) registerRoutes() {
 			disconnected = s.backend.KickSession(req.SessionID)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "disconnected": disconnected})
+	})
+
+	s.mux.HandleFunc("POST /ui/api/browser/connect", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			BrowserID string `json:"browser_id"`
+		}
+		_ = decodeJSON(w, r, &req)
+		if s.backend.ConnectBrowser == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "browser_unavailable", "Browser CDP engine is unavailable.")
+			return
+		}
+		inst, err := s.backend.ConnectBrowser(r.Context(), req.BrowserID)
+		if err != nil {
+			writeJSONError(w, http.StatusUnprocessableEntity, "browser_connect_failed", err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"instance": inst})
 	})
 }
 

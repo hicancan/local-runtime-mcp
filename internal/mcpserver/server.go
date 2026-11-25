@@ -3,7 +3,9 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -12,7 +14,7 @@ import (
 	"github.com/hicancan/local-runtime-mcp/internal/capability"
 	"github.com/hicancan/local-runtime-mcp/internal/computer"
 	"github.com/hicancan/local-runtime-mcp/internal/filesystem"
-	runtimeimage "github.com/hicancan/local-runtime-mcp/internal/image"
+	"github.com/hicancan/local-runtime-mcp/internal/jsrt"
 	runtimeprocess "github.com/hicancan/local-runtime-mcp/internal/process"
 	"github.com/hicancan/local-runtime-mcp/internal/version"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -20,7 +22,19 @@ import (
 
 const Version = version.Version
 
-const instructions = "Local Runtime MCP exposes the machine where lrmcp is running. Filesystem and image tools accept direct absolute paths or paths relative to the server process. Create new text paths with mode=create; replace or patch only an expected SHA-256 version. Process tools execute installed programs directly without shell parsing and return independent sessions for longer programs. Pass the last successfully received output_cursor to process_continue for incremental output. Omit it or use zero to reread the retained output; reads do not consume data. After a lost response, retry a read-only continue using the same cursor. Do not automatically repeat process_run, stdin, resize, or terminate after an uncertain response. Completed async sessions remain readable for up to ten minutes, subject to session capacity. Process duration_ms is elapsed time while running and fixed after exit. Browser tools use the bundled Chromium extension: discover online instances with browser_status, select their browser_id for tabs/open, and use the returned opaque tab_id for all existing-tab operations. Read page content with browser_snapshot. New tabs are inactive by default. Computer tools see every display and window: computer_targets lists them, computer_state observes pixels and a window's UI Automation tree, computer_wait waits for an element. Prefer semantic computer_action kinds and place: they operate controls by ref_id without the pointer, keyboard or foreground, so the person at the computer is undisturbed. Physical input needs computer_control: acquire it, observe with its control_id, act on that exact state_id, and release it. Visible browser changes share the desktop gate and require the matching control_id while another task owns it. Independent process sessions, file paths, and background browser tabs can run concurrently; IDs route resources, not separate operating-system desktops or security tenants. Call agent_report periodically with short progress milestones so the owner can monitor long tasks in the local activity stream. Prefer browser tools for web pages, computer tools for native UI, and native image-content tools for images and screenshots. Source code is available under AGPL-3.0-only at https://github.com/hicancan/local-runtime-mcp."
+const instructions = `Local Runtime MCP (v18) exposes this machine through 4 orthogonal primitives:
+1. run(title, code, done_title?, yield_ms?, max_output_bytes?): Execute stateful async JavaScript in your session's persistent VM. Top-level variables & functions persist across turns. Parallelize independent I/O with await Promise.allSettled([...]). Always pass a concise human-readable title (and optional done_title) describing what this step does.
+   Built-in async SDK inside run:
+   - proc.run({ cmd, shell?, cwd?, max_output_tokens?, timeout_seconds? }) or proc.run(program, args, opts); proc.continue(opts); proc.kill(session_id)
+   - fs.list / fs.stat / fs.read / fs.write / fs.patch / fs.search (path-locked atomic writes with expected_sha256)
+   - browser.status / browser.connect / browser.tabs / browser.open(url, { browser_id?, active?, session_name? }) / browser.tab(id) / browser.cdp(method, params, browser_id?) / browser.traceStart / browser.traceStop / browser.cleanup
+     TabHandle: tab.goto / reload / back / forward / close / snapshot({ diff: true }) / screenshot / eval / cdp(method, params) / getByRole / getByText / getByLabel / getByPlaceholder / locator (with .click/.fill/.type/.press/.select/.check/.uploadFiles/.waitFor) / network / networkBody / console / emulate / css / heapSnapshot / logpoint / screencastStart / screencastStop / markHandoff()
+   - desktop.targets / desktop.state / desktop.wait / desktop.action / desktop.control('acquire'|'status'|'release')
+   - img.read(path, opts); emitImage(imgOrShotOrPath, label?) returns native MCP ImageContent
+   - caps.list() / caps.call(name, args, browser_id?, tab_id?); print(...); sleep(ms)
+2. wait(cell_id, yield_ms?, terminate?): Continue awaiting incremental output/images or cancel a running cell.
+3. session(action='start'|'update'|'done', title?, message?, status?, session_id?, agent_id?): Open a fresh named task thread (action='start'), post major milestones ('update'), or finish and reclaim temporary browser tabs ('done').
+4. capability_propose(name, definition, script): Propose a reusable owner-approved site tool.`
 
 // ToolFilter reports whether a tool with the given name and side-effect hints
 // should be visible and callable on this MCP server.
@@ -28,6 +42,7 @@ type ToolFilter func(name string, readOnly, destructive bool) bool
 
 // Dependencies are owned by the Runtime Host, never by a client connection.
 type Dependencies struct {
+	Runtime      *jsrt.Engine
 	Process      *runtimeprocess.Manager
 	Filesystem   *filesystem.Service
 	Browser      *browser.Bridge
@@ -36,6 +51,7 @@ type Dependencies struct {
 	Audit        *audit.Store
 	Wire         string
 	LocalApps    bool
+	ReadOnly     bool
 	Filter       ToolFilter
 }
 
@@ -46,10 +62,12 @@ type Managed struct {
 
 	mu         sync.Mutex
 	wire       string
+	readOnly   bool
 	filter     ToolFilter
 	registered map[string]string
 	static     []toolSpec
 	registry   *capability.Registry
+	runtime    *jsrt.Engine
 
 	taskMu      sync.RWMutex
 	activeTasks map[string]string
@@ -72,61 +90,42 @@ func NewManaged(deps Dependencies) *Managed {
 		&mcp.ServerOptions{Instructions: instructions, Capabilities: &mcp.ServerCapabilities{}},
 	)
 
-	writeTool := inputTool[writeTextInput](tool("filesystem_write_text", "Write text file", "Atomically create a new UTF-8 file or replace one expected file version. Writes to the same path are serialized by this host.", false, true, true, false), func(schema *jsonschema.Schema) {
-		schema.Properties["mode"].Enum = enum("create", "replace")
-	})
-	processRunTool := inputTool[processRunInput](tool("process_run", "Run process", "Start a program directly in pipe or interactive PTY mode. Completed programs return their result; longer programs return a session ID.", false, true, false, true), func(schema *jsonschema.Schema) {
-		schema.Properties["io_mode"].Enum = enum("pipe", "pty")
-	})
+	engine := deps.Runtime
+	if engine == nil {
+		engine = jsrt.NewEngine(context.Background(), jsrt.Dependencies{
+			Process:      deps.Process,
+			Filesystem:   deps.Filesystem,
+			Browser:      deps.Browser,
+			Computer:     deps.Computer,
+			Capabilities: deps.Capabilities,
+			LocalApps:    deps.LocalApps,
+		})
+	}
+
+	managed := &Managed{
+		Server:      server,
+		wire:        deps.Wire,
+		readOnly:    deps.ReadOnly,
+		filter:      deps.Filter,
+		registered:  map[string]string{},
+		registry:    deps.Capabilities,
+		runtime:     engine,
+		activeTasks: map[string]string{},
+	}
 
 	static := []toolSpec{
-		{name: "filesystem_list", readOnly: true, register: func(s *mcp.Server) {
-			mcp.AddTool(s, tool("filesystem_list", "List directory", "List a bounded number of files and directories below a direct machine path without following symbolic links.", true, false, true, false), filesystemList)
-		}},
-		{name: "filesystem_stat", readOnly: true, register: func(s *mcp.Server) {
-			mcp.AddTool(s, tool("filesystem_stat", "Inspect path", "Inspect a direct path without following symbolic links; optionally calculate a regular file's SHA-256.", true, false, true, false), filesystemStat)
-		}},
-		{name: "filesystem_read_text", readOnly: true, register: func(s *mcp.Server) {
-			mcp.AddTool(s, tool("filesystem_read_text", "Read text file", "Read bounded complete UTF-8 lines from a direct machine path, starting at any one-based line.", true, false, true, false), filesystemReadText)
-		}},
-		{name: "filesystem_write_text", destructive: true, register: func(s *mcp.Server) {
-			mcp.AddTool(s, writeTool, filesystemWriteText(deps.Filesystem))
-		}},
-		{name: "filesystem_patch_text", destructive: true, register: func(s *mcp.Server) {
-			mcp.AddTool(s, tool("filesystem_patch_text", "Patch text file", "Apply uniquely anchored, non-overlapping UTF-8 hunks against one expected file version and commit them atomically.", false, true, true, false), filesystemPatchText(deps.Filesystem))
-		}},
-		{name: "filesystem_search_text", readOnly: true, register: func(s *mcp.Server) {
-			mcp.AddTool(s, tool("filesystem_search_text", "Search text files", "Search bounded UTF-8 files below a direct path using literal text or a Go regular expression.", true, false, true, false), filesystemSearchText)
-		}},
-		{name: "image_read", readOnly: true, register: func(s *mcp.Server) {
-			mcp.AddTool(s, tool("image_read", "Read image", "Return a direct PNG, JPEG, GIF, or WebP path as native MCP image content with metadata.", true, false, true, false), imageRead)
-		}},
-		{name: "process_run", destructive: true, register: func(s *mcp.Server) {
-			mcp.AddTool(s, processRunTool, processRun(deps.Process))
-		}},
-		{name: "process_continue", destructive: true, register: func(s *mcp.Server) {
-			mcp.AddTool(s, tool("process_continue", "Continue process", "Read retained output from output_cursor, write or close pipe stdin, resize a PTY, wait for, or terminate a process session. Pure reads with the same cursor can be retried; advance the cursor only after receiving a result.", false, true, false, true), processContinue(deps.Process))
-		}},
+		runToolSpec(managed, deps.Wire),
+		waitToolSpec(managed),
+		sessionToolSpec(managed, deps.Audit, deps.Wire),
 	}
-	static = append(static, browserToolSpecs(deps.Browser)...)
-	static = append(static, computerToolSpecs(deps.Computer)...)
 	if deps.Capabilities.Proposes() {
 		static = append(static, proposeToolSpec(deps.Capabilities))
 	}
 	if deps.LocalApps {
 		registerLocalAppTools(server, deps.Capabilities)
 	}
+	managed.static = static
 
-	managed := &Managed{
-		Server:      server,
-		wire:        deps.Wire,
-		filter:      deps.Filter,
-		registered:  map[string]string{},
-		static:      static,
-		registry:    deps.Capabilities,
-		activeTasks: map[string]string{},
-	}
-	managed.static = append(managed.static, agentReportToolSpec(managed, deps.Audit, deps.Wire))
 	managed.installMiddleware(deps.Audit, deps.Wire)
 	managed.Sync()
 	if deps.Capabilities != nil {
@@ -137,13 +136,14 @@ func NewManaged(deps Dependencies) *Managed {
 
 // SetFilter replaces the active tool filter and immediately reconciles the
 // server's published tool catalog, pushing tools/list_changed to connected clients.
-func (m *Managed) SetFilter(filter ToolFilter) {
+func (m *Managed) SetFilter(filter ToolFilter, readOnly bool) {
 	if m == nil {
 		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.filter = filter
+	m.readOnly = readOnly
 	m.syncLocked()
 }
 
@@ -199,6 +199,119 @@ func (m *Managed) syncLocked() {
 	}
 }
 
+func (m *Managed) isReadOnlyCall(ctx context.Context) bool {
+	m.mu.Lock()
+	ro := m.readOnly
+	m.mu.Unlock()
+	if ro {
+		return true
+	}
+	return audit.CallMetaFromContext(ctx).ReadOnly
+}
+
+type runInput struct {
+	Title          string `json:"title" jsonschema:"required concise 4-16 word description of what this step is doing (shown live in lrmcp ui)"`
+	DoneTitle      string `json:"done_title,omitempty" jsonschema:"optional completed past-tense summary replacing title once finished"`
+	Code           string `json:"code" jsonschema:"async JavaScript executed in this session's persistent VM with proc, fs, browser, desktop, img, caps, emitImage, print, sleep"`
+	YieldMS        int    `json:"yield_ms,omitempty" jsonschema:"milliseconds to wait before returning a running cell_id (1-60000; default 15000)"`
+	MaxOutputBytes int    `json:"max_output_bytes,omitempty" jsonschema:"maximum retained print/console output bytes (default 262144)"`
+}
+
+type waitInput struct {
+	CellID    string `json:"cell_id" jsonschema:"cell_id returned by a running run call"`
+	YieldMS   int    `json:"yield_ms,omitempty" jsonschema:"milliseconds to wait for completion or incremental output (1-60000; default 15000)"`
+	Terminate bool   `json:"terminate,omitempty" jsonschema:"when true, immediately cancel the running cell and all its in-flight sub-operations"`
+}
+
+func runToolSpec(m *Managed, defaultWire string) toolSpec {
+	runTool := inputTool[runInput](
+		tool(
+			"run",
+			"Run stateful runtime script",
+			"Execute async JavaScript in this session's persistent VM with full concurrent access to proc, fs, browser (full browser-level CDP + Tracing + DevTools + AX diff + semantic locators), desktop (Rust UIA + control), img, caps, emitImage, print, and sleep. Parallelize independent calls with await Promise.allSettled([...]).",
+			true, false, false, true,
+		),
+		func(schema *jsonschema.Schema) {
+			schema.Required = []string{"title", "code"}
+		},
+	)
+	return toolSpec{
+		name:     "run",
+		readOnly: true, // read-only remote grants remain allowed and enforce SDK-level read-only inside jsrt
+		register: func(s *mcp.Server) {
+			mcp.AddTool(s, runTool, func(ctx context.Context, req *mcp.CallToolRequest, in runInput) (*mcp.CallToolResult, jsrt.CellResult, error) {
+				if strings.TrimSpace(in.Title) == "" {
+					return nil, jsrt.CellResult{}, errors.New("title is required")
+				}
+				if strings.TrimSpace(in.Code) == "" {
+					return nil, jsrt.CellResult{}, errors.New("code is required")
+				}
+				sid, _, _, _, _ := resolveCaller(ctx, m, req.Session, defaultWire, "")
+				res, err := m.runtime.Run(ctx, jsrt.RunOptions{
+					SessionID:      sid,
+					Title:          strings.TrimSpace(in.Title),
+					DoneTitle:      strings.TrimSpace(in.DoneTitle),
+					Code:           in.Code,
+					YieldMS:        in.YieldMS,
+					MaxOutputBytes: in.MaxOutputBytes,
+					ReadOnly:       m.isReadOnlyCall(ctx),
+				})
+				if err != nil {
+					return nil, res, err
+				}
+				return cellResultToMCP(res), res, nil
+			})
+		},
+	}
+}
+
+func waitToolSpec(m *Managed) toolSpec {
+	waitTool := inputTool[waitInput](
+		tool(
+			"wait",
+			"Wait for or cancel running cell",
+			"Await completion, collect incremental output/images, or cancel a running cell_id returned by run.",
+			true, false, false, true,
+		),
+		func(schema *jsonschema.Schema) {
+			schema.Required = []string{"cell_id"}
+		},
+	)
+	return toolSpec{
+		name:     "wait",
+		readOnly: true,
+		register: func(s *mcp.Server) {
+			mcp.AddTool(s, waitTool, func(ctx context.Context, _ *mcp.CallToolRequest, in waitInput) (*mcp.CallToolResult, jsrt.CellResult, error) {
+				res, err := m.runtime.Wait(ctx, jsrt.WaitOptions{
+					CellID:    strings.TrimSpace(in.CellID),
+					YieldMS:   in.YieldMS,
+					Terminate: in.Terminate,
+				})
+				if err != nil {
+					return nil, res, err
+				}
+				return cellResultToMCP(res), res, nil
+			})
+		},
+	}
+}
+
+func cellResultToMCP(res jsrt.CellResult) *mcp.CallToolResult {
+	var content []mcp.Content
+	payload, _ := json.Marshal(res)
+	content = append(content, &mcp.TextContent{Text: string(payload)})
+	for _, img := range res.Images {
+		if len(img.Data) > 0 && img.MIMEType != "" {
+			content = append(content, &mcp.ImageContent{Data: img.Data, MIMEType: img.MIMEType})
+		}
+	}
+	return &mcp.CallToolResult{
+		IsError:           res.Status == "error",
+		Content:           content,
+		StructuredContent: res,
+	}
+}
+
 func tool(name, title, description string, readOnly, destructive, idempotent, openWorld bool) *mcp.Tool {
 	return &mcp.Tool{
 		Name: name, Title: title, Description: description,
@@ -227,157 +340,4 @@ func enum(values ...string) []any {
 		result[index] = value
 	}
 	return result
-}
-
-type emptyInput struct{}
-
-type listInput struct {
-	Path          string `json:"path" jsonschema:"absolute directory path or path relative to the server process"`
-	MaxDepth      int    `json:"max_depth,omitempty" jsonschema:"maximum traversal depth from 1 to 64; defaults to 1"`
-	IncludeHidden bool   `json:"include_hidden,omitempty" jsonschema:"include dotfiles and dot directories"`
-	MaxEntries    int    `json:"max_entries,omitempty" jsonschema:"maximum returned entries from 1 to 100000; defaults to 1000"`
-}
-
-func filesystemList(_ context.Context, _ *mcp.CallToolRequest, in listInput) (*mcp.CallToolResult, filesystem.ListResult, error) {
-	result, err := filesystem.List(in.Path, in.MaxDepth, in.IncludeHidden, in.MaxEntries)
-	return nil, result, err
-}
-
-type pathInput struct {
-	Path       string `json:"path" jsonschema:"absolute path or path relative to the server process"`
-	WithSHA256 bool   `json:"with_sha256,omitempty" jsonschema:"calculate SHA-256 for a regular file by reading it completely"`
-}
-
-func filesystemStat(_ context.Context, _ *mcp.CallToolRequest, in pathInput) (*mcp.CallToolResult, filesystem.FileInfo, error) {
-	result, err := filesystem.Stat(in.Path, in.WithSHA256)
-	return nil, result, err
-}
-
-type readTextInput struct {
-	Path       string `json:"path" jsonschema:"absolute text-file path or path relative to the server process"`
-	StartLine  int    `json:"start_line,omitempty" jsonschema:"one-based first line; defaults to 1"`
-	LineCount  int    `json:"line_count,omitempty" jsonschema:"maximum complete lines returned; zero means until max_bytes or EOF"`
-	MaxBytes   int    `json:"max_bytes,omitempty" jsonschema:"maximum bytes returned from 1 to 8388608; defaults to 1048576"`
-	WithSHA256 bool   `json:"with_sha256,omitempty" jsonschema:"calculate SHA-256 by reading the entire file"`
-}
-
-func filesystemReadText(_ context.Context, _ *mcp.CallToolRequest, in readTextInput) (*mcp.CallToolResult, filesystem.TextReadResult, error) {
-	result, err := filesystem.ReadText(in.Path, filesystem.ReadTextOptions{StartLine: in.StartLine, LineCount: in.LineCount, MaxBytes: in.MaxBytes, WithSHA256: in.WithSHA256})
-	return nil, result, err
-}
-
-type writeTextInput struct {
-	Path           string `json:"path" jsonschema:"absolute text-file path or path relative to the server process"`
-	Content        string `json:"content" jsonschema:"complete UTF-8 file content"`
-	Mode           string `json:"mode" jsonschema:"create a new path or replace an existing file version"`
-	ExpectedSHA256 string `json:"expected_sha256,omitempty" jsonschema:"required for replace; forbidden for create"`
-	CreateParents  bool   `json:"create_parents,omitempty" jsonschema:"create missing parent directories; defaults to false"`
-}
-
-func filesystemWriteText(service *filesystem.Service) func(context.Context, *mcp.CallToolRequest, writeTextInput) (*mcp.CallToolResult, filesystem.TextWriteResult, error) {
-	return func(ctx context.Context, _ *mcp.CallToolRequest, in writeTextInput) (*mcp.CallToolResult, filesystem.TextWriteResult, error) {
-		result, err := service.WriteText(ctx, in.Path, in.Content, filesystem.WriteTextOptions{Mode: in.Mode, ExpectedSHA256: in.ExpectedSHA256, CreateParents: in.CreateParents})
-		return nil, result, err
-	}
-}
-
-type patchTextInput struct {
-	Path           string                     `json:"path" jsonschema:"absolute text-file path or path relative to the server process"`
-	Hunks          []filesystem.TextPatchHunk `json:"hunks" jsonschema:"exact contextual hunks, all located against the same original file"`
-	ExpectedSHA256 string                     `json:"expected_sha256" jsonschema:"required SHA-256 of the original file"`
-}
-
-func filesystemPatchText(service *filesystem.Service) func(context.Context, *mcp.CallToolRequest, patchTextInput) (*mcp.CallToolResult, filesystem.TextPatchResult, error) {
-	return func(ctx context.Context, _ *mcp.CallToolRequest, in patchTextInput) (*mcp.CallToolResult, filesystem.TextPatchResult, error) {
-		result, err := service.PatchText(ctx, in.Path, filesystem.PatchTextOptions{Hunks: in.Hunks, ExpectedSHA256: in.ExpectedSHA256})
-		return nil, result, err
-	}
-}
-
-type searchTextInput struct {
-	Path          string `json:"path" jsonschema:"absolute file/directory path or path relative to the server process"`
-	Query         string `json:"query" jsonschema:"literal text or Go regular expression to find"`
-	Regex         bool   `json:"regex,omitempty" jsonschema:"interpret query as a Go regular expression"`
-	CaseSensitive bool   `json:"case_sensitive,omitempty" jsonschema:"perform a case-sensitive search"`
-	IncludeHidden bool   `json:"include_hidden,omitempty" jsonschema:"include dotfiles and dot directories"`
-	MaxResults    int    `json:"max_results,omitempty" jsonschema:"maximum matches from 1 to 10000; defaults to 200"`
-}
-
-func filesystemSearchText(_ context.Context, _ *mcp.CallToolRequest, in searchTextInput) (*mcp.CallToolResult, filesystem.SearchResult, error) {
-	result, err := filesystem.SearchText(in.Path, in.Query, in.Regex, in.CaseSensitive, in.IncludeHidden, in.MaxResults)
-	return nil, result, err
-}
-
-type imageReadInput struct {
-	Path       string `json:"path" jsonschema:"absolute image path or path relative to the server process"`
-	MaxBytes   int    `json:"max_bytes,omitempty" jsonschema:"maximum complete image size from 1 to 67108864; defaults to 10485760"`
-	MaxPixels  int    `json:"max_pixels,omitempty" jsonschema:"maximum width times height from 1 to 250000000; defaults to 40000000"`
-	CropX      int    `json:"crop_x,omitempty" jsonschema:"non-negative source X coordinate; requires crop_width and crop_height"`
-	CropY      int    `json:"crop_y,omitempty" jsonschema:"non-negative source Y coordinate; requires crop_width and crop_height"`
-	CropWidth  int    `json:"crop_width,omitempty" jsonschema:"positive source crop width; requires crop_height"`
-	CropHeight int    `json:"crop_height,omitempty" jsonschema:"positive source crop height; requires crop_width"`
-	MaxWidth   int    `json:"max_width,omitempty" jsonschema:"maximum projected width from 1 to 32768; aspect ratio is preserved"`
-	MaxHeight  int    `json:"max_height,omitempty" jsonschema:"maximum projected height from 1 to 32768; aspect ratio is preserved"`
-}
-
-func imageRead(ctx context.Context, _ *mcp.CallToolRequest, in imageReadInput) (*mcp.CallToolResult, runtimeimage.ReadResult, error) {
-	data, metadata, err := runtimeimage.Read(ctx, in.Path, runtimeimage.ReadOptions{MaxBytes: in.MaxBytes, MaxPixels: in.MaxPixels, CropX: in.CropX, CropY: in.CropY, CropWidth: in.CropWidth, CropHeight: in.CropHeight, MaxWidth: in.MaxWidth, MaxHeight: in.MaxHeight})
-	if err != nil {
-		return nil, runtimeimage.ReadResult{}, err
-	}
-	result := &mcp.CallToolResult{Content: []mcp.Content{&mcp.ImageContent{Data: data, MIMEType: metadata.MIMEType}}}
-	return result, metadata, nil
-}
-
-type processRunInput struct {
-	Program        string            `json:"program" jsonschema:"installed program name or executable path; no shell parsing is performed"`
-	Args           []string          `json:"args,omitempty" jsonschema:"program argument array"`
-	Directory      string            `json:"directory,omitempty" jsonschema:"absolute working directory or path relative to the server process; defaults to the server working directory"`
-	Environment    map[string]string `json:"environment,omitempty" jsonschema:"environment variables added or overridden for the child process"`
-	Stdin          string            `json:"stdin,omitempty" jsonschema:"initial text sent to standard input"`
-	KeepStdinOpen  bool              `json:"keep_stdin_open,omitempty" jsonschema:"keep stdin open so process_continue can write more input"`
-	TimeoutSeconds int               `json:"timeout_seconds,omitempty" jsonschema:"lifetime timeout from 1 to 86400 seconds; defaults to 300"`
-	MaxOutputBytes int               `json:"max_output_bytes,omitempty" jsonschema:"separate retained stdout and stderr limit from 1 to 16777216 bytes; defaults to 1048576"`
-	YieldTimeMS    int               `json:"yield_time_ms,omitempty" jsonschema:"initial wait from 1 to 60000 milliseconds; defaults to 10000"`
-	IOMode         string            `json:"io_mode,omitempty" jsonschema:"pipe for separate stdout and stderr, or pty for one interactive terminal stream; defaults to pipe"`
-	Columns        int               `json:"columns,omitempty" jsonschema:"PTY width from 1 to 1000; defaults to 80"`
-	Rows           int               `json:"rows,omitempty" jsonschema:"PTY height from 1 to 1000; defaults to 25"`
-}
-
-func processRun(manager *runtimeprocess.Manager) func(context.Context, *mcp.CallToolRequest, processRunInput) (*mcp.CallToolResult, runtimeprocess.Result, error) {
-	return func(ctx context.Context, _ *mcp.CallToolRequest, in processRunInput) (*mcp.CallToolResult, runtimeprocess.Result, error) {
-		result, err := manager.Run(ctx, runtimeprocess.Options{
-			Program: in.Program, Args: in.Args, Directory: in.Directory, Environment: in.Environment,
-			Stdin: in.Stdin, KeepStdinOpen: in.KeepStdinOpen, TimeoutSeconds: in.TimeoutSeconds,
-			MaxOutputBytes: in.MaxOutputBytes, YieldTimeMS: in.YieldTimeMS,
-			IOMode: in.IOMode, Columns: in.Columns, Rows: in.Rows,
-		})
-		if err != nil {
-			return nil, result, fmt.Errorf("run process: %w", err)
-		}
-		return nil, result, nil
-	}
-}
-
-type processContinueInput struct {
-	SessionID    string                      `json:"session_id" jsonschema:"process session ID returned by process_run"`
-	OutputCursor runtimeprocess.OutputCursor `json:"output_cursor,omitempty" jsonschema:"stdout and stderr byte offsets from the last successfully received result; omitted or zero rereads retained output; reuse the same cursor after a lost pure-read response"`
-	Stdin        string                      `json:"stdin,omitempty" jsonschema:"additional text written to the open process stdin; do not automatically replay after a lost response"`
-	CloseStdin   bool                        `json:"close_stdin,omitempty" jsonschema:"close the process stdin after writing"`
-	Terminate    bool                        `json:"terminate,omitempty" jsonschema:"terminate the complete process tree"`
-	YieldTimeMS  int                         `json:"yield_time_ms,omitempty" jsonschema:"wait for output or exit from 1 to 60000 milliseconds; defaults to 1000"`
-	Columns      int                         `json:"columns,omitempty" jsonschema:"new PTY width from 1 to 1000; requires rows"`
-	Rows         int                         `json:"rows,omitempty" jsonschema:"new PTY height from 1 to 1000; requires columns"`
-}
-
-func processContinue(manager *runtimeprocess.Manager) func(context.Context, *mcp.CallToolRequest, processContinueInput) (*mcp.CallToolResult, runtimeprocess.Result, error) {
-	return func(ctx context.Context, _ *mcp.CallToolRequest, in processContinueInput) (*mcp.CallToolResult, runtimeprocess.Result, error) {
-		result, err := manager.Continue(ctx, runtimeprocess.ContinueOptions{
-			SessionID: in.SessionID, OutputCursor: in.OutputCursor, Stdin: in.Stdin, CloseStdin: in.CloseStdin, Terminate: in.Terminate, YieldTimeMS: in.YieldTimeMS, Columns: in.Columns, Rows: in.Rows,
-		})
-		if err != nil {
-			return nil, result, fmt.Errorf("continue process: %w", err)
-		}
-		return nil, result, nil
-	}
 }

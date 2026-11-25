@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -22,19 +23,21 @@ type ActiveMCPSession struct {
 	Wire       string `json:"wire"`
 }
 
-type agentReportInput struct {
-	Message    string `json:"message" jsonschema:"concise human-readable progress milestone or status note shown in the owner's live activity timeline"`
-	Title      string `json:"title,omitempty" jsonschema:"optional short task/session title shown in the activity sidebar"`
-	AgentID    string `json:"agent_id,omitempty" jsonschema:"optional logical agent identifier when multiple sub-agents share one connection"`
-	SessionID  string `json:"session_id,omitempty" jsonschema:"optional explicit task session identifier to group one task's calls into its own thread under this agent"`
-	NewSession bool   `json:"new_session,omitempty" jsonschema:"when true on a persistent connection, opens a fresh task session under this agent for this note and subsequent tool calls"`
-	Status     string `json:"status,omitempty" jsonschema:"optional session status hint: working, waiting, done, or error"`
+type sessionInput struct {
+	Action    string `json:"action" jsonschema:"session lifecycle action: start (open fresh named task thread), update (post progress milestone), or done (finish task and reclaim temporary browser tabs)"`
+	Title     string `json:"title,omitempty" jsonschema:"concise task title shown in the activity sidebar (recommended on start)"`
+	Message   string `json:"message,omitempty" jsonschema:"concise human-readable milestone or completion summary"`
+	Status    string `json:"status,omitempty" jsonschema:"optional status hint: working, waiting, done, or error"`
+	SessionID string `json:"session_id,omitempty" jsonschema:"optional explicit task session identifier"`
+	AgentID   string `json:"agent_id,omitempty" jsonschema:"optional logical agent identifier when multiple sub-agents share one connection"`
 }
 
-type agentReportOutput struct {
-	Recorded  bool   `json:"recorded"`
-	EventID   int64  `json:"event_id,omitempty"`
-	SessionID string `json:"session_id,omitempty"`
+type sessionOutput struct {
+	Recorded      bool   `json:"recorded"`
+	EventID       int64  `json:"event_id,omitempty"`
+	SessionID     string `json:"session_id,omitempty"`
+	Status        string `json:"status,omitempty"`
+	ClosedTabs    int    `json:"closed_tabs,omitempty"`
 }
 
 func shortTaskID() string {
@@ -81,30 +84,32 @@ func (m *Managed) clearActiveTask(keyOrTaskSID string) {
 	m.taskMu.Unlock()
 }
 
-func agentReportToolSpec(m *Managed, store *audit.Store, defaultWire string) toolSpec {
-	reportTool := inputTool[agentReportInput](
+func sessionToolSpec(m *Managed, store *audit.Store, defaultWire string) toolSpec {
+	sessTool := inputTool[sessionInput](
 		tool(
-			"agent_report",
-			"Report progress note",
-			"Post a short, human-readable progress note to the owner's live local activity stream (lrmcp ui). Read-only and zero side effects on files, processes, or browser tabs. Pass new_session=true (or a distinct session_id) with title when starting a brand-new task so each task appears as its own thread under your agent folder.",
+			"session",
+			"Manage task session & milestones",
+			"Manage the logical task thread in lrmcp ui: call action='start' with title when beginning a distinct task, action='update' for major milestones, and action='done' when finished (automatically reclaiming temporary browser tabs not marked via markHandoff).",
 			true, false, false, false,
 		),
 		func(schema *jsonschema.Schema) {
+			schema.Required = []string{"action"}
+			schema.Properties["action"].Enum = enum("start", "update", "done")
 			schema.Properties["status"].Enum = enum("working", "waiting", "done", "error")
 		},
 	)
 	return toolSpec{
-		name:     "agent_report",
+		name:     "session",
 		readOnly: true,
 		register: func(s *mcp.Server) {
-			mcp.AddTool(s, reportTool, func(ctx context.Context, req *mcp.CallToolRequest, in agentReportInput) (*mcp.CallToolResult, agentReportOutput, error) {
-				msg := strings.TrimSpace(in.Message)
-				if msg == "" {
-					return nil, agentReportOutput{}, errors.New("message is required")
+			mcp.AddTool(s, sessTool, func(ctx context.Context, req *mcp.CallToolRequest, in sessionInput) (*mcp.CallToolResult, sessionOutput, error) {
+				action := strings.ToLower(strings.TrimSpace(in.Action))
+				switch action {
+				case "start", "update", "done":
+				default:
+					return nil, sessionOutput{}, errors.New("action must be start, update, or done")
 				}
-				if store == nil {
-					return nil, agentReportOutput{Recorded: true}, nil
-				}
+
 				sid, aid, clientName, wire, baseKey := resolveCaller(ctx, m, req.Session, defaultWire, in.AgentID)
 
 				explicitSID := audit.SanitizeID(in.SessionID)
@@ -117,13 +122,39 @@ func agentReportToolSpec(m *Managed, store *audit.Store, defaultWire string) too
 					if baseKey != "" {
 						m.setActiveTask(baseKey, sid)
 					}
-				} else if in.NewSession {
+				} else if action == "start" {
 					sid = wire + ":task-" + shortTaskID()
 					if baseKey != "" {
 						m.setActiveTask(baseKey, sid)
 					}
 				}
 
+				status := strings.TrimSpace(in.Status)
+				if status == "" {
+					switch action {
+					case "done":
+						status = "done"
+					default:
+						status = "working"
+					}
+				}
+				msg := strings.TrimSpace(in.Message)
+				if msg == "" {
+					if t := strings.TrimSpace(in.Title); t != "" {
+						msg = t
+					} else {
+						msg = "session " + action
+					}
+				}
+
+				closedTabs := 0
+				if action == "done" && m.runtime != nil {
+					m.runtime.CloseSession(ctx, sid)
+				}
+
+				if store == nil {
+					return nil, sessionOutput{Recorded: true, SessionID: sid, Status: status, ClosedTabs: closedTabs}, nil
+				}
 				ev, err := store.RecordNote(audit.NoteInput{
 					SessionID:  sid,
 					AgentID:    aid,
@@ -131,12 +162,12 @@ func agentReportToolSpec(m *Managed, store *audit.Store, defaultWire string) too
 					Wire:       wire,
 					Title:      in.Title,
 					Message:    msg,
-					Status:     in.Status,
+					Status:     status,
 				})
 				if err != nil {
-					return nil, agentReportOutput{}, err
+					return nil, sessionOutput{}, err
 				}
-				return nil, agentReportOutput{Recorded: true, EventID: ev.ID, SessionID: ev.SessionID}, nil
+				return nil, sessionOutput{Recorded: true, EventID: ev.ID, SessionID: ev.SessionID, Status: status, ClosedTabs: closedTabs}, nil
 			})
 		},
 	}
@@ -178,6 +209,8 @@ func resolveCaller(ctx context.Context, m *Managed, session *mcp.ServerSession, 
 			baseKey = meta.SessionID
 		case session != nil && session.ID() != "":
 			baseKey = wire + ":" + session.ID()
+		case session != nil:
+			baseKey = fmt.Sprintf("%s:conn-%p", wire, session)
 		}
 		if baseKey != "" {
 			if activeTask := m.getActiveTask(baseKey); activeTask != "" {
@@ -193,7 +226,6 @@ func resolveCaller(ctx context.Context, m *Managed, session *mcp.ServerSession, 
 			sessionID = wire + ":" + explicit
 		}
 	case isStatelessWire:
-		// Stateless HTTP / tunnel calls without X-LRMCP-Session coalesce by wire + agent identity.
 		sessionID = wire + ":" + agentID
 	case session != nil && session.ID() != "":
 		sessionID = wire + ":" + session.ID()
@@ -270,9 +302,19 @@ func (m *Managed) installMiddleware(store *audit.Store, defaultWire string) {
 				}
 			}
 
-			// agent_report writes its own dedicated "note" event; avoid duplicate tool_call rows.
-			if toolName == "agent_report" || store == nil {
+			if toolName == "session" || store == nil {
 				return next(ctx, method, req)
+			}
+
+			// Extract optional done_title for dual-state doing -> done summary flipping on `run`.
+			var doneTitle string
+			if toolName == "run" && len(rawParams.Arguments) > 0 {
+				var peek struct {
+					DoneTitle string `json:"done_title"`
+				}
+				if json.Unmarshal(rawParams.Arguments, &peek) == nil {
+					doneTitle = strings.TrimSpace(peek.DoneTitle)
+				}
 			}
 
 			start := time.Now()
@@ -304,6 +346,9 @@ func (m *Managed) installMiddleware(store *audit.Store, defaultWire string) {
 				if callRes.IsError {
 					finish.Status = "error"
 				}
+			}
+			if finish.Status == "ok" && doneTitle != "" {
+				finish.FinalSummary = doneTitle
 			}
 			store.FinishTool(evID, auditSID, finish)
 			return res, err
@@ -390,21 +435,22 @@ func (m *Managed) ActiveSessions() []ActiveMCPSession {
 	return out
 }
 
-// CloseSession closes an active MCP session matching sessionID (accepting either
-// raw MCP session ID, wire-prefixed "<wire>:<id>", or an active task session ID).
+// CloseSession closes an active MCP session matching sessionID and releases its stateful JS VM.
 func (m *Managed) CloseSession(sessionID string) bool {
 	if m == nil || m.Server == nil || sessionID == "" {
 		return false
 	}
 	m.clearActiveTask(sessionID)
+	if m.runtime != nil {
+		m.runtime.CloseSession(context.Background(), sessionID)
+	}
 	bare := sessionID
 	if idx := strings.IndexByte(sessionID, ':'); idx >= 0 {
 		bare = sessionID[idx+1:]
 	}
 	closed := false
 	for ss := range m.Server.Sessions() {
-		id := ss.ID()
-		if id != "" && (id == sessionID || id == bare || m.wire+":"+id == sessionID) {
+		if ss.ID() == sessionID || ss.ID() == bare {
 			_ = ss.Close()
 			closed = true
 		}
