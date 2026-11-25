@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"strings"
 	"time"
 
 	"github.com/dop251/goja"
+	"github.com/dop251/goja/parser"
 	"github.com/hicancan/local-runtime-mcp/internal/browser"
 	"github.com/hicancan/local-runtime-mcp/internal/computer"
 	"github.com/hicancan/local-runtime-mcp/internal/filesystem"
@@ -931,20 +933,19 @@ func (v *sessionVM) makeTabHandle(tab browser.Tab) goja.Value {
 		})
 	})
 	_ = obj.Set("eval", func(call goja.FunctionCall) goja.Value {
-		const sig = `tab.eval(script)`
 		if v.isReadOnly() {
 			return v.rejected(errors.New("read-only grant forbids tab.eval"))
 		}
-		if err := rejectExtraArgs(call, 1, sig); err != nil {
-			return v.rejected(err)
-		}
-		script, err := requireNonEmptyStringArg(call, 0, "script", sig)
+		script, label, isFn, err := buildTabEvalScript(call)
 		if err != nil {
 			return v.rejected(err)
 		}
-		return v.spawnAsync("tab.eval", clipStr(firstCommentOrCode(script), 72), func(ctx context.Context) (any, error) {
+		return v.spawnAsync("tab.eval", label, func(ctx context.Context) (any, error) {
 			res, err := b.Act(ctx, browser.Action{TabID: tabID, Kind: "evaluate", Script: script})
 			if err != nil {
+				if isFn && strings.Contains(err.Error(), "ReferenceError") {
+					return nil, fmt.Errorf("%w (hint: tab.eval runs inside the browser page, not the lrmcp VM; pass outer variables as extra arguments: tab.eval((x) => ..., x))", err)
+				}
 				return nil, err
 			}
 			return res.Value, nil
@@ -1858,4 +1859,101 @@ func firstCommentOrCode(script string) string {
 		return strings.TrimSpace(line)
 	}
 	return script
+}
+
+func buildTabEvalScript(call goja.FunctionCall) (script string, label string, isFn bool, err error) {
+	const sig = `tab.eval(scriptOrFn, ...args)`
+	if len(call.Arguments) == 0 || goja.IsUndefined(call.Arguments[0]) || goja.IsNull(call.Arguments[0]) {
+		return "", "", false, fmt.Errorf("missing required argument scriptOrFn; signature: %s", sig)
+	}
+	first := call.Arguments[0]
+
+	// Mode 1: JS function + optional serialized arguments -> tab.eval((x, y) => ..., x, y)
+	if _, ok := goja.AssertFunction(first); ok {
+		fnSrc := strings.TrimSpace(first.String())
+		if fnSrc == "" || strings.Contains(fnSrc, "[native code]") {
+			return "", "", true, errors.New("tab.eval: cannot serialize a native or bound function across the browser boundary; pass a plain/arrow JS function and pass outer values as extra args: tab.eval((x) => ..., x)")
+		}
+		fnExpr, err := normalizeEvalFunctionSource(fnSrc)
+		if err != nil {
+			return "", "", true, fmt.Errorf("tab.eval: function cannot be serialized (%v); signature: %s", err, sig)
+		}
+		argExprs := make([]string, 0, len(call.Arguments)-1)
+		totalBytes := len(fnExpr)
+		for i, arg := range call.Arguments[1:] {
+			expr, err := serializeTabEvalArg(arg, i+1)
+			if err != nil {
+				return "", "", true, err
+			}
+			totalBytes += len(expr)
+			if totalBytes > 4<<20 {
+				return "", "", true, errors.New("tab.eval: serialized function and arguments exceed 4 MiB limit")
+			}
+			argExprs = append(argExprs, expr)
+		}
+		wrapped := fmt.Sprintf("((__lrmcp_fn, __lrmcp_args) => __lrmcp_fn(...__lrmcp_args))((\n%s\n), [%s])", fnExpr, strings.Join(argExprs, ", "))
+		return wrapped, clipStr(firstCommentOrCode(fnSrc), 72), true, nil
+	}
+
+	// Mode 2: raw JS string -> tab.eval(script)
+	raw, ok := first.Export().(string)
+	if !ok {
+		return "", "", false, fmt.Errorf("argument scriptOrFn must be a string or function, got %T; signature: %s", first.Export(), sig)
+	}
+	for _, extra := range call.Arguments[1:] {
+		if extra != nil && !goja.IsUndefined(extra) {
+			return "", "", false, errors.New("tab.eval(script) with a string script does not accept extra arguments; pass a function instead: tab.eval((arg) => ..., arg)")
+		}
+	}
+	if strings.TrimSpace(raw) == "" {
+		return "", "", false, fmt.Errorf("argument scriptOrFn must not be empty; signature: %s", sig)
+	}
+	return raw, clipStr(firstCommentOrCode(raw), 72), false, nil
+}
+
+func normalizeEvalFunctionSource(fnSrc string) (string, error) {
+	if _, err := parser.ParseFile(nil, "eval_fn.js", "(\n"+fnSrc+"\n)", 0); err == nil {
+		return fnSrc, nil
+	}
+	// Handle object shorthand methods like `foo(x) { return x; }` or `async foo(x) { ... }`.
+	if _, err := parser.ParseFile(nil, "eval_fn.js", "({\n"+fnSrc+"\n})", 0); err == nil {
+		return "Object.values(({\n" + fnSrc + "\n}))[0]", nil
+	}
+	_, err := parser.ParseFile(nil, "eval_fn.js", "(\n"+fnSrc+"\n)", 0)
+	return "", err
+}
+
+func serializeTabEvalArg(arg goja.Value, idx int) (string, error) {
+	if arg == nil || goja.IsUndefined(arg) {
+		return "undefined", nil
+	}
+	if goja.IsNull(arg) {
+		return "null", nil
+	}
+	if _, ok := goja.AssertFunction(arg); ok {
+		return "", fmt.Errorf("tab.eval: argument %d is a function and cannot be serialized to the browser page; pass plain JSON-serializable values", idx)
+	}
+	if _, ok := arg.(*goja.Symbol); ok {
+		return "", fmt.Errorf("tab.eval: argument %d is a Symbol and cannot be serialized to the browser page", idx)
+	}
+	exp := arg.Export()
+	switch x := exp.(type) {
+	case float64:
+		if math.IsNaN(x) {
+			return "NaN", nil
+		}
+		if math.IsInf(x, 1) {
+			return "Infinity", nil
+		}
+		if math.IsInf(x, -1) {
+			return "-Infinity", nil
+		}
+	case time.Time:
+		return fmt.Sprintf("new Date(%d)", x.UnixMilli()), nil
+	}
+	b, err := json.Marshal(exp)
+	if err != nil {
+		return "", fmt.Errorf("tab.eval: argument %d is not JSON-serializable (%v)", idx, err)
+	}
+	return string(b), nil
 }

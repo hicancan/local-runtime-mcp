@@ -82,7 +82,7 @@ flowchart TB
 
 | Primitive | Purpose |
 | --- | --- |
-| **`run(title, code, done_title?, yield_ms?, max_output_bytes?)`** | Execute async JavaScript in this session's persistent VM with full concurrent access to `proc`, `fs`, `browser`, `desktop`, `img`, `caps`, `emitImage`, `print`, `sleep`, `help()`, and Web globals (`URL`, `URLSearchParams`, `atob`, `btoa`, `setTimeout`). Top-level `let`/`const`/`var`/`function`/`class` persist across turns; bare final expressions auto-return in `cell.value`. |
+| **`run(title, code, done_title?, yield_ms?, max_output_bytes?)`** | Execute async JavaScript in this session's persistent VM with full concurrent access to `proc`, `fs`, `browser`, `desktop`, `img`, `caps`, `emitImage`, `print`, `sleep`, `help()`, and Web globals (`URL`, `URLSearchParams`, `atob`, `btoa`, `setTimeout`, embedded-`tzdata` `Intl.DateTimeFormat` & `Date.toLocale*String`). Top-level `let`/`const`/`var`/`function`/`class` persist across turns; bare final expressions auto-return in `cell.value`. |
 | **`wait(cell_id, yield_ms?, terminate?)`** | Collect incremental output/images or cancel any long-running cell cleanly. |
 | **`session(action='start'\|'update'\|'done', ...)`** | Optional for single-shot read-only queries (call `run` directly). For multi-step or browser tasks, opens a named thread in `/ui` and automatically reclaims temporary browser tabs on `done` (unless marked via `tab.markHandoff()`). |
 | **`capability_propose(name, definition, script)`** | Distill a repeatable website workflow explored via `run` into a deterministic Web MCP tool proposal for owner review in the extension's `L` panel. |
@@ -136,13 +136,13 @@ All SDK options use strict `snake_case` with `DisallowUnknownFields` — mismatc
   - `browser.tab(id)` · `browser.cdp(method, params?, browser_id?)` · `browser.cleanup()`
   - `browser.traceStart({ browser_id?, tab_id?, reload?, ignore_cache?, categories? }?)` · `browser.traceStop(file_path?, browser_id?)` (streams lossless raw trace via `IO.read` + reads exact kernel Web Performance API metrics: `ttfb_ms`, `fcp_ms`, `lcp_ms`, `dcl_ms`, `load_ms`, `cls`)
   - `tab.goto(url)` · `reload()` · `back()` · `forward()` · `close()` · `markHandoff()`
-  - `tab.snapshot({ diff?: true, max_elements?, max_text? }?)` · `tab.screenshot({ full_page?, clip_x?, clip_y?, clip_width?, clip_height? }?)` · `tab.eval(js)` · `tab.cdp(method, params?)`
+  - `tab.snapshot({ diff?: true, max_elements?, max_text? }?)` · `tab.screenshot({ full_page?, clip_x?, clip_y?, clip_width?, clip_height? }?)` · `tab.eval(jsOrFn, ...args)` · `tab.cdp(method, params?)`
   - Semantic locators with auto-wait: `tab.getByRole(role, nameOrOpts?)` · `getByText` · `getByLabel` · `getByPlaceholder` · `locator(css)` → `.click()` / `.doubleClick()` / `.hover()` / `.fill(t)` / `.type(t)` / `.press(k)` / `.select(o)` / `.check(b)` / `.uploadFiles(paths)` / `.waitFor({ timeout_ms? })` / `.nth(i)`
   - DevTools: `tab.network({ resource_types?, url_contains?, include_preserved?, failed_only?, limit? }?)` · `tab.networkBody(request_id)` · `tab.console({ levels?, limit? }?)` · `tab.emulate({ width?, height?, mobile?, cpu_throttling_rate?, network_preset?, color_scheme?, reduced_motion?, forced_colors?, user_agent?, geolocation?, extra_headers? })` · `tab.css(selectorOrLoc)` · `tab.heapSnapshot(file_path?)` · `tab.logpoint(url, line, expr, col?)` · `tab.screencastStart(opts?)` · `tab.screencastStop()`
 - **`desktop`** — Embedded Rust Windows Graphics Capture (even for covered windows) + UI Automation (zero focus stealing for observation/semantic actions; physical input borrows a revocable token with a clickable bottom-of-screen Stop pill):
   - `desktop.targets({ pid?, title?, process? }?)` · `desktop.state(opts?)` · `desktop.wait(opts)` · `desktop.action(act)` · `desktop.control("status"|"acquire"|"release", opts?)`
 - **`img` & `emitImage`** — `img.read(path, { max_bytes?, max_pixels?, crop_x?, crop_y?, crop_width?, crop_height?, max_width?, max_height? }?)` · `emitImage(imgOrShotOrPath, label?)` returns native MCP `ImageContent`.
-- **`caps` & Web Globals** — `caps.list()` · `caps.call(name, args?, browser_id?, tab_id?)` · `print(...)` · `sleep(ms)` · `setTimeout` / `clearTimeout` · `URL` / `URLSearchParams` · `atob` / `btoa` · `help(topic?)`.
+- **`caps` & Web Globals** — `caps.list()` · `caps.call(name, args?, browser_id?, tab_id?)` · `print(...)` · `sleep(ms)` · `setTimeout` / `clearTimeout` · `URL` / `URLSearchParams` · `atob` / `btoa` · `Intl.DateTimeFormat` / `Date.toLocale*String` (embedded IANA `tzdata`) · `help(topic?)`.
 
 </details>
 

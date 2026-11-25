@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dop251/goja"
 	"github.com/hicancan/local-runtime-mcp/internal/filesystem"
 	runtimeprocess "github.com/hicancan/local-runtime-mcp/internal/process"
 )
@@ -447,6 +448,199 @@ func TestASTPersistenceClassRedeclareAndWebGlobals(t *testing.T) {
 		got, ok := res.Value.(float64)
 		if !ok || got != tc.want {
 			t.Fatalf("%s: want %v, got %#v", tc.name, tc.want, res.Value)
+		}
+	}
+}
+
+func TestIntlDateTimeFormatAndDateLocaleTimeZones(t *testing.T) {
+	ctx := context.Background()
+	eng := NewEngine(ctx, Dependencies{})
+	defer eng.Close()
+
+	r, err := eng.Run(ctx, RunOptions{
+		SessionID: "sess-intl",
+		Title:     "验证内置 IANA tzdata、Intl.DateTimeFormat 与 Date.toLocale*String",
+		Code: `
+			const summer = new Date("2026-06-15T18:30:45.123Z");
+			const winter = new Date("2026-01-15T18:30:45.000Z");
+
+			// Asia/Shanghai (+08:00 year-round -> crosses into next day 2026/6/16 02:30:45)
+			const cnSummer = summer.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
+			const cnDate = summer.toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" });
+			const cnTime = summer.toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
+			const svShanghai = summer.toLocaleString("sv-SE", { timeZone: "Asia/Shanghai" });
+
+			// America/Los_Angeles (PDT -7 in June -> 11:30:45 AM; PST -8 in January -> 10:30:45 AM)
+			const laSummer = summer.toLocaleString("en-US", { timeZone: "America/Los_Angeles" });
+			const laWinter = winter.toLocaleString("en-US", { timeZone: "America/Los_Angeles" });
+			const laTimeWithTZ = summer.toLocaleTimeString("en-US", { timeZone: "America/Los_Angeles", timeZoneName: "short" });
+
+			// Detached .format & formatToParts & resolvedOptions & callable without new
+			const dtf = Intl.DateTimeFormat("zh-CN", {
+				timeZone: "Asia/Shanghai",
+				year: "numeric",
+				month: "2-digit",
+				day: "2-digit",
+				hour: "2-digit",
+				minute: "2-digit",
+				second: "2-digit",
+				hour12: false,
+				timeZoneName: "shortOffset",
+			});
+			const { format } = dtf;
+			const detachedOut = format(summer);
+			const partsMap = Object.fromEntries(dtf.formatToParts(summer).filter(p => p.type !== "literal").map(p => [p.type, p.value]));
+			const resolved = dtf.resolvedOptions();
+
+			// Invalid Date behavior
+			const invalidLocale = new Date(NaN).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
+			let invalidFormatErr = "";
+			try { dtf.format(new Date(NaN)); } catch (e) { invalidFormatErr = e.name + ":" + e.message; }
+
+			// Invalid timeZone MUST throw RangeError (never silently ignore!)
+			let badTZErr = "";
+			try { summer.toLocaleString("zh-CN", { timeZone: "Mars/Olympus" }); } catch (e) { badTZErr = e.name + ":" + e.message; }
+			let emptyTZErr = "";
+			try { new Intl.DateTimeFormat("en-US", { timeZone: "" }); } catch (e) { emptyTZErr = e.name + ":" + e.message; }
+			let styleConflictErr = "";
+			try { new Intl.DateTimeFormat("en-US", { dateStyle: "short", year: "numeric" }); } catch (e) { styleConflictErr = e.name; }
+
+			({
+				cnSummer, cnDate, cnTime, svShanghai,
+				laSummer, laWinter, laTimeWithTZ,
+				detachedOut, partsMap, resolved,
+				invalidLocale, invalidFormatErr, badTZErr, emptyTZErr, styleConflictErr,
+			})
+		`,
+	})
+	if err != nil || r.Status != "done" {
+		t.Fatalf("intl test failed: status=%s err=%s goErr=%v", r.Status, r.Error, err)
+	}
+	m, ok := r.Value.(map[string]any)
+	if !ok {
+		t.Fatalf("expected object result, got %#v", r.Value)
+	}
+	assertEq := func(key, want string) {
+		t.Helper()
+		if got, _ := m[key].(string); got != want {
+			t.Fatalf("%s: want %q, got %q", key, want, got)
+		}
+	}
+	assertEq("cnSummer", "2026/6/16 02:30:45")
+	assertEq("cnDate", "2026/06/16")
+	assertEq("cnTime", "02:30:45")
+	assertEq("svShanghai", "2026-06-16 02:30:45")
+	assertEq("laSummer", "6/15/2026, 11:30:45 AM")
+	assertEq("laWinter", "1/15/2026, 10:30:45 AM")
+	assertEq("laTimeWithTZ", "11:30:45 AM PDT")
+	assertEq("detachedOut", "2026/06/16 02:30:45 GMT+8")
+	assertEq("invalidLocale", "Invalid Date")
+
+	if got, _ := m["invalidFormatErr"].(string); !strings.HasPrefix(got, "RangeError:") {
+		t.Fatalf("expected RangeError on Invalid Date format, got %q", got)
+	}
+	if got, _ := m["badTZErr"].(string); !strings.HasPrefix(got, "RangeError:") {
+		t.Fatalf("expected RangeError on invalid timeZone, got %q", got)
+	}
+	if got, _ := m["emptyTZErr"].(string); !strings.HasPrefix(got, "RangeError:") {
+		t.Fatalf("expected RangeError on empty timeZone, got %q", got)
+	}
+	if got, _ := m["styleConflictErr"].(string); got != "TypeError" {
+		t.Fatalf("expected TypeError on dateStyle+year conflict, got %q", got)
+	}
+	parts, _ := m["partsMap"].(map[string]any)
+	if parts["year"] != "2026" || parts["month"] != "06" || parts["day"] != "16" || parts["hour"] != "02" || parts["timeZoneName"] != "GMT+8" {
+		t.Fatalf("unexpected formatToParts: %#v", parts)
+	}
+	resolved, _ := m["resolved"].(map[string]any)
+	if resolved["timeZone"] != "Asia/Shanghai" || resolved["hour12"] != false || resolved["hourCycle"] != "h23" {
+		t.Fatalf("unexpected resolvedOptions: %#v", resolved)
+	}
+}
+
+func TestTabEvalScriptOrFunctionSerialization(t *testing.T) {
+	callerVM := goja.New()
+	pageVM := goja.New()
+
+	var capturedScript string
+	var capturedIsFn bool
+	var capturedErr error
+	_ = callerVM.Set("compileEval", func(call goja.FunctionCall) goja.Value {
+		capturedScript, _, capturedIsFn, capturedErr = buildTabEvalScript(call)
+		return goja.Undefined()
+	})
+	_ = callerVM.Set("nativeFn", func(goja.FunctionCall) goja.Value { return goja.Undefined() })
+
+	// 1. String script mode works and rejects extra arguments.
+	if _, err := callerVM.RunString(`compileEval("2 + 3")`); err != nil || capturedErr != nil || capturedIsFn {
+		t.Fatalf("string mode failed: runErr=%v capErr=%v isFn=%v", err, capturedErr, capturedIsFn)
+	}
+	if val, err := pageVM.RunString(capturedScript); err != nil || val.ToInteger() != 5 {
+		t.Fatalf("string mode eval failed: val=%v err=%v", val, err)
+	}
+	if _, err := callerVM.RunString(`compileEval("2 + 3", 99)`); err != nil || capturedErr == nil || !strings.Contains(capturedErr.Error(), "pass a function") {
+		t.Fatalf("expected extra-arg error on string script, got %v", capturedErr)
+	}
+
+	// 2. Function + multi-arg serialization (undefined, null, Date, NaN, Infinity, nested object/array, trailing comment).
+	_, err := callerVM.RunString(`
+		compileEval(
+			(u, n, d, nanVal, infVal, cfg) => ({
+				uType: typeof u,
+				isNull: n === null,
+				isDate: d instanceof Date,
+				ms: d.getTime(),
+				isNaN: Number.isNaN(nanVal),
+				isInf: infVal === Infinity,
+				sum: cfg.nums[0] + cfg.nums[1],
+				tag: cfg.tag,
+			}) // trailing comment must not eat closing paren
+			,
+			undefined,
+			null,
+			new Date(1700000000000),
+			NaN,
+			Infinity,
+			{ tag: "v18.3", nums: [19, 23] }
+		);
+	`)
+	if err != nil || capturedErr != nil || !capturedIsFn {
+		t.Fatalf("fn mode compile failed: runErr=%v capErr=%v isFn=%v", err, capturedErr, capturedIsFn)
+	}
+	pageVal, err := pageVM.RunString(capturedScript)
+	if err != nil {
+		t.Fatalf("pageVM failed executing serialized fn (%s): %v", capturedScript, err)
+	}
+	pm, ok := pageVal.Export().(map[string]any)
+	if !ok || pm["uType"] != "undefined" || pm["isNull"] != true || pm["isDate"] != true || pm["ms"] != int64(1700000000000) || pm["isNaN"] != true || pm["isInf"] != true || pm["sum"] != int64(42) || pm["tag"] != "v18.3" {
+		t.Fatalf("unexpected pageVM fn eval result: %#v", pageVal.Export())
+	}
+
+	// 3. Shorthand method syntax (`{ calc(x) { return x + 10; } }.calc`).
+	if _, err := callerVM.RunString(`const o = { calc(x) { return x + 10; } }; compileEval(o.calc, 32);`); err != nil || capturedErr != nil {
+		t.Fatalf("shorthand method compile failed: runErr=%v capErr=%v", err, capturedErr)
+	}
+	if val, err := pageVM.RunString(capturedScript); err != nil || val.ToInteger() != 42 {
+		t.Fatalf("shorthand method page eval failed: val=%v err=%v script=%s", val, err, capturedScript)
+	}
+
+	// 4. Reject native/bound functions and unserializable function/Symbol arguments fast.
+	for _, tc := range []struct {
+		name string
+		js   string
+		want string
+	}{
+		{"native-fn", `compileEval(nativeFn)`, "native or bound"},
+		{"bound-fn", `compileEval(((x) => x).bind(null, 1))`, "native or bound"},
+		{"fn-arg", `compileEval((cb) => cb, () => 1)`, "is a function"},
+		{"symbol-arg", `compileEval((s) => s, Symbol("k"))`, "is a Symbol"},
+		{"nested-fn-arg", `compileEval((o) => o, { cb: () => 1 })`, "not JSON-serializable"},
+	} {
+		if _, err := callerVM.RunString(tc.js); err != nil {
+			t.Fatalf("%s run err: %v", tc.name, err)
+		}
+		if capturedErr == nil || !strings.Contains(capturedErr.Error(), tc.want) {
+			t.Fatalf("%s: expected error containing %q, got %v", tc.name, tc.want, capturedErr)
 		}
 	}
 }

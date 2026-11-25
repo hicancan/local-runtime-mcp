@@ -236,4 +236,5 @@ globalThis.URLSearchParams = URLSearchParams;
 globalThis.URL = URL;
 })();
 `)
+	v.installIntlGlobals()
 }

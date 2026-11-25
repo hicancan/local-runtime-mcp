@@ -9,7 +9,7 @@ Quick reference:
 - proc:    proc.run(program, args?, opts?) | proc.run({ cmd, shell?, cwd?, env?, stdin?, timeout_seconds?, max_output_tokens?, yield_time_ms?, io_mode? }) | proc.continue(opts) | proc.kill(session_id)
 - fs:      fs.list(path, opts?) | fs.stat(path, opts?) | fs.read(path, { start_line?, end_line?, line_count?, max_bytes?, with_sha256? }) | fs.write(path, content, opts?) | fs.patch(path, hunks, expected_sha256) | fs.search(path, query, opts?)
 - browser: browser.status() | browser.connect(browser_id?) | browser.tabs(browser_idOrOpts?) | browser.open(url, opts?) | browser.tab(id) | browser.cdp(method, params?, browser_id?) | browser.traceStart(opts?) | browser.traceStop(file_path?, browser_id?) | browser.cleanup()
-- tab:     tab.goto(url) | reload() | back() | forward() | close() | markHandoff() | snapshot(opts?) | screenshot(opts?) | eval(js) | cdp(method, params?) | getByRole/getByText/getByLabel/getByPlaceholder/locator | click/fill/press/scroll/handleDialog | network(filter?) | networkBody(req_id) | console(filter?) | emulate(opts) | css(selectorOrLoc) | heapSnapshot(file_path?) | logpoint(url, line, expr, col?) | screencastStart(opts?) | screencastStop()
+- tab:     tab.goto(url) | reload() | back() | forward() | close() | markHandoff() | snapshot(opts?) | screenshot(opts?) | eval(jsOrFn, ...args) | cdp(method, params?) | getByRole/getByText/getByLabel/getByPlaceholder/locator | click/fill/press/scroll/handleDialog | network(filter?) | networkBody(req_id) | console(filter?) | emulate(opts) | css(selectorOrLoc) | heapSnapshot(file_path?) | logpoint(url, line, expr, col?) | screencastStart(opts?) | screencastStop()
 - desktop: desktop.targets(opts?) | desktop.state(opts?) | desktop.wait(opts) | desktop.action(act) | desktop.control(kindOrOpts, opts?)
 - img:     img.read(path, opts?) | emitImage(imgOrShotOrPath, label?)
 - caps:    caps.list() | caps.call(name, args?, browser_id?, tab_id?)
@@ -78,7 +78,7 @@ Navigation & lifecycle:
 Inspection & scripting:
 - tab.snapshot({ diff?: true, max_elements?: 500, max_text?: 50000 }?) -> incremental AX tree + refs
 - tab.screenshot({ full_page?, clip_x?, clip_y?, clip_width?, clip_height? }?) -> pass result to emitImage(shot, label)
-- tab.eval(script) -> evaluates JS in page context and returns value
+- tab.eval(scriptOrFn, ...args) -> evaluates JS string or (fn, ...args) in page context (args are serialized across the VM boundary, e.g. tab.eval((id) => fetch('/api/' + id), id))
 - tab.cdp(method, params?) -> raw page-target CDP command
 Locators (sync handle -> async actions with auto-wait):
 - tab.locator(css | { role?, name?, exact?, text?, label?, placeholder?, css?, ref?, nth?, timeout_ms? })
@@ -124,6 +124,7 @@ DevTools:
 - sleep(ms) -> Promise<true> (capped at 300000ms)
 - setTimeout(fn, ms, ...args) / clearTimeout(id)
 - URL / URLSearchParams / atob(b64) / btoa(str)
+- Intl.DateTimeFormat & Date.prototype.toLocale{,Date,Time}String (embedded IANA tzdata; valid timeZone honored, invalid timeZone throws RangeError)
 - help(topic?) -> returns SDK documentation string`,
 }
 

@@ -82,7 +82,7 @@ flowchart TB
 
 | 原语 | 职责 |
 | --- | --- |
-| **`run(title, code, done_title?, yield_ms?, max_output_bytes?)`** | 在当前会话的持久 JS 虚拟机里并发调度 `proc`、`fs`、`browser`、`desktop`、`img`、`caps`、`emitImage`、`print`、`sleep`、`help()` 以及标准 Web 全局对象（`URL`、`URLSearchParams`、`atob`、`btoa`、`setTimeout`）。顶层 `let`/`const`/`var`/`function`/`class` 跨轮保留；末尾裸表达式自动回显在 `cell.value`。 |
+| **`run(title, code, done_title?, yield_ms?, max_output_bytes?)`** | 在当前会话的持久 JS 虚拟机里并发调度 `proc`、`fs`、`browser`、`desktop`、`img`、`caps`、`emitImage`、`print`、`sleep`、`help()` 以及标准 Web 全局对象（`URL`、`URLSearchParams`、`atob`、`btoa`、`setTimeout`、内嵌 IANA `tzdata` 的 `Intl.DateTimeFormat` 与 `Date.toLocale*String`）。顶层 `let`/`const`/`var`/`function`/`class` 跨轮保留；末尾裸表达式自动回显在 `cell.value`。 |
 | **`wait(cell_id, yield_ms?, terminate?)`** | 续接耗时较长的执行单元、收集增量输出与图片，或随时一键终止。 |
 | **`session(action='start'\|'update'\|'done', ...)`** | 单次只读查询可直接调用 `run` 免开闭会话；多步任务或打开浏览器标签页时用 `start` 建立命名任务线，`done` 时自动关闭未移交用户的临时标签页并明确回传 `closed_tabs`。 |
 | **`capability_propose(name, definition, script)`** | 模型探索完某个网站后，把可复用步骤写成确定性脚本提交提案，经主人在扩展 `L` 面板审代码批准后正式生效。 |
@@ -136,13 +136,13 @@ const [snap, css, reqs] = await Promise.all([
   - `browser.tab(id)` · `browser.cdp(method, params?, browser_id?)` · `browser.cleanup()`
   - `browser.traceStart({ browser_id?, tab_id?, reload?, ignore_cache?, categories? }?)` · `browser.traceStop(file_path?, browser_id?)`（`IO.read` 无损落盘原始轨迹 + 直接读取浏览器内核 Web Performance API：`ttfb_ms`、`fcp_ms`、`lcp_ms`、`dcl_ms`、`load_ms`、`cls`）
   - `tab.goto(url)` · `reload()` · `back()` · `forward()` · `close()` · `markHandoff()`
-  - `tab.snapshot({ diff?: true, max_elements?, max_text? }?)` · `tab.screenshot({ full_page?, clip_x?, clip_y?, clip_width?, clip_height? }?)` · `tab.eval(js)` · `tab.cdp(method, params?)`
+  - `tab.snapshot({ diff?: true, max_elements?, max_text? }?)` · `tab.screenshot({ full_page?, clip_x?, clip_y?, clip_width?, clip_height? }?)` · `tab.eval(jsOrFn, ...args)` · `tab.cdp(method, params?)`
   - 带自动等待的语义定位器：`tab.getByRole(role, nameOrOpts?)` · `getByText` · `getByLabel` · `getByPlaceholder` · `locator(css)` → `.click()` / `.doubleClick()` / `.hover()` / `.fill(t)` / `.type(t)` / `.press(k)` / `.select(o)` / `.check(b)` / `.uploadFiles(paths)` / `.waitFor({ timeout_ms? })` / `.nth(i)`
   - 全套 DevTools：`tab.network({ resource_types?, url_contains?, include_preserved?, failed_only?, limit? }?)` · `tab.networkBody(request_id)` · `tab.console({ levels?, limit? }?)` · `tab.emulate({ width?, height?, mobile?, cpu_throttling_rate?, network_preset?, color_scheme?, reduced_motion?, forced_colors?, user_agent?, geolocation?, extra_headers? })` · `tab.css(selectorOrLoc)` · `tab.heapSnapshot(file_path?)` · `tab.logpoint(url, line, expr, col?)` · `tab.screencastStart(opts?)` · `tab.screencastStop()`
 - **`desktop`** — 内嵌 Rust Windows Graphics Capture（窗口被遮挡也能清晰抓帧）+ UI Automation（观察和语义控件操作绝不抢焦点；仅物理键鼠需借用独占令牌，屏幕底部带可随时点停的提示条）：
   - `desktop.targets({ pid?, title?, process? }?)` · `desktop.state(opts?)` · `desktop.wait(opts)` · `desktop.action(act)` · `desktop.control("status"|"acquire"|"release", opts?)`
 - **`img` 与 `emitImage`** — `img.read(path, { max_bytes?, max_pixels?, crop_x?, crop_y?, crop_width?, crop_height?, max_width?, max_height? }?)` · `emitImage(imgOrShotOrPath, label?)` 直接回传原生 MCP 多模态图片。
-- **`caps` 与标准全局对象** — `caps.list()` · `caps.call(name, args?, browser_id?, tab_id?)` · `print(...)` · `sleep(ms)` · `setTimeout` / `clearTimeout` · `URL` / `URLSearchParams` · `atob` / `btoa` · `help(topic?)`。
+- **`caps` 与标准全局对象** — `caps.list()` · `caps.call(name, args?, browser_id?, tab_id?)` · `print(...)` · `sleep(ms)` · `setTimeout` / `clearTimeout` · `URL` / `URLSearchParams` · `atob` / `btoa` · `Intl.DateTimeFormat` / `Date.toLocale*String`（内嵌 IANA `tzdata`） · `help(topic?)`。
 
 </details>
 
