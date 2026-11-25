@@ -78,6 +78,7 @@ type EventFilter struct {
 	BeforeID  int64
 	AfterID   int64
 	Limit     int
+	Compact   bool
 }
 
 // Stats reports store-level observability metrics.
@@ -498,6 +499,26 @@ func (s *Store) RecordSystem(kind, summary string, detail any) {
 	s.broadcast(LivePacket{Type: "event", Event: &ev, Session: &sess})
 }
 
+// GetEvent retrieves one complete audit event by its numeric ID.
+func (s *Store) GetEvent(id int64) (Event, error) {
+	if s == nil {
+		return Event{}, sql.ErrNoRows
+	}
+	return s.getEvent(id)
+}
+
+// BlobPath returns the on-disk file path for a stored blob hash, if persisted.
+func (s *Store) BlobPath(hash string) string {
+	if s == nil || s.blobDir == "" || !validBlobHash.MatchString(hash) {
+		return ""
+	}
+	target := filepath.Join(s.blobDir, hash)
+	if _, err := os.Stat(target); err == nil {
+		return target
+	}
+	return ""
+}
+
 func (s *Store) getEvent(id int64) (Event, error) {
 	var e Event
 	err := s.db.QueryRow(`
@@ -577,10 +598,14 @@ func (s *Store) ListEvents(f EventFilter) ([]Event, error) {
 	if len(where) > 0 {
 		clause = "WHERE " + strings.Join(where, " AND ")
 	}
+	cols := "id, session_id, agent_id, wire, kind, tool_name, summary, args_json, result_json, image_blob, image_mime, status, error_text, duration_ms, created_at"
+	if f.Compact {
+		cols = "id, session_id, agent_id, wire, kind, tool_name, summary, '', '', image_blob, image_mime, status, error_text, duration_ms, created_at"
+	}
 	query := fmt.Sprintf(`
-		SELECT id, session_id, agent_id, wire, kind, tool_name, summary, args_json, result_json, image_blob, image_mime, status, error_text, duration_ms, created_at
+		SELECT %s
 		FROM events %s ORDER BY id DESC LIMIT ?
-	`, clause)
+	`, cols, clause)
 	args = append(args, limit)
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
@@ -608,12 +633,17 @@ func (s *Store) ListEvents(f EventFilter) ([]Event, error) {
 // Search executes a millisecond SQLite FTS5 trigram full-text search across all recorded events
 // (falling back cleanly to LIKE for 1-2 character queries).
 func (s *Store) Search(query string, limit int) ([]Event, error) {
+	return s.SearchWithOptions(query, limit, false)
+}
+
+// SearchWithOptions executes full-text search and optionally omits bulky args/result payloads.
+func (s *Store) SearchWithOptions(query string, limit int, compact bool) ([]Event, error) {
 	if s == nil {
 		return []Event{}, nil
 	}
 	q := strings.TrimSpace(query)
 	if q == "" {
-		return s.ListEvents(EventFilter{Limit: limit})
+		return s.ListEvents(EventFilter{Limit: limit, Compact: compact})
 	}
 	if limit <= 0 || limit > 200 {
 		limit = 80
@@ -622,28 +652,34 @@ func (s *Store) Search(query string, limit int) ([]Event, error) {
 		rows *sql.Rows
 		err  error
 	)
+	ftsCols := "e.id, e.session_id, e.agent_id, e.wire, e.kind, e.tool_name, e.summary, e.args_json, e.result_json, e.image_blob, e.image_mime, e.status, e.error_text, e.duration_ms, e.created_at"
+	plainCols := "id, session_id, agent_id, wire, kind, tool_name, summary, args_json, result_json, image_blob, image_mime, status, error_text, duration_ms, created_at"
+	if compact {
+		ftsCols = "e.id, e.session_id, e.agent_id, e.wire, e.kind, e.tool_name, e.summary, '', '', e.image_blob, e.image_mime, e.status, e.error_text, e.duration_ms, e.created_at"
+		plainCols = "id, session_id, agent_id, wire, kind, tool_name, summary, '', '', image_blob, image_mime, status, error_text, duration_ms, created_at"
+	}
 	useFTS := len([]rune(q)) >= 3
 	if useFTS {
 		// Quote user input safely for FTS5 trigram phrase matching.
 		safeFTS := `"` + strings.ReplaceAll(q, `"`, `""`) + `"`
-		rows, err = s.db.Query(`
-			SELECT e.id, e.session_id, e.agent_id, e.wire, e.kind, e.tool_name, e.summary, e.args_json, e.result_json, e.image_blob, e.image_mime, e.status, e.error_text, e.duration_ms, e.created_at
+		rows, err = s.db.Query(fmt.Sprintf(`
+			SELECT %s
 			FROM events_fts f
 			JOIN events e ON e.id = f.rowid
 			WHERE events_fts MATCH ?
 			ORDER BY e.id DESC
 			LIMIT ?
-		`, safeFTS, limit)
+		`, ftsCols), safeFTS, limit)
 	}
 	if !useFTS || err != nil {
 		like := "%" + q + "%"
-		rows, err = s.db.Query(`
-			SELECT id, session_id, agent_id, wire, kind, tool_name, summary, args_json, result_json, image_blob, image_mime, status, error_text, duration_ms, created_at
+		rows, err = s.db.Query(fmt.Sprintf(`
+			SELECT %s
 			FROM events
 			WHERE summary LIKE ? OR tool_name LIKE ? OR args_json LIKE ? OR result_json LIKE ? OR error_text LIKE ? OR agent_id LIKE ?
 			ORDER BY id DESC
 			LIMIT ?
-		`, like, like, like, like, like, like, limit)
+		`, plainCols), like, like, like, like, like, like, limit)
 		if err != nil {
 			return nil, err
 		}

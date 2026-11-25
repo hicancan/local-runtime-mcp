@@ -98,6 +98,23 @@ func TestSQLiteWALStoreRedactionFTS5BlobsAndLiveStream(t *testing.T) {
 		t.Fatalf("unexpected sessions: %v %+v", err, sessions)
 	}
 
+	// Compact list & search omit args_json/result_json; GetEvent + BlobPath recover full payload.
+	compactList, err := store.ListEvents(EventFilter{SessionID: sid, Compact: true, Limit: 20})
+	if err != nil || len(compactList) != 2 || compactList[0].ArgsJSON != "" || compactList[0].ResultJSON != "" {
+		t.Fatalf("compact list failed: %v %+v", err, compactList)
+	}
+	compactHits, err := store.SearchWithOptions("hello", 20, true)
+	if err != nil || len(compactHits) != 1 || compactHits[0].ArgsJSON != "" || compactHits[0].ResultJSON != "" {
+		t.Fatalf("compact search failed: %v %+v", err, compactHits)
+	}
+	fullEv, err := store.GetEvent(evID)
+	if err != nil || fullEv.ID != evID || fullEv.ArgsJSON == "" || fullEv.ResultJSON == "" {
+		t.Fatalf("GetEvent failed: %v %+v", err, fullEv)
+	}
+	if store.BlobPath(blobHash) == "" {
+		t.Fatalf("expected non-empty blob path for %s", blobHash)
+	}
+
 	// JSONL export produces valid lines.
 	var exported bytes.Buffer
 	if err := store.ExportJSONL(&exported, sid); err != nil {

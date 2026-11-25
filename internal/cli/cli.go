@@ -739,9 +739,10 @@ Usage:
   lrmcp tunnel status
   lrmcp grant remote <openai|http> [--read-only] [--tool NAME]
   lrmcp ui [--no-open]                               Open local Sovereign Activity & Audit Studio
-  lrmcp audit list [--limit N]                       List audited agent sessions
-  lrmcp audit events [--session ID] [--agent ID]     List recorded tool calls & notes
-  lrmcp audit search <query> [--limit N]             FTS5 full-text search across audit history
+  lrmcp audit list [--limit N]                       List audited sessions
+  lrmcp audit events [--session ID] [--compact]      List recorded tool calls & notes
+  lrmcp audit show <event_id>                        Inspect one full audit event by ID
+  lrmcp audit search <query> [--compact] [--limit N] FTS5 full-text search across audit history
   lrmcp audit tail [--agent ID] [--session ID]       Stream live events in real time
   lrmcp audit export [--session ID] [--output FILE]  Export audit stream as JSONL
   lrmcp setup browser [flags]

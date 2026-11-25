@@ -2,7 +2,9 @@ package connection
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -132,6 +134,7 @@ func newAdminHandler(
 	})
 
 	mux.HandleFunc("GET /admin/audit/events", func(w http.ResponseWriter, r *http.Request) {
+		compact := adminBoolQuery(r, "compact")
 		events, err := host.Audit().ListEvents(audit.EventFilter{
 			SessionID: r.URL.Query().Get("session_id"),
 			AgentID:   r.URL.Query().Get("agent_id"),
@@ -139,6 +142,7 @@ func newAdminHandler(
 			Kind:      r.URL.Query().Get("kind"),
 			Status:    r.URL.Query().Get("status"),
 			Limit:     adminIntQuery(r, "limit", 100, 1, 1000),
+			Compact:   compact,
 		})
 		if err != nil {
 			writeAdminError(w, http.StatusInternalServerError, "audit_error", err.Error())
@@ -147,10 +151,35 @@ func newAdminHandler(
 		writeAdminJSON(w, http.StatusOK, map[string]any{"events": events})
 	})
 
+	mux.HandleFunc("GET /admin/audit/events/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+		if err != nil || id <= 0 {
+			writeAdminError(w, http.StatusBadRequest, "invalid_request", "Provide a positive integer event id.")
+			return
+		}
+		ev, err := host.Audit().GetEvent(id)
+		if errors.Is(err, sql.ErrNoRows) {
+			writeAdminError(w, http.StatusNotFound, "not_found", "Audit event not found.")
+			return
+		}
+		if err != nil {
+			writeAdminError(w, http.StatusInternalServerError, "audit_error", err.Error())
+			return
+		}
+		resp := map[string]any{"event": ev}
+		if ev.ImageBlob != "" {
+			if p := host.Audit().BlobPath(ev.ImageBlob); p != "" {
+				resp["blob_path"] = p
+			}
+		}
+		writeAdminJSON(w, http.StatusOK, resp)
+	})
+
 	mux.HandleFunc("GET /admin/audit/search", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query().Get("q")
 		limit := adminIntQuery(r, "limit", 80, 1, 200)
-		events, err := host.Audit().Search(q, limit)
+		compact := adminBoolQuery(r, "compact")
+		events, err := host.Audit().SearchWithOptions(q, limit, compact)
 		if err != nil {
 			writeAdminError(w, http.StatusInternalServerError, "audit_error", err.Error())
 			return
@@ -251,6 +280,15 @@ func newAdminHandler(
 	})
 
 	return mux
+}
+
+func adminBoolQuery(r *http.Request, name string) bool {
+	switch r.URL.Query().Get(name) {
+	case "1", "true", "TRUE", "yes":
+		return true
+	default:
+		return false
+	}
 }
 
 func adminIntQuery(r *http.Request, name string, def, min, max int) int {

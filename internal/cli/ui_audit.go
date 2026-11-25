@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -80,7 +81,7 @@ func openBrowserURL(target string) error {
 
 func auditCmd(ctx context.Context, args []string, stdout, stderr io.Writer, configPath string) error {
 	if len(args) < 1 {
-		return errors.New("audit requires list, events, search, tail, or export")
+		return errors.New("audit requires list, events, show, search, tail, or export")
 	}
 	switch args[0] {
 	case "list", "sessions":
@@ -114,6 +115,7 @@ func auditCmd(ctx context.Context, args []string, stdout, stderr io.Writer, conf
 		agentID := flags.String("agent", "", "filter by agent ID")
 		wire := flags.String("wire", "", "filter by wire (local, cloudflare, openai, http, web)")
 		limit := flags.Int("limit", 100, "maximum events to return")
+		compact := flags.Bool("compact", false, "omit bulky args_json and result_json payloads")
 		localFlags := addLocalFlags(flags)
 		if err := flags.Parse(args[1:]); err != nil {
 			return err
@@ -138,6 +140,9 @@ func auditCmd(ctx context.Context, args []string, stdout, stderr io.Writer, conf
 		if *wire != "" {
 			q.Set("wire", *wire)
 		}
+		if *compact {
+			q.Set("compact", "1")
+		}
 		var resp struct {
 			Events []audit.Event `json:"events"`
 		}
@@ -146,9 +151,38 @@ func auditCmd(ctx context.Context, args []string, stdout, stderr io.Writer, conf
 		}
 		return writeJSON(stdout, resp)
 
+	case "show":
+		flags := flagSet("lrmcp audit show", stderr)
+		localFlags := addLocalFlags(flags)
+		if err := flags.Parse(args[1:]); err != nil {
+			return err
+		}
+		if flags.NArg() != 1 {
+			return errors.New("audit show requires one integer event ID")
+		}
+		id, err := strconv.ParseInt(flags.Arg(0), 10, 64)
+		if err != nil || id <= 0 {
+			return fmt.Errorf("invalid event ID %q", flags.Arg(0))
+		}
+		var overrides config.Overrides
+		localFlags.apply(&overrides)
+		cfg, err := config.Resolve(configPath, overrides)
+		if err != nil {
+			return err
+		}
+		var resp struct {
+			Event    audit.Event `json:"event"`
+			BlobPath string      `json:"blob_path,omitempty"`
+		}
+		if err := transport.AdminRequest(ctx, cfg.Local.Listen, cfg.Local.Token, http.MethodGet, fmt.Sprintf("/admin/audit/events/%d", id), nil, &resp); err != nil {
+			return err
+		}
+		return writeJSON(stdout, resp)
+
 	case "search":
 		flags := flagSet("lrmcp audit search", stderr)
 		limit := flags.Int("limit", 40, "maximum matches to return")
+		compact := flags.Bool("compact", false, "omit bulky args_json and result_json payloads")
 		localFlags := addLocalFlags(flags)
 		if err := flags.Parse(args[1:]); err != nil {
 			return err
@@ -166,6 +200,9 @@ func auditCmd(ctx context.Context, args []string, stdout, stderr io.Writer, conf
 		q := url.Values{}
 		q.Set("q", query)
 		q.Set("limit", fmt.Sprintf("%d", *limit))
+		if *compact {
+			q.Set("compact", "1")
+		}
 		var resp struct {
 			Query  string        `json:"query"`
 			Events []audit.Event `json:"events"`
@@ -263,7 +300,7 @@ func auditCmd(ctx context.Context, args []string, stdout, stderr io.Writer, conf
 		return err
 
 	default:
-		return errors.New("audit requires list, events, search, tail, or export")
+		return errors.New("audit requires list, events, show, search, tail, or export")
 	}
 }
 
