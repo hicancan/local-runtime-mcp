@@ -164,6 +164,12 @@ func (s *Studio) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Frame-Options", "DENY")
 
+	if (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+		(r.URL.Path == "/ui/favicon.svg" || r.URL.Path == "/favicon.svg" || r.URL.Path == "/favicon.ico") {
+		s.serveAsset(w, "favicon.svg")
+		return
+	}
+
 	if r.URL.Path == "/ui/auth" {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -477,7 +483,7 @@ func writeUnauthorizedHTML(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Security-Policy", studioCSP)
 	w.WriteHeader(http.StatusUnauthorized)
-	_, _ = io.WriteString(w, `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>lrmcp studio — locked</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f8f9fa;color:#111827}.card{max-width:420px;padding:28px 32px;background:#fff;border:1px solid #e5e7eb;border-radius:14px;box-shadow:0 2px 10px rgba(0,0,0,.04)}h1{margin:0 0 8px;font-size:18px;font-weight:600}p{margin:0 0 12px;font-size:14px;line-height:1.6;color:#4b5563}code{background:#f3f4f6;padding:2px 6px;border-radius:5px;font-size:13px;color:#111827}</style></head><body><div class="card"><h1>Local Runtime Studio</h1><p>This local-only dashboard requires a single-use owner session from your machine.</p><p>Run <code>lrmcp ui</code> in your terminal or click <strong>Studio</strong> in the <code>L</code> browser extension.</p></div></body></html>`)
+	_, _ = io.WriteString(w, `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>lrmcp studio — locked</title><link rel="icon" type="image/svg+xml" href="/ui/favicon.svg"><style>body{margin:0;min-height:100vh;display:grid;place-items:center;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f8f9fa;color:#111827}.card{max-width:420px;padding:28px 32px;background:#fff;border:1px solid #e5e7eb;border-radius:14px;box-shadow:0 2px 10px rgba(0,0,0,.04)}.head{display:flex;align-items:center;gap:10px;margin-bottom:10px}.head img{width:26px;height:26px;display:block}h1{margin:0;font-size:18px;font-weight:600}p{margin:0 0 12px;font-size:14px;line-height:1.6;color:#4b5563}code{background:#f3f4f6;padding:2px 6px;border-radius:5px;font-size:13px;color:#111827}</style></head><body><div class="card"><div class="head"><img src="/ui/favicon.svg" alt="lrmcp"><h1>Local Runtime Studio</h1></div><p>This local-only dashboard requires a single-use owner session from your machine.</p><p>Run <code>lrmcp ui</code> in your terminal or click <strong>Studio</strong> in the <code>L</code> browser extension.</p></div></body></html>`)
 }
 
 func parseIntQuery(r *http.Request, name string, def, min, max int) int {

@@ -75,12 +75,22 @@ func TestStudioSingleUseBootstrapCookieCSRFAndAuditAPI(t *testing.T) {
 		t.Fatalf("replayed bootstrap code was accepted: %d", replay.Code)
 	}
 
-	// Authenticated GET /ui/ returns HTML with strict CSP.
+	// Public brand favicons are served on loopback even before cookie bootstrap.
+	for _, iconPath := range []string{"/ui/favicon.svg", "/favicon.svg", "/favicon.ico"} {
+		iconRec := httptest.NewRecorder()
+		iconReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9317"+iconPath, nil)
+		studio.ServeHTTP(iconRec, iconReq)
+		if iconRec.Code != http.StatusOK || !strings.Contains(iconRec.Header().Get("Content-Type"), "image/svg+xml") || !strings.Contains(iconRec.Body.String(), "<svg") {
+			t.Fatalf("%s failed: code=%d ct=%q", iconPath, iconRec.Code, iconRec.Header().Get("Content-Type"))
+		}
+	}
+
+	// Authenticated GET /ui/ returns HTML with strict CSP and unified favicon/logo.
 	htmlRec := httptest.NewRecorder()
 	htmlReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9317/ui/", nil)
 	htmlReq.AddCookie(sessionCookie)
 	studio.ServeHTTP(htmlRec, htmlReq)
-	if htmlRec.Code != http.StatusOK || !strings.Contains(htmlRec.Body.String(), "lrmcp") || htmlRec.Header().Get("Content-Security-Policy") == "" {
+	if htmlRec.Code != http.StatusOK || !strings.Contains(htmlRec.Body.String(), "lrmcp") || !strings.Contains(htmlRec.Body.String(), "/ui/favicon.svg") || htmlRec.Header().Get("Content-Security-Policy") == "" {
 		t.Fatalf("GET /ui/ failed: %d", htmlRec.Code)
 	}
 

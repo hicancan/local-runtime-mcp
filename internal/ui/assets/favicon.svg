@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="86 63 360 360">
+  <defs>
+    <linearGradient id="lrmcp-g" x1="86" y1="63" x2="446" y2="423" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#00C6FF"/>
+      <stop offset="55%" stop-color="#0A6CFF"/>
+      <stop offset="100%" stop-color="#5B3FD8"/>
+    </linearGradient>
+  </defs>
+  <path d="M206 140 V346 H326" fill="none" stroke="url(#lrmcp-g)" stroke-width="88" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

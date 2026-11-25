@@ -111,9 +111,10 @@ func NewLocalHTTP(localServer *mcp.Server, cfg LocalConfig) (*LocalServer, error
 			return
 		}
 
-		// Local Studio UI (/ui and /ui/*) is strictly loopback-only, never forwarded,
-		// and handles its own single-use bootstrap cookie and same-origin CSRF checks.
-		if r.URL.Path == "/ui" || strings.HasPrefix(r.URL.Path, "/ui/") {
+		// Local Studio UI (/ui, /ui/*, and public brand favicons) is strictly loopback-only,
+		// never forwarded, and handles its own single-use bootstrap cookie and CSRF checks.
+		if r.URL.Path == "/ui" || strings.HasPrefix(r.URL.Path, "/ui/") ||
+			r.URL.Path == "/favicon.ico" || r.URL.Path == "/favicon.svg" {
 			if !hasOwner || cfg.UI == nil {
 				writeLocalError(w, http.StatusNotFound, "not_found", "Local Studio UI is not enabled.")
 				return

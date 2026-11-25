@@ -69,10 +69,7 @@ html, body { height: 100%; margin: 0; padding: 0; background: var(--bg); color: 
 .brand { display: flex; align-items: center; justify-content: space-between; padding: 2px 6px; }
 .brand-left { display: flex; align-items: center; gap: 8px; }
 .logo {
-  width: 24px; height: 24px; border-radius: 7px;
-  background: var(--ink); color: var(--bg);
-  display: grid; place-items: center;
-  font-weight: 700; font-size: 13px; letter-spacing: -0.02em;
+  width: 24px; height: 24px; flex-shrink: 0; display: block;
 }
 .brand-name { font-weight: 600; font-size: 15px; letter-spacing: -0.02em; }
 .sse-pill {
