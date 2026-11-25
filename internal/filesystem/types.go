@@ -61,21 +61,21 @@ type TextPatchHunk struct {
 }
 
 type ReadTextOptions struct {
-	StartLine  int
-	LineCount  int
-	MaxBytes   int
-	WithSHA256 bool
+	StartLine  int  `json:"start_line,omitempty"`
+	LineCount  int  `json:"line_count,omitempty"`
+	MaxBytes   int  `json:"max_bytes,omitempty"`
+	WithSHA256 bool `json:"with_sha256,omitempty"`
 }
 
 type WriteTextOptions struct {
-	Mode           string
-	ExpectedSHA256 string
-	CreateParents  bool
+	Mode           string `json:"mode,omitempty"`
+	ExpectedSHA256 string `json:"expected_sha256,omitempty"`
+	CreateParents  bool   `json:"create_parents,omitempty"`
 }
 
 type PatchTextOptions struct {
-	Hunks          []TextPatchHunk
-	ExpectedSHA256 string
+	Hunks          []TextPatchHunk `json:"hunks"`
+	ExpectedSHA256 string          `json:"expected_sha256"`
 }
 
 type SearchMatch struct {

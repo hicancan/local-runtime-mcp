@@ -22,19 +22,31 @@ import (
 
 const Version = version.Version
 
-const instructions = `Local Runtime MCP (v18) exposes this machine through 4 orthogonal primitives:
-1. run(title, code, done_title?, yield_ms?, max_output_bytes?): Execute stateful async JavaScript in your session's persistent VM. Top-level variables & functions persist across turns. Parallelize independent I/O with await Promise.allSettled([...]). Always pass a concise human-readable title (and optional done_title) describing what this step does.
-   Built-in async SDK inside run:
-   - proc.run({ cmd, shell?, cwd?, max_output_tokens?, timeout_seconds? }) or proc.run(program, args, opts); proc.continue(opts); proc.kill(session_id)
-   - fs.list / fs.stat / fs.read / fs.write / fs.patch / fs.search (path-locked atomic writes with expected_sha256)
-   - browser.status / browser.connect / browser.tabs / browser.open(url, { browser_id?, active?, session_name? }) / browser.tab(id) / browser.cdp(method, params, browser_id?) / browser.traceStart / browser.traceStop / browser.cleanup
-     TabHandle: tab.goto / reload / back / forward / close / snapshot({ diff: true }) / screenshot / eval / cdp(method, params) / getByRole / getByText / getByLabel / getByPlaceholder / locator (with .click/.fill/.type/.press/.select/.check/.uploadFiles/.waitFor) / network / networkBody / console / emulate / css / heapSnapshot / logpoint / screencastStart / screencastStop / markHandoff()
-   - desktop.targets / desktop.state / desktop.wait / desktop.action / desktop.control('acquire'|'status'|'release')
-   - img.read(path, opts); emitImage(imgOrShotOrPath, label?) returns native MCP ImageContent
-   - caps.list() / caps.call(name, args, browser_id?, tab_id?); print(...); sleep(ms)
-2. wait(cell_id, yield_ms?, terminate?): Continue awaiting incremental output/images or cancel a running cell.
-3. session(action='start'|'update'|'done', title?, message?, status?, session_id?, agent_id?): Open a fresh named task thread (action='start'), post major milestones ('update'), or finish and reclaim temporary browser tabs ('done').
-4. capability_propose(name, definition, script): Propose a reusable owner-approved site tool.`
+const instructions = `Local Runtime MCP (lrmcp) exposes this machine via 4 orthogonal primitives:
+- run(title, code, ...): stateful async JS runtime with concurrent proc, fs, browser (native browser-level CDP + DevTools + Tracing), desktop, img, caps, emitImage, print, sleep, and help(topic?). See run's description for exact SDK signatures.
+- Call run directly for one-off queries. Use session(action='start'...'done') for multi-step tasks or whenever opening temporary browser tabs so 'done' reclaims them. Use wait(cell_id) to continue or cancel a running cell.`
+
+const runToolDescription = `Execute async JavaScript in this session's persistent VM (top-level let/const/var/function persist across turns; bare final expressions auto-return in cell.value; parallelize with await Promise.allSettled([...]); call help(topic?) anytime for full docs). All SDK options use strict snake_case and fail fast on unknown fields.
+
+SDK signatures (all async unless noted):
+- proc.run(program, args?, { cwd?, env?, stdin?, keep_stdin_open?, timeout_seconds?, max_output_tokens?, yield_time_ms?, io_mode? })
+  or proc.run({ cmd, shell?: "pwsh"|"cmd"|"bash"|"sh", cwd?, env?, stdin?, timeout_seconds?, max_output_tokens?, yield_time_ms?, io_mode? })
+  -> { session_id?, program, cwd, exit_code, running, timed_out, duration_ms, stdout, stderr, output_cursor }
+- proc.continue({ session_id, output_cursor?, stdin?, close_stdin?, terminate?, yield_time_ms? }); proc.kill(session_id)
+- fs.list(path, { max_depth?, include_hidden?, max_entries? }?) -> { entries: [{ path, type, size?, modified_at }], truncated, skipped }
+- fs.stat(path, { with_sha256? }?) -> { path, type, size, modified_at, mime_type?, sha256? }
+- fs.read(path, { start_line?, end_line?, line_count?, max_bytes?, with_sha256? }?) -> { path, content, size, start_line, end_line, next_line?, truncated, sha256? }
+- fs.write(path, content, { mode?: "create"|"replace", expected_sha256?, create_parents? }?) -> { path, bytes, created, sha256 }
+- fs.patch(path, [{ before?, old, new, after? }], expected_sha256) -> { path, bytes, hunks, sha256 }
+- fs.search(path, query, { regex?, case_sensitive?, include_hidden?, max_results? }?) -> { matches: [{ path, line, column, text }], truncated }
+- browser.status() -> { connected, extension_connected, instances: [{ browser_id, label, state, cdp_url, connected, extension_version }] }
+- browser.connect(browser_id?); browser.tabs(browser_id? | { browser_id?, include_workers? }?) -> TabHandle[]
+- browser.open(url, { browser_id?, active?, session_name? }?) -> TabHandle; browser.tab(id) (sync); browser.cleanup()
+- browser.cdp(method, params?, browser_id?); browser.traceStart({ browser_id?, tab_id?, reload?, ignore_cache?, categories? }?); browser.traceStop(file_path?, browser_id?)
+- TabHandle (.id/.title/.url/.browser_id): .goto(url) | .reload() | .back() | .forward() | .close() | .markHandoff() (sync) | .snapshot({ diff?, max_elements?, max_text? }?) | .screenshot({ full_page?, clip_x?, clip_y?, clip_width?, clip_height? }?) | .eval(js) | .cdp(method, params?) | .getByRole(role, nameOrOpts?)/.getByText/.getByLabel/.getByPlaceholder/.locator(css) -> .click()/.fill(t)/.type(t)/.press(k)/.select(o)/.check(b)/.uploadFiles(paths)/.waitFor({ timeout_ms? })/.nth(i) | .network({ resource_types?, url_contains?, failed_only?, limit? }?) | .networkBody(req_id) | .console({ levels?, limit? }?) | .emulate({ width?, height?, mobile?, cpu_throttling_rate?, network_preset?, color_scheme?, ... }) | .css(selectorOrLoc) | .heapSnapshot(path?) | .logpoint(url, line, expr, col?) | .screencastStart(opts?) | .screencastStop()
+- desktop.targets({ pid?, title?, process? }?) -> { displays, windows }; desktop.state(opts?); desktop.wait(opts); desktop.action(act); desktop.control("status"|"acquire"|"release", { control_id?, label? }?)
+- img.read(path, { max_width?, max_height?, crop_x?, crop_y?, crop_width?, crop_height? }?); emitImage(imgOrShotOrPath, label?) (sync)
+- caps.list() -> Capability[]; caps.call(name, args?, browser_id?, tab_id?); help(topic?) (sync); print(...); sleep(ms)`
 
 // ToolFilter reports whether a tool with the given name and side-effect hints
 // should be visible and callable on this MCP server.
@@ -228,7 +240,7 @@ func runToolSpec(m *Managed, defaultWire string) toolSpec {
 		tool(
 			"run",
 			"Run stateful runtime script",
-			"Execute async JavaScript in this session's persistent VM with full concurrent access to proc, fs, browser (full browser-level CDP + Tracing + DevTools + AX diff + semantic locators), desktop (Rust UIA + control), img, caps, emitImage, print, and sleep. Parallelize independent calls with await Promise.allSettled([...]).",
+			runToolDescription,
 			true, false, false, true,
 		),
 		func(schema *jsonschema.Schema) {

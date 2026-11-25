@@ -83,10 +83,10 @@ func (e *Engine) Close() {
 }
 
 // CloseSession terminates the persistent JS VM and cleans up temporary browser
-// tabs owned by sessionID.
-func (e *Engine) CloseSession(ctx context.Context, sessionID string) {
+// tabs owned by sessionID, returning the number of closed tabs.
+func (e *Engine) CloseSession(ctx context.Context, sessionID string) int {
 	if e == nil || sessionID == "" {
-		return
+		return 0
 	}
 	e.mu.Lock()
 	vm := e.sessions[sessionID]
@@ -96,8 +96,9 @@ func (e *Engine) CloseSession(ctx context.Context, sessionID string) {
 		vm.close()
 	}
 	if e.deps.Browser != nil {
-		e.deps.Browser.CleanupSessionTabs(ctx, sessionID)
+		return e.deps.Browser.CleanupSessionTabs(ctx, sessionID)
 	}
+	return 0
 }
 
 func (e *Engine) reaperLoop() {
@@ -361,8 +362,7 @@ func (v *sessionVM) loop() {
 }
 
 func (v *sessionVM) startCell(cell *cellRun, code string) error {
-	wrapped := wrapReplCode(code)
-	prog, err := goja.Compile("cell.js", wrapped, false)
+	prog, err := compileReplCode(code)
 	if err != nil {
 		return fmt.Errorf("JavaScript syntax error: %w", err)
 	}
@@ -476,6 +476,13 @@ func (v *sessionVM) spawnAsync(opName, target string, fn func(context.Context) (
 }
 
 func (v *sessionVM) rejected(err error) goja.Value {
+	return v.rejectedOp("sdk.validation", "", err)
+}
+
+func (v *sessionVM) rejectedOp(opName, target string, err error) goja.Value {
+	if cell := v.currentCell(); cell != nil && err != nil {
+		cell.recordSubOp(opName, target, 0, err)
+	}
 	p, _, reject := v.vm.NewPromise()
 	_ = reject(v.vm.NewGoError(err))
 	return v.vm.ToValue(p)

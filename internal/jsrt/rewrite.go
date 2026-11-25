@@ -3,6 +3,8 @@ package jsrt
 import (
 	"strings"
 	"unicode"
+
+	"github.com/dop251/goja"
 )
 
 // wrapReplCode wraps arbitrary async JS code inside an async IIFE while hoisting
@@ -11,6 +13,260 @@ import (
 func wrapReplCode(code string) string {
 	rewritten := hoistTopLevelDeclarations(code)
 	return "(async () => {\n" + rewritten + "\n})"
+}
+
+// compileReplCode hoists top-level bindings and, when the final top-level
+// statement is a pure expression (not a declaration or control-flow statement),
+// automatically returns its value just like an interactive JS REPL.
+func compileReplCode(code string) (*goja.Program, error) {
+	rewritten := hoistTopLevelDeclarations(code)
+	if candidate, ok := tryAutoReturnLastExpr(code, rewritten); ok {
+		if prog, err := goja.Compile("cell.js", candidate, false); err == nil {
+			return prog, nil
+		}
+	}
+	return goja.Compile("cell.js", "(async () => {\n"+rewritten+"\n})", false)
+}
+
+// tryAutoReturnLastExpr checks if the last top-level statement in rewritten
+// is a pure expression (and was not originally a let/const/var/function
+// declaration) and wraps it with `return (<expr>);`.
+func tryAutoReturnLastExpr(orig, rewritten string) (string, bool) {
+	// Reject if the original code's last top-level statement was a declaration
+	// (which hoistTopLevelDeclarations turned into `globalThis.x = ...`).
+	_, origLast := splitLastTopLevelStmt(orig)
+	origTrim := trimLeadingCommentsAndSpace(origLast)
+	if origTrim == "" {
+		return "", false
+	}
+	firstWord := leadingIdent(origTrim)
+	switch firstWord {
+	case "let", "const", "var", "function", "class",
+		"return", "throw", "if", "for", "while", "do", "switch", "try",
+		"break", "continue", "debugger", "with", "import", "export":
+		return "", false
+	case "async":
+		rest := trimLeadingCommentsAndSpace(origTrim[len("async"):])
+		if leadingIdent(rest) == "function" {
+			return "", false
+		}
+	}
+	if origTrim[0] == '{' {
+		// Could be a block statement `{ ... }`; don't guess as object literal.
+		return "", false
+	}
+
+	prefix, last := splitLastTopLevelStmt(rewritten)
+	lastTrim := strings.TrimSpace(strings.TrimRight(strings.TrimSpace(last), ";"))
+	if lastTrim == "" {
+		return "", false
+	}
+	return "(async () => {\n" + prefix + "\nreturn (\n" + lastTrim + "\n);\n})", true
+}
+
+// splitLastTopLevelStmt splits src into (everything before the last non-empty
+// top-level statement, the last non-empty top-level statement).
+func splitLastTopLevelStmt(src string) (string, string) {
+	n := len(src)
+	brace, paren, bracket := 0, 0, 0
+	var starts []int
+	stmtStart := true
+	curStart := -1
+
+	flushStmt := func(end int) {
+		if curStart >= 0 && curStart < end {
+			if strings.TrimSpace(trimLeadingCommentsAndSpace(src[curStart:end])) != "" {
+				starts = append(starts, curStart)
+			}
+		}
+		curStart = -1
+		stmtStart = true
+	}
+
+	i := 0
+	for i < n {
+		ch := src[i]
+		// Line comment
+		if ch == '/' && i+1 < n && src[i+1] == '/' {
+			i += 2
+			for i < n && src[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		// Block comment
+		if ch == '/' && i+1 < n && src[i+1] == '*' {
+			i += 2
+			for i+1 < n && !(src[i] == '*' && src[i+1] == '/') {
+				i++
+			}
+			if i+1 < n {
+				i += 2
+			}
+			continue
+		}
+		// Strings
+		if ch == '\'' || ch == '"' {
+			if stmtStart && brace == 0 && paren == 0 && bracket == 0 {
+				curStart = i
+				stmtStart = false
+			}
+			q := ch
+			i++
+			for i < n {
+				if src[i] == '\\' && i+1 < n {
+					i += 2
+					continue
+				}
+				if src[i] == q {
+					i++
+					break
+				}
+				i++
+			}
+			continue
+		}
+		// Template literal
+		if ch == '`' {
+			if stmtStart && brace == 0 && paren == 0 && bracket == 0 {
+				curStart = i
+				stmtStart = false
+			}
+			i++
+			exprDepth := 0
+			for i < n {
+				if src[i] == '\\' && i+1 < n {
+					i += 2
+					continue
+				}
+				if exprDepth == 0 {
+					if src[i] == '`' {
+						i++
+						break
+					}
+					if src[i] == '$' && i+1 < n && src[i+1] == '{' {
+						exprDepth = 1
+						i += 2
+						continue
+					}
+					i++
+					continue
+				}
+				if src[i] == '{' {
+					exprDepth++
+				} else if src[i] == '}' {
+					exprDepth--
+				}
+				i++
+			}
+			continue
+		}
+
+		if ch == ' ' || ch == '\t' || ch == '\r' {
+			i++
+			continue
+		}
+		if ch == '\n' {
+			if brace == 0 && paren == 0 && bracket == 0 && !stmtStart {
+				// Only split on newline if the next non-space token isn't a
+				// continuation operator (like '.', '?.', ')', ']', ',', '?').
+				next := skipSpacesAndNewlines(src, i+1)
+				if next < n && !isContinuationByte(src[next]) {
+					flushStmt(i)
+				}
+			}
+			i++
+			continue
+		}
+		if ch == ';' && brace == 0 && paren == 0 && bracket == 0 {
+			flushStmt(i)
+			i++
+			continue
+		}
+
+		if stmtStart && brace == 0 && paren == 0 && bracket == 0 {
+			curStart = i
+			stmtStart = false
+		}
+		switch ch {
+		case '{':
+			brace++
+		case '}':
+			if brace > 0 {
+				brace--
+			}
+		case '(':
+			paren++
+		case ')':
+			if paren > 0 {
+				paren--
+			}
+		case '[':
+			bracket++
+		case ']':
+			if bracket > 0 {
+				bracket--
+			}
+		}
+		i++
+	}
+	flushStmt(n)
+	if len(starts) == 0 {
+		return src, ""
+	}
+	lastIdx := starts[len(starts)-1]
+	return src[:lastIdx], src[lastIdx:]
+}
+
+func skipSpacesAndNewlines(s string, i int) int {
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n') {
+		i++
+	}
+	return i
+}
+
+func isContinuationByte(b byte) bool {
+	return b == '.' || b == '?' || b == ':' || b == ')' || b == ']' || b == ',' || b == '+' || b == '-' || b == '*' || b == '/' || b == '&' || b == '|'
+}
+
+func trimLeadingCommentsAndSpace(s string) string {
+	i := 0
+	n := len(s)
+	for i < n {
+		for i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n') {
+			i++
+		}
+		if i+1 < n && s[i] == '/' && s[i+1] == '/' {
+			i += 2
+			for i < n && s[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		if i+1 < n && s[i] == '/' && s[i+1] == '*' {
+			i += 2
+			for i+1 < n && !(s[i] == '*' && s[i+1] == '/') {
+				i++
+			}
+			if i+1 < n {
+				i += 2
+			}
+			continue
+		}
+		break
+	}
+	return s[i:]
+}
+
+func leadingIdent(s string) string {
+	if len(s) == 0 || !isIdentStart(s[0]) {
+		return ""
+	}
+	end := 1
+	for end < len(s) && isIdentPart(s[end]) {
+		end++
+	}
+	return s[:end]
 }
 
 func hoistTopLevelDeclarations(src string) string {

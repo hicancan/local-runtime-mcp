@@ -500,6 +500,14 @@ func (b *Bridge) resolveClient(ctx context.Context, browserID string, forceRetry
 		b.mu.Unlock()
 		return nil, fmt.Errorf("remote debugging connection to %s was declined; call browser.connect(%q) to retry", entry.discovered.Label, entry.discovered.ID)
 	}
+	if !forceRetry && entry.state == "awaiting_approval" {
+		b.mu.Unlock()
+		return nil, fmt.Errorf("%s is awaiting one-time 'Allow' on its remote debugging prompt (%s); click Allow in the browser then call browser.connect(%q)", entry.discovered.Label, entry.discovered.WSURL, entry.discovered.ID)
+	}
+	if entry.dialing {
+		b.mu.Unlock()
+		return nil, fmt.Errorf("%s already has a pending remote debugging connection awaiting one-time 'Allow' (%s)", entry.discovered.Label, entry.discovered.WSURL)
+	}
 	entry.state = "awaiting_approval"
 	entry.dialing = true
 	disc := entry.discovered
@@ -522,7 +530,7 @@ func (b *Bridge) resolveClient(ctx context.Context, browserID string, forceRetry
 	dialCtx := ctx
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
-		dialCtx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		dialCtx, cancel = context.WithTimeout(ctx, 12*time.Second)
 		defer cancel()
 	}
 

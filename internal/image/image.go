@@ -33,14 +33,14 @@ const (
 )
 
 type ReadOptions struct {
-	MaxBytes   int
-	MaxPixels  int
-	CropX      int
-	CropY      int
-	CropWidth  int
-	CropHeight int
-	MaxWidth   int
-	MaxHeight  int
+	MaxBytes   int `json:"max_bytes,omitempty"`
+	MaxPixels  int `json:"max_pixels,omitempty"`
+	CropX      int `json:"crop_x,omitempty"`
+	CropY      int `json:"crop_y,omitempty"`
+	CropWidth  int `json:"crop_width,omitempty"`
+	CropHeight int `json:"crop_height,omitempty"`
+	MaxWidth   int `json:"max_width,omitempty"`
+	MaxHeight  int `json:"max_height,omitempty"`
 }
 
 type ReadResult struct {

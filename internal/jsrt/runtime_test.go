@@ -231,3 +231,121 @@ func TestRewritePreservesForLoopsAndStrings(t *testing.T) {
 		t.Fatalf("unexpected rewrite result: %#v", m)
 	}
 }
+
+func TestStrictValidationReplAutoReturnHelpAndSubOpErrors(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	sample := filepath.Join(dir, "lines.txt")
+	var lines []string
+	for i := 1; i <= 40; i++ {
+		lines = append(lines, "line-"+string(rune('0'+i/10))+string(rune('0'+i%10)))
+	}
+	if err := os.WriteFile(sample, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	eng := NewEngine(ctx, Dependencies{Filesystem: filesystem.New()})
+	defer eng.Close()
+
+	// 1. fs.read with start_line + end_line AND bare expression REPL auto-return.
+	r1, err := eng.Run(ctx, RunOptions{
+		SessionID: "sess-strict",
+		Title:     "验证行范围与末表达式自动返回",
+		Code:      `await fs.read(` + "`" + filepath.ToSlash(sample) + "`" + `, { start_line: 3, end_line: 7 })`,
+	})
+	if err != nil || r1.Status != "done" {
+		t.Fatalf("fs.read range failed: %#v err=%v", r1, err)
+	}
+	m1, ok := r1.Value.(map[string]any)
+	if !ok || m1["start_line"] != float64(3) || m1["end_line"] != float64(7) {
+		t.Fatalf("expected lines 3..7 via REPL auto-return, got %#v", r1.Value)
+	}
+
+	// 2. Unknown field, extra positional args, and object-as-path must fail fast with signature hints.
+	r2, err := eng.Run(ctx, RunOptions{
+		SessionID: "sess-strict",
+		Title:     "验证非法参数立即报错",
+		Code: `
+			const f = ` + "`" + filepath.ToSlash(sample) + "`" + `;
+			const res = await Promise.allSettled([
+				fs.read(f, { startLine: 1, endLine: 5 }),
+				fs.read(f, 1, 5),
+				fs.read({ path: f, start_line: 1, end_line: 5 }),
+				caps.list(),
+			]);
+			res.map(x => x.status === 'rejected' ? String(x.reason) : 'ok')
+		`,
+	})
+	if err != nil || r2.Status != "done" {
+		t.Fatalf("strict validation cell failed: %#v err=%v", r2, err)
+	}
+	arr, ok := r2.Value.([]any)
+	if !ok || len(arr) != 4 {
+		t.Fatalf("expected 4 results, got %#v", r2.Value)
+	}
+	for i := 0; i < 3; i++ {
+		s, _ := arr[i].(string)
+		if !strings.Contains(s, "signature:") {
+			t.Fatalf("case %d expected signature hint in error, got %q", i, s)
+		}
+	}
+	if arr[3] != "ok" {
+		t.Fatalf("expected caps.list ok, got %#v", arr[3])
+	}
+	// caps.list must be recorded in sub_ops.
+	foundCaps := false
+	for _, op := range r2.SubOps {
+		if op.Op == "caps.list" {
+			foundCaps = true
+		}
+	}
+	if !foundCaps {
+		t.Fatalf("expected caps.list in sub_ops, got %#v", r2.SubOps)
+	}
+	// All 3 parameter validation errors must also be recorded in sub_ops and counted in sub_op_errors!
+	if r2.SubOpErrors != 3 {
+		t.Fatalf("expected 3 recorded validation errors in sub_op_errors, got %d (%#v)", r2.SubOpErrors, r2.SubOps)
+	}
+
+	// 3. sub_op_errors reports failed async sub-ops inside a done cell.
+	r3, err := eng.Run(ctx, RunOptions{
+		SessionID: "sess-strict",
+		Title:     "验证子操作失败计数",
+		Code: `
+			await Promise.allSettled([
+				fs.read(` + "`" + filepath.ToSlash(filepath.Join(dir, "missing.txt")) + "`" + `),
+				caps.list(),
+			]);
+			"done"
+		`,
+	})
+	if err != nil || r3.Status != "done" || r3.SubOpErrors != 1 {
+		t.Fatalf("expected status=done sub_op_errors=1, got %#v err=%v", r3, err)
+	}
+
+	// 4. fs.write expected_sha256 JSON tag actually enforces optimistic lock.
+	r4, err := eng.Run(ctx, RunOptions{
+		SessionID: "sess-strict",
+		Title:     "验证 expected_sha256 乐观锁",
+		Code: `
+			await fs.write(` + "`" + filepath.ToSlash(sample) + "`" + `, "overwrite", { mode: "replace", expected_sha256: "0000000000000000000000000000000000000000000000000000000000000000" });
+		`,
+	})
+	if err != nil || r4.Status != "error" || !strings.Contains(strings.ToLower(r4.Error), "sha256") {
+		t.Fatalf("expected sha256 mismatch rejection, got %#v err=%v", r4, err)
+	}
+
+	// 5. Built-in help() returns signature docs via REPL auto-return.
+	r5, err := eng.Run(ctx, RunOptions{
+		SessionID: "sess-strict",
+		Title:     "验证内置 help 文档",
+		Code:      `help("fs.read")`,
+	})
+	if err != nil || r5.Status != "done" {
+		t.Fatalf("help failed: %#v err=%v", r5, err)
+	}
+	doc, _ := r5.Value.(string)
+	if !strings.Contains(doc, "end_line") || !strings.Contains(doc, "fs.read") {
+		t.Fatalf("unexpected help doc: %q", doc)
+	}
+}

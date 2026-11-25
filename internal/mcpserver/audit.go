@@ -33,11 +33,11 @@ type sessionInput struct {
 }
 
 type sessionOutput struct {
-	Recorded      bool   `json:"recorded"`
-	EventID       int64  `json:"event_id,omitempty"`
-	SessionID     string `json:"session_id,omitempty"`
-	Status        string `json:"status,omitempty"`
-	ClosedTabs    int    `json:"closed_tabs,omitempty"`
+	Recorded   bool   `json:"recorded"`
+	EventID    int64  `json:"event_id,omitempty"`
+	SessionID  string `json:"session_id,omitempty"`
+	Status     string `json:"status,omitempty"`
+	ClosedTabs *int   `json:"closed_tabs,omitempty"`
 }
 
 func shortTaskID() string {
@@ -89,7 +89,7 @@ func sessionToolSpec(m *Managed, store *audit.Store, defaultWire string) toolSpe
 		tool(
 			"session",
 			"Manage task session & milestones",
-			"Manage the logical task thread in lrmcp ui: call action='start' with title when beginning a distinct task, action='update' for major milestones, and action='done' when finished (automatically reclaiming temporary browser tabs not marked via markHandoff).",
+			"Optional for one-off read-only queries (call run directly instead). Use action='start' with title for multi-step tasks or browser workflows, action='update' for major milestones, and action='done' when finished to close the task thread and reclaim temporary browser tabs not marked via markHandoff.",
 			true, false, false, false,
 		),
 		func(schema *jsonschema.Schema) {
@@ -147,9 +147,13 @@ func sessionToolSpec(m *Managed, store *audit.Store, defaultWire string) toolSpe
 					}
 				}
 
-				closedTabs := 0
-				if action == "done" && m.runtime != nil {
-					m.runtime.CloseSession(ctx, sid)
+				var closedTabs *int
+				if action == "done" {
+					n := 0
+					if m.runtime != nil {
+						n = m.runtime.CloseSession(ctx, sid)
+					}
+					closedTabs = &n
 				}
 
 				if store == nil {
