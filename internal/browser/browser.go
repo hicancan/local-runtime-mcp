@@ -685,11 +685,14 @@ func (b *Bridge) OpenWithOptions(ctx context.Context, opts OpenOptions) (Tab, er
 	if err != nil {
 		return Tab{}, err
 	}
+	// Create at about:blank first, attach & enable Network/Page/Runtime/DOM,
+	// then navigate via Page.navigate so main-document requests are captured
+	// from byte 0 and waitReady never mistakes initial about:blank for loaded.
 	var created struct {
 		TargetID string `json:"targetId"`
 	}
 	if err := cl.Send(opCtx, "", "Target.createTarget", map[string]any{
-		"url":        opts.URL,
+		"url":        "about:blank",
 		"background": !opts.Active,
 	}, &created); err != nil {
 		return Tab{}, err
@@ -703,7 +706,22 @@ func (b *Bridge) OpenWithOptions(ctx context.Context, opts OpenOptions) (Tab, er
 		return Tab{}, err
 	}
 	if opts.URL != "about:blank" {
-		_ = cl.waitReady(opCtx, ts, 20*time.Second)
+		ts.mu.Lock()
+		prevNav := ts.navSeq
+		ts.mu.Unlock()
+		loadCh, cancelLoad := ts.subscribeLoad()
+		defer cancelLoad()
+
+		var navRes struct {
+			ErrorText string `json:"errorText"`
+		}
+		if err := cl.Send(opCtx, ts.sessionID, "Page.navigate", map[string]any{"url": opts.URL}, &navRes); err != nil {
+			return Tab{}, err
+		}
+		if navRes.ErrorText != "" {
+			return Tab{}, fmt.Errorf("navigate %s: %s", opts.URL, navRes.ErrorText)
+		}
+		_ = cl.waitNavigation(opCtx, ts, loadCh, prevNav, true, 20*time.Second)
 	}
 	title, finalURL := cl.targetMeta(opCtx, created.TargetID)
 	if finalURL == "" {
@@ -757,6 +775,50 @@ func (b *Bridge) notifyTabGroup(tabURL, groupName string) {
 	b.mu.Unlock()
 }
 
+func (c *cdpClient) waitNavigation(ctx context.Context, ts *tabSession, loadCh <-chan struct{}, prevNav int, requireLeaveBlank bool, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(120 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-loadCh:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if time.Now().After(deadline) {
+				return nil
+			}
+			ts.mu.Lock()
+			navAdvanced := ts.navSeq > prevNav
+			ts.mu.Unlock()
+			var res struct {
+				Result struct {
+					Value map[string]any `json:"value"`
+				} `json:"result"`
+			}
+			checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			err := c.Send(checkCtx, ts.sessionID, "Runtime.evaluate", map[string]any{
+				"expression":    `({ ready: document.readyState, href: location.href })`,
+				"returnByValue": true,
+			}, &res)
+			cancel()
+			if err != nil || res.Result.Value == nil {
+				continue
+			}
+			ready, _ := res.Result.Value["ready"].(string)
+			href, _ := res.Result.Value["href"].(string)
+			if requireLeaveBlank && (href == "" || href == "about:blank") {
+				continue
+			}
+			if ready == "complete" && (navAdvanced || requireLeaveBlank) {
+				return nil
+			}
+		}
+	}
+}
+
 func (c *cdpClient) waitReady(ctx context.Context, ts *tabSession, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -771,10 +833,8 @@ func (c *cdpClient) waitReady(ctx context.Context, ts *tabSession, timeout time.
 			"returnByValue": true,
 		}, &res)
 		cancel()
-		if err == nil && (res.Result.Value == "complete" || res.Result.Value == "interactive") {
-			if res.Result.Value == "complete" {
-				return nil
-			}
+		if err == nil && res.Result.Value == "complete" {
+			return nil
 		}
 		select {
 		case <-ctx.Done():
@@ -849,13 +909,25 @@ func (b *Bridge) Navigate(ctx context.Context, nav Navigation) (Tab, error) {
 	if err != nil {
 		return Tab{}, err
 	}
+	ts.mu.Lock()
+	prevNav := ts.navSeq
+	ts.mu.Unlock()
+	loadCh, cancelLoad := ts.subscribeLoad()
+	defer cancelLoad()
+
 	switch nav.Kind {
 	case "url":
 		if strings.TrimSpace(nav.URL) == "" {
 			return Tab{}, errors.New("url navigation requires url")
 		}
-		if err := cl.Send(ctx, ts.sessionID, "Page.navigate", map[string]any{"url": nav.URL}, nil); err != nil {
+		var navRes struct {
+			ErrorText string `json:"errorText"`
+		}
+		if err := cl.Send(ctx, ts.sessionID, "Page.navigate", map[string]any{"url": nav.URL}, &navRes); err != nil {
 			return Tab{}, err
+		}
+		if navRes.ErrorText != "" {
+			return Tab{}, fmt.Errorf("navigate %s: %s", nav.URL, navRes.ErrorText)
 		}
 	case "reload":
 		if err := cl.Send(ctx, ts.sessionID, "Page.reload", nil, nil); err != nil {
@@ -884,7 +956,7 @@ func (b *Bridge) Navigate(ctx context.Context, nav Navigation) (Tab, error) {
 	default:
 		return Tab{}, fmt.Errorf("unsupported browser navigation %q", nav.Kind)
 	}
-	_ = cl.waitReady(ctx, ts, 20*time.Second)
+	_ = cl.waitNavigation(ctx, ts, loadCh, prevNav, false, 20*time.Second)
 	title, finalURL := cl.targetMeta(ctx, targetID)
 	return Tab{ID: nav.TabID, TargetID: targetID, BrowserID: cl.id, Type: "page", Title: title, URL: finalURL}, nil
 }

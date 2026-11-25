@@ -23,6 +23,9 @@ func startMockCDPServer(t *testing.T) (*httptest.Server, string) {
 	targets := map[string]map[string]any{
 		"T1": {"targetId": "T1", "type": "page", "title": "Home", "url": "https://example.com"},
 	}
+	targetSeq := 0
+	docRequested := map[string]bool{}
+	sessTarget := map[string]string{}
 	axCount := 0
 	var traceStreamData string
 
@@ -61,8 +64,9 @@ func startMockCDPServer(t *testing.T) (*httptest.Server, string) {
 			case "Target.createTarget":
 				u, _ := params["url"].(string)
 				mu.Lock()
-				id := "T_NEW_" + strings.ReplaceAll(u, "https://", "")
-				targets[id] = map[string]any{"targetId": id, "type": "page", "title": "Opened " + u, "url": u}
+				targetSeq++
+				id := "T_NEW_" + strings.ReplaceAll(strings.ReplaceAll(u, "https://", ""), ":", "_") + "_" + string(rune('0'+targetSeq))
+				targets[id] = map[string]any{"targetId": id, "type": "page", "title": "", "url": u}
 				mu.Unlock()
 				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"targetId": id}})
 			case "Target.closeTarget":
@@ -74,7 +78,80 @@ func startMockCDPServer(t *testing.T) (*httptest.Server, string) {
 			case "Target.attachToTarget":
 				tid, _ := params["targetId"].(string)
 				sessID := "S_" + tid
+				mu.Lock()
+				sessTarget[sessID] = tid
+				mu.Unlock()
 				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"sessionId": sessID}})
+			case "Page.navigate":
+				u, _ := params["url"].(string)
+				mu.Lock()
+				tid := sessTarget[req.SessionID]
+				if info := targets[tid]; info != nil {
+					info["url"] = u
+					info["title"] = "Opened " + u
+				}
+				loaderID := "L_" + tid
+				mu.Unlock()
+				// Real Chromium order: Network.requestWillBeSent (Document) fires BEFORE Page.frameNavigated!
+				sendJSON(map[string]any{
+					"method":    "Network.requestWillBeSent",
+					"sessionId": req.SessionID,
+					"params": map[string]any{
+						"requestId": "doc-" + tid,
+						"loaderId":  loaderID,
+						"type":      "Document",
+						"request":   map[string]any{"url": u, "method": "GET"},
+					},
+				})
+				sendJSON(map[string]any{
+					"method":    "Network.responseReceived",
+					"sessionId": req.SessionID,
+					"params": map[string]any{
+						"requestId": "doc-" + tid,
+						"type":      "Document",
+						"response":  map[string]any{"status": 200, "statusText": "OK", "mimeType": "text/html"},
+					},
+				})
+				sendJSON(map[string]any{
+					"method":    "Page.frameNavigated",
+					"sessionId": req.SessionID,
+					"params": map[string]any{
+						"frame": map[string]any{"id": "F_" + tid, "loaderId": loaderID, "url": u},
+					},
+				})
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"frameId": "F_" + tid, "loaderId": loaderID}})
+				sendJSON(map[string]any{"method": "Page.loadEventFired", "sessionId": req.SessionID, "params": map[string]any{"timestamp": 1.0}})
+			case "DOM.getDocument":
+				mu.Lock()
+				docRequested[req.SessionID] = true
+				mu.Unlock()
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"root": map[string]any{"nodeId": 1}}})
+			case "DOM.pushNodesByBackendIdsToFrontend":
+				mu.Lock()
+				ok := docRequested[req.SessionID]
+				mu.Unlock()
+				if !ok {
+					sendJSON(map[string]any{"id": req.ID, "error": map[string]any{"code": -32000, "message": "Document needs to be requested first"}})
+					continue
+				}
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"nodeIds": []int{101}}})
+			case "CSS.getComputedStyleForNode":
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"computedStyle": []map[string]any{
+					{"name": "display", "value": "inline-block"},
+					{"name": "font-size", "value": "16px"},
+				}}})
+			case "CSS.getMatchedStylesForNode":
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{
+					"matchedCSSRules": []map[string]any{
+						{
+							"rule": map[string]any{
+								"origin":       "user-agent",
+								"selectorList": map[string]any{"text": "a:-webkit-any-link"},
+								"style":        map[string]any{"cssProperties": []map[string]any{{"name": "color", "value": "-webkit-link"}}},
+							},
+						},
+					},
+				}})
 			case "Network.enable":
 				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{}})
 				sendJSON(map[string]any{
@@ -124,9 +201,19 @@ func startMockCDPServer(t *testing.T) (*httptest.Server, string) {
 				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"model": map[string]any{"content": []float64{10, 10, 110, 10, 110, 50, 10, 50}}}})
 			case "Runtime.evaluate":
 				expr, _ := params["expression"].(string)
-				if expr == "document.readyState" {
+				switch {
+				case expr == "document.readyState":
 					sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"result": map[string]any{"value": "complete"}}})
-				} else {
+				case strings.Contains(expr, "performance.getEntriesByType('navigation')"):
+					sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"result": map[string]any{"value": map[string]any{
+						"ttfb_ms": 45.2,
+						"fcp_ms":  210.5,
+						"lcp_ms":  320.4,
+						"dcl_ms":  587.6,
+						"load_ms": 588.2,
+						"cls":     0.01,
+					}}}})
+				default:
 					sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"result": map[string]any{"value": "eval:" + expr}}})
 				}
 			case "Page.getLayoutMetrics":
@@ -251,10 +338,48 @@ func TestBrowserLevelCDPEngineFullSuite(t *testing.T) {
 		t.Fatalf("RawCDP failed: %#v err=%v", rawRes, err)
 	}
 
-	// Concurrent Open + MarkHandoff + CleanupSessionTabs
+	// CSS inspection must auto-initialize DOM.getDocument and include user-agent matched rules
+	cssRes, err := bridge.CSS(ctx, tabID, Locator{Role: "button", Name: "Search", Exact: true})
+	if err != nil {
+		t.Fatalf("CSS failed on first call (expected auto DOM.getDocument): %v", err)
+	}
+	if cssRes.Computed["font-size"] != "16px" || len(cssRes.Matched) == 0 || cssRes.Matched[0].Origin != "user-agent" {
+		t.Fatalf("unexpected CSS result: %#v", cssRes)
+	}
+
+	// Tab-scoped Tracing reads exact Web Performance API metrics alongside raw trace
+	tabTracePath := filepath.Join(tmpDir, "perf-tab.json")
+	if err := bridge.TraceStart(ctx, TraceStartOptions{BrowserID: "cdp-1", TabID: tabID, Reload: true, IgnoreCache: true}); err != nil {
+		t.Fatalf("tab TraceStart failed: %v", err)
+	}
+	tabSummary, err := bridge.TraceStop(ctx, "cdp-1", tabTracePath)
+	if err != nil {
+		t.Fatalf("tab TraceStop failed: %v", err)
+	}
+	if tabSummary.MetricsSource != "page_performance_api" || tabSummary.DCLMS == nil || *tabSummary.DCLMS != 587.6 || tabSummary.LoadMS == nil || *tabSummary.LoadMS != 588.2 || tabSummary.CLS == nil || *tabSummary.CLS != 0.01 {
+		t.Fatalf("expected page_performance_api metrics, got %#v", tabSummary)
+	}
+
+	// Concurrent Open (captures main Document request via about:blank -> attach -> Page.navigate) + MarkHandoff + CleanupSessionTabs
 	tA, err := bridge.OpenWithOptions(ctx, OpenOptions{BrowserID: "cdp-1", URL: "https://a.test", SessionID: "s1"})
 	if err != nil {
 		t.Fatalf("Open A failed: %v", err)
+	}
+	if tA.URL != "https://a.test" || tA.Title != "Opened https://a.test" {
+		t.Fatalf("unexpected opened tab A metadata: %#v", tA)
+	}
+	aReqs, err := bridge.Network(ctx, tA.ID, NetworkFilter{})
+	if err != nil {
+		t.Fatalf("Network on opened tab A failed: %v", err)
+	}
+	foundMainDoc := false
+	for _, r := range aReqs {
+		if r.ResourceType == "document" && r.URL == "https://a.test" && r.Status == 200 {
+			foundMainDoc = true
+		}
+	}
+	if !foundMainDoc {
+		t.Fatalf("expected main document request captured in tab.network() on Open, got %#v", aReqs)
 	}
 	tB, err := bridge.OpenWithOptions(ctx, OpenOptions{BrowserID: "cdp-1", URL: "https://b.test", SessionID: "s1"})
 	if err != nil {

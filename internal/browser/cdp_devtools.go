@@ -37,20 +37,26 @@ type TraceStartOptions struct {
 	Categories  []string `json:"categories,omitempty"`
 }
 
-// TraceSummary extracts key Web Vitals & main-thread metrics directly from the raw trace.
+// TraceSummary reports browser-process trace file telemetry plus Web Vitals /
+// Navigation Timing metrics (sourced from the traced tab's native Web
+// Performance API when tab_id is provided, or aligned by (pid, frame) from
+// trace events otherwise).
 type TraceSummary struct {
-	FilePath         string             `json:"file_path"`
-	Bytes            int64              `json:"bytes"`
-	DurationMS       int64              `json:"duration_ms"`
-	EventCount       int                `json:"event_count"`
-	DataLossOccurred bool               `json:"data_loss_occurred,omitempty"`
-	LongTaskCount    int                `json:"long_task_count"`
-	MaxTaskMS        float64            `json:"max_task_ms,omitempty"`
-	FCPMS            *float64           `json:"fcp_ms,omitempty"`
-	LCPMS            *float64           `json:"lcp_ms,omitempty"`
-	DCLMS            *float64           `json:"dcl_ms,omitempty"`
-	LoadMS           *float64           `json:"load_ms,omitempty"`
-	TopCategories    map[string]int     `json:"top_categories,omitempty"`
+	FilePath         string         `json:"file_path"`
+	Bytes            int64          `json:"bytes"`
+	DurationMS       int64          `json:"duration_ms"`
+	EventCount       int            `json:"event_count"`
+	DataLossOccurred bool           `json:"data_loss_occurred,omitempty"`
+	MetricsSource    string         `json:"metrics_source,omitempty"`
+	LongTaskCount    int            `json:"long_task_count"`
+	MaxTaskMS        float64        `json:"max_task_ms,omitempty"`
+	TTFBMS           *float64       `json:"ttfb_ms,omitempty"`
+	FCPMS            *float64       `json:"fcp_ms,omitempty"`
+	LCPMS            *float64       `json:"lcp_ms,omitempty"`
+	DCLMS            *float64       `json:"dcl_ms,omitempty"`
+	LoadMS           *float64       `json:"load_ms,omitempty"`
+	CLS              *float64       `json:"cls,omitempty"`
+	TopCategories    map[string]int `json:"top_categories,omitempty"`
 }
 
 // EmulateOptions configures Chrome DevTools Emulation & Network throttling.
@@ -132,6 +138,8 @@ func (c *cdpClient) traceStart(ctx context.Context, opts TraceStartOptions, relo
 	c.traceChunks = nil
 	c.traceStarted = time.Now()
 	c.traceTabID = opts.TabID
+	c.traceTargetID = reloadTargetID
+	c.traceCacheDisabled = false
 	c.traceMu.Unlock()
 
 	cats := opts.Categories
@@ -150,6 +158,7 @@ func (c *cdpClient) traceStart(ctx context.Context, opts TraceStartOptions, relo
 		c.traceMu.Lock()
 		c.traceActive = false
 		c.traceDone = nil
+		c.traceTargetID = ""
 		c.traceMu.Unlock()
 		return err
 	}
@@ -160,7 +169,11 @@ func (c *cdpClient) traceStart(ctx context.Context, opts TraceStartOptions, relo
 			return err
 		}
 		if opts.IgnoreCache {
-			_ = c.Send(ctx, ts.sessionID, "Network.setCacheDisabled", map[string]any{"cacheDisabled": true}, nil)
+			if c.Send(ctx, ts.sessionID, "Network.setCacheDisabled", map[string]any{"cacheDisabled": true}, nil) == nil {
+				c.traceMu.Lock()
+				c.traceCacheDisabled = true
+				c.traceMu.Unlock()
+			}
 		}
 		if err := c.Send(ctx, ts.sessionID, "Page.reload", map[string]any{"ignoreCache": opts.IgnoreCache}, nil); err != nil {
 			return err
@@ -177,6 +190,8 @@ func (c *cdpClient) traceStop(ctx context.Context, filePath string) (TraceSummar
 	}
 	doneCh := c.traceDone
 	started := c.traceStarted
+	targetID := c.traceTargetID
+	restoreCache := c.traceCacheDisabled
 	c.traceMu.Unlock()
 
 	defer func() {
@@ -184,7 +199,17 @@ func (c *cdpClient) traceStop(ctx context.Context, filePath string) (TraceSummar
 		c.traceActive = false
 		c.traceDone = nil
 		c.traceChunks = nil
+		c.traceTabID = ""
+		c.traceTargetID = ""
+		c.traceCacheDisabled = false
 		c.traceMu.Unlock()
+		if restoreCache && targetID != "" {
+			if ts, err := c.ensureAttached(context.Background(), targetID); err == nil {
+				rCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				_ = c.Send(rCtx, ts.sessionID, "Network.setCacheDisabled", map[string]any{"cacheDisabled": false}, nil)
+				cancel()
+			}
+		}
 	}()
 
 	if err := c.Send(ctx, "", "Tracing.end", nil, nil); err != nil {
@@ -287,7 +312,100 @@ func (c *cdpClient) traceStop(ctx context.Context, filePath string) (TraceSummar
 	summary.Bytes = written
 	summary.DurationMS = time.Since(started).Milliseconds()
 	summary.DataLossOccurred = completed.DataLossOccurred
+	summary.MetricsSource = "trace_events"
+	if targetID != "" {
+		if pm, ok := c.collectPagePerfMetrics(ctx, targetID); ok {
+			summary.MetricsSource = "page_performance_api"
+			summary.TTFBMS = pm.TTFBMS
+			summary.FCPMS = pm.FCPMS
+			summary.LCPMS = pm.LCPMS
+			summary.DCLMS = pm.DCLMS
+			summary.LoadMS = pm.LoadMS
+			summary.CLS = pm.CLS
+		}
+	}
 	return summary, nil
+}
+
+type pagePerfMetrics struct {
+	TTFBMS *float64 `json:"ttfb_ms"`
+	FCPMS  *float64 `json:"fcp_ms"`
+	LCPMS  *float64 `json:"lcp_ms"`
+	DCLMS  *float64 `json:"dcl_ms"`
+	LoadMS *float64 `json:"load_ms"`
+	CLS    *float64 `json:"cls"`
+}
+
+const pagePerfCollectScript = `(async () => {
+  const out = {};
+  try {
+    const nav = performance.getEntriesByType('navigation')[0];
+    if (nav) {
+      if (nav.responseStart > 0) out.ttfb_ms = Math.round(nav.responseStart * 1000) / 1000;
+      if (nav.domContentLoadedEventEnd > 0) out.dcl_ms = Math.round(nav.domContentLoadedEventEnd * 1000) / 1000;
+      if (nav.loadEventEnd > 0) out.load_ms = Math.round(nav.loadEventEnd * 1000) / 1000;
+    }
+    for (const p of performance.getEntriesByType('paint')) {
+      if (p.name === 'first-contentful-paint' && p.startTime > 0) {
+        out.fcp_ms = Math.round(p.startTime * 1000) / 1000;
+      }
+    }
+  } catch {}
+  const readBuffered = (type) => new Promise((resolve) => {
+    try {
+      const items = [];
+      let done = false;
+      const finish = () => { if (!done) { done = true; try { obs.disconnect(); } catch {} resolve(items); } };
+      const obs = new PerformanceObserver((list) => { items.push(...list.getEntries()); finish(); });
+      obs.observe({ type, buffered: true });
+      setTimeout(finish, 40);
+    } catch { resolve([]); }
+  });
+  const [lcps, shifts] = await Promise.all([
+    readBuffered('largest-contentful-paint'),
+    readBuffered('layout-shift'),
+  ]);
+  if (lcps.length > 0) {
+    const last = lcps[lcps.length - 1];
+    const t = last.startTime || last.renderTime || last.loadTime || 0;
+    if (t > 0) out.lcp_ms = Math.round(t * 1000) / 1000;
+  }
+  let cls = 0;
+  for (const s of shifts) {
+    if (!s.hadRecentInput && typeof s.value === 'number') cls += s.value;
+  }
+  out.cls = Math.round(cls * 10000) / 10000;
+  return out;
+})()`
+
+func (c *cdpClient) collectPagePerfMetrics(ctx context.Context, targetID string) (pagePerfMetrics, bool) {
+	ts, err := c.ensureAttached(ctx, targetID)
+	if err != nil {
+		return pagePerfMetrics{}, false
+	}
+	evalCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	var res struct {
+		Result struct {
+			Value json.RawMessage `json:"value"`
+		} `json:"result"`
+		ExceptionDetails any `json:"exceptionDetails"`
+	}
+	if err := c.Send(evalCtx, ts.sessionID, "Runtime.evaluate", map[string]any{
+		"expression":    pagePerfCollectScript,
+		"awaitPromise":  true,
+		"returnByValue": true,
+	}, &res); err != nil || res.ExceptionDetails != nil || len(res.Result.Value) == 0 {
+		return pagePerfMetrics{}, false
+	}
+	var pm pagePerfMetrics
+	if err := json.Unmarshal(res.Result.Value, &pm); err != nil {
+		return pagePerfMetrics{}, false
+	}
+	if pm.TTFBMS == nil && pm.FCPMS == nil && pm.LCPMS == nil && pm.DCLMS == nil && pm.LoadMS == nil && pm.CLS == nil {
+		return pagePerfMetrics{}, false
+	}
+	return pm, true
 }
 
 func analyzeTraceFile(path string) TraceSummary {
@@ -296,24 +414,49 @@ func analyzeTraceFile(path string) TraceSummary {
 	if err != nil {
 		return out
 	}
+	type traceEvent struct {
+		Name string         `json:"name"`
+		Cat  string         `json:"cat"`
+		Ph   string         `json:"ph"`
+		PID  int            `json:"pid"`
+		TS   float64        `json:"ts"`
+		Dur  float64        `json:"dur"`
+		Args map[string]any `json:"args"`
+	}
 	var traceDoc struct {
-		TraceEvents []struct {
-			Name string  `json:"name"`
-			Cat  string  `json:"cat"`
-			Ph   string  `json:"ph"`
-			TS   float64 `json:"ts"`
-			Dur  float64 `json:"dur"`
-		} `json:"traceEvents"`
+		TraceEvents []traceEvent `json:"traceEvents"`
 	}
 	if err := json.Unmarshal(data, &traceDoc); err != nil {
 		// Some Chromium builds stream raw array instead of {"traceEvents":[...]}
 		_ = json.Unmarshal(data, &traceDoc.TraceEvents)
 	}
 	out.EventCount = len(traceDoc.TraceEvents)
+
+	eventFrame := func(ev traceEvent) string {
+		if ev.Args == nil {
+			return ""
+		}
+		if f, ok := ev.Args["frame"].(string); ok {
+			return f
+		}
+		if d, ok := ev.Args["data"].(map[string]any); ok {
+			if f, ok := d["frame"].(string); ok {
+				return f
+			}
+		}
+		return ""
+	}
+
+	// Select the latest navigationStart as the baseline and lock all trace-derived
+	// milestone timestamps to the same (pid, frame) to prevent cross-tab contamination.
 	var navStart float64
+	var navPID int
+	var navFrame string
 	for _, ev := range traceDoc.TraceEvents {
-		if ev.Name == "navigationStart" && (navStart == 0 || ev.TS < navStart) {
+		if ev.Name == "navigationStart" && ev.TS >= navStart {
 			navStart = ev.TS
+			navPID = ev.PID
+			navFrame = eventFrame(ev)
 		}
 	}
 	for _, ev := range traceDoc.TraceEvents {
@@ -328,7 +471,10 @@ func analyzeTraceFile(path string) TraceSummary {
 				out.MaxTaskMS = ms
 			}
 		}
-		if navStart > 0 && ev.TS >= navStart {
+		if navStart > 0 && ev.TS >= navStart && ev.PID == navPID {
+			if ef := eventFrame(ev); navFrame != "" && ef != "" && ef != navFrame {
+				continue
+			}
 			relMS := (ev.TS - navStart) / 1000.0
 			switch ev.Name {
 			case "firstContentfulPaint":
@@ -340,11 +486,15 @@ func analyzeTraceFile(path string) TraceSummary {
 				v := relMS
 				out.LCPMS = &v
 			case "domContentLoadedEventEnd":
-				v := relMS
-				out.DCLMS = &v
+				if out.DCLMS == nil {
+					v := relMS
+					out.DCLMS = &v
+				}
 			case "loadEventEnd":
-				v := relMS
-				out.LoadMS = &v
+				if out.LoadMS == nil {
+					v := relMS
+					out.LoadMS = &v
+				}
 			}
 		}
 	}
@@ -545,6 +695,12 @@ func (c *cdpClient) cssTab(ctx context.Context, targetID string, loc Locator) (C
 	if err != nil {
 		return CSSResult{}, err
 	}
+	// Chromium requires DOM.enable + DOM.getDocument on the target session
+	// before DOM.pushNodesByBackendIdsToFrontend or CSS inspection can resolve nodeIds.
+	_ = c.Send(ctx, target.SessionID, "DOM.enable", nil, nil)
+	if err := c.Send(ctx, target.SessionID, "DOM.getDocument", map[string]any{"depth": 0}, nil); err != nil {
+		return CSSResult{}, fmt.Errorf("initialize DOM document for CSS inspection: %w", err)
+	}
 	if err := c.Send(ctx, target.SessionID, "CSS.enable", nil, nil); err != nil {
 		return CSSResult{}, err
 	}
@@ -564,7 +720,9 @@ func (c *cdpClient) cssTab(ctx context.Context, targetID string, loc Locator) (C
 			Value string `json:"value"`
 		} `json:"computedStyle"`
 	}
-	_ = c.Send(ctx, target.SessionID, "CSS.getComputedStyleForNode", map[string]any{"nodeId": nodeID}, &computed)
+	if err := c.Send(ctx, target.SessionID, "CSS.getComputedStyleForNode", map[string]any{"nodeId": nodeID}, &computed); err != nil {
+		return CSSResult{}, fmt.Errorf("get computed styles: %w", err)
+	}
 
 	var matched struct {
 		InlineStyle *struct {
@@ -602,23 +760,36 @@ func (c *cdpClient) cssTab(ctx context.Context, targetID string, loc Locator) (C
 			}
 		}
 	}
+	var uaRules []CSSMatchedRule
 	for _, mr := range matched.MatchedCSSRules {
-		if mr.Rule.Origin == "user-agent" {
-			continue
-		}
 		props := map[string]string{}
 		for _, p := range mr.Rule.Style.CSSProperties {
 			if p.Name != "" && p.Value != "" {
 				props[p.Name] = p.Value
 			}
 		}
-		if len(props) > 0 {
-			out.Matched = append(out.Matched, CSSMatchedRule{
-				Selector:   mr.Rule.SelectorList.Text,
-				Origin:     mr.Rule.Origin,
-				Properties: props,
-			})
+		if len(props) == 0 {
+			continue
 		}
+		rule := CSSMatchedRule{
+			Selector:   mr.Rule.SelectorList.Text,
+			Origin:     mr.Rule.Origin,
+			Properties: props,
+		}
+		if mr.Rule.Origin == "user-agent" {
+			uaRules = append(uaRules, rule)
+		} else {
+			out.Matched = append(out.Matched, rule)
+		}
+	}
+	// Put author rules first, then include user-agent matched rules (capped) so
+	// elements relying on browser defaults (like unstyled <a>) still report rules.
+	const maxMatchedRules = 24
+	for _, r := range uaRules {
+		if len(out.Matched) >= maxMatchedRules {
+			break
+		}
+		out.Matched = append(out.Matched, r)
 	}
 	keyComputed := map[string]bool{
 		"display": true, "position": true, "width": true, "height": true,

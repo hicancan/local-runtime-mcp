@@ -57,6 +57,7 @@ func (e *cdpError) Error() string {
 // NetworkEntry represents one observed HTTP/WebSocket request captured passively on a tab.
 type NetworkEntry struct {
 	RequestID       string            `json:"request_id"`
+	LoaderID        string            `json:"-"`
 	URL             string            `json:"url"`
 	Method          string            `json:"method"`
 	ResourceType    string            `json:"resource_type,omitempty"`
@@ -180,12 +181,14 @@ type cdpClient struct {
 	attached       map[string]bool
 
 	// Browser-level tracing state
-	traceMu       sync.Mutex
-	traceActive   bool
-	traceDone     chan traceCompleteEvent
-	traceChunks   []json.RawMessage
-	traceStarted  time.Time
-	traceTabID    string
+	traceMu            sync.Mutex
+	traceActive        bool
+	traceDone          chan traceCompleteEvent
+	traceChunks        []json.RawMessage
+	traceStarted       time.Time
+	traceTabID         string
+	traceTargetID      string
+	traceCacheDisabled bool
 
 	// Heap snapshot chunk sink (keyed by sessionID)
 	heapMu    sync.Mutex
@@ -518,7 +521,10 @@ func (c *cdpClient) handleEvent(env cdpEnvelope) {
 	case "Page.frameNavigated":
 		var p struct {
 			Frame struct {
+				ID       string `json:"id"`
 				ParentID string `json:"parentId"`
+				LoaderID string `json:"loaderId"`
+				URL      string `json:"url"`
 			} `json:"frame"`
 		}
 		if json.Unmarshal(env.Params, &p) == nil && p.Frame.ParentID == "" {
@@ -526,6 +532,16 @@ func (c *cdpClient) handleEvent(env cdpEnvelope) {
 			ts.navSeq++
 			ts.lastAXLines = nil
 			ts.bumpEpochLocked()
+			// Promote main-document navigation request(s) sharing this loaderId
+			// (which fire Network.requestWillBeSent before Page.frameNavigated commits)
+			// into the new navigation sequence so tab.network() always includes the Document.
+			if p.Frame.LoaderID != "" {
+				for _, e := range ts.network {
+					if e.LoaderID == p.Frame.LoaderID {
+						e.NavigationSeq = ts.navSeq
+					}
+				}
+			}
 			// Retain up to 3 navigations of network requests.
 			minNav := ts.navSeq - 3
 			if minNav > 0 && len(ts.network) > 0 {
@@ -565,6 +581,7 @@ func (c *cdpClient) handleEvent(env cdpEnvelope) {
 	case "Network.requestWillBeSent":
 		var p struct {
 			RequestID string `json:"requestId"`
+			LoaderID  string `json:"loaderId"`
 			Type      string `json:"type"`
 			Request   struct {
 				URL     string            `json:"url"`
@@ -576,6 +593,7 @@ func (c *cdpClient) handleEvent(env cdpEnvelope) {
 			ts.mu.Lock()
 			entry := &NetworkEntry{
 				RequestID:      p.RequestID,
+				LoaderID:       p.LoaderID,
 				URL:            p.Request.URL,
 				Method:         p.Request.Method,
 				ResourceType:   strings.ToLower(p.Type),
@@ -773,6 +791,24 @@ func (c *cdpClient) handleEvent(env cdpEnvelope) {
 			}(env.SessionID, p.SessionID)
 		}
 	}
+}
+
+func (ts *tabSession) subscribeLoad() (<-chan struct{}, func()) {
+	ch := make(chan struct{})
+	ts.mu.Lock()
+	ts.loadWaiters = append(ts.loadWaiters, ch)
+	ts.mu.Unlock()
+	cancel := func() {
+		ts.mu.Lock()
+		for i, w := range ts.loadWaiters {
+			if w == ch {
+				ts.loadWaiters = append(ts.loadWaiters[:i], ts.loadWaiters[i+1:]...)
+				break
+			}
+		}
+		ts.mu.Unlock()
+	}
+	return ch, cancel
 }
 
 func (ts *tabSession) appendConsole(entry ConsoleEntry) {
