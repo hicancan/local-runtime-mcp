@@ -29,18 +29,27 @@ func compileReplCode(code string) (*goja.Program, error) {
 		return goja.Compile("cell.js", wrapped, false)
 	}
 
-	stmts := topLevelBodyStatements(prog)
-	if len(stmts) == 0 {
+	block := topLevelBodyBlock(prog)
+	if block == nil || len(block.List) == 0 {
 		return goja.Compile("cell.js", wrapped, false)
 	}
+	stmts := block.List
 
 	base := prog.File.Base()
+	blockStart := int(block.LeftBrace) - base + 1
+	blockEnd := int(block.RightBrace) - base
 	var edits []astEdit
 
 	for i, stmt := range stmts {
 		names := collectTopLevelNames(stmt)
 		if len(names) > 0 {
-			end := int(stmt.Idx1()) - base
+			var end int
+			switch stmt.(type) {
+			case *ast.FunctionDeclaration, *ast.ClassDeclaration:
+				end = int(stmt.Idx1()) - base
+			default:
+				_, end = statementEndAfter(wrapped, int(stmt.Idx1())-base, blockEnd)
+			}
 			if end >= 0 && end <= len(wrapped) {
 				var sb strings.Builder
 				sb.WriteString(";\n")
@@ -59,12 +68,27 @@ func compileReplCode(code string) (*goja.Program, error) {
 		// Auto-return the final top-level statement when it is a pure expression.
 		if i == len(stmts)-1 {
 			if exprStmt, ok := stmt.(*ast.ExpressionStatement); ok {
-				s0 := int(exprStmt.Expression.Idx0()) - base
-				s1 := int(exprStmt.Expression.Idx1()) - base
-				if s0 >= 0 && s1 > s0 && s1 <= len(wrapped) {
+				prevEnd := blockStart
+				if i > 0 {
+					prev := stmts[i-1]
+					switch prev.(type) {
+					case *ast.FunctionDeclaration, *ast.ClassDeclaration:
+						prevEnd = int(prev.Idx1()) - base
+					default:
+						_, prevEnd = statementEndAfter(wrapped, int(prev.Idx1())-base, blockEnd)
+					}
+				}
+				innerStart := int(exprStmt.Expression.Idx0()) - base
+				innerEnd := int(exprStmt.Expression.Idx1()) - base
+				if innerStart < prevEnd {
+					prevEnd = innerStart
+				}
+				s0 := skipWSAndComments(wrapped, prevEnd, innerStart)
+				s1, _ := statementEndAfter(wrapped, innerEnd, blockEnd)
+				if s0 >= 0 && s1 > s0 && s1 <= blockEnd {
 					exprSrc := strings.TrimSpace(wrapped[s0:s1])
 					// AST already guarantees this is an ExpressionStatement (not a BlockStatement),
-					// so object literals like `({ a: 1 })` safely wrap inside `return (...)`.
+					// and [s0, s1] preserves any outer/side parentheses stripped by Goja's AST.
 					if exprSrc != "" {
 						edits = append(edits, astEdit{
 							start: s0,
@@ -100,7 +124,7 @@ func compileReplCode(code string) (*goja.Program, error) {
 	return compiled, nil
 }
 
-func topLevelBodyStatements(prog *ast.Program) []ast.Statement {
+func topLevelBodyBlock(prog *ast.Program) *ast.BlockStatement {
 	if prog == nil || len(prog.Body) != 1 {
 		return nil
 	}
@@ -116,7 +140,67 @@ func topLevelBodyStatements(prog *ast.Program) []ast.Statement {
 	if !ok {
 		return nil
 	}
-	return block.List
+	return block
+}
+
+// skipWSAndComments advances pos past ECMAScript whitespace and line/block comments up to limit.
+func skipWSAndComments(src string, pos, limit int) int {
+	for pos < limit {
+		c := src[pos]
+		if c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v' {
+			pos++
+			continue
+		}
+		if c == '/' && pos+1 < limit {
+			if src[pos+1] == '/' {
+				pos += 2
+				for pos < limit && src[pos] != '\n' && src[pos] != '\r' {
+					pos++
+				}
+				continue
+			}
+			if src[pos+1] == '*' {
+				pos += 2
+				for pos+1 < limit && !(src[pos] == '*' && src[pos+1] == '/') {
+					pos++
+				}
+				if pos+1 < limit {
+					pos += 2
+				} else {
+					pos = limit
+				}
+				continue
+			}
+		}
+		break
+	}
+	return pos
+}
+
+// statementEndAfter expands past closing ')' tokens stripped by Goja's AST from parenthesized
+// expressions/initializers, returning both the expression end (before ';') and statement end (after optional ';').
+func statementEndAfter(src string, idx1, limit int) (exprEnd, stmtEnd int) {
+	if idx1 < 0 {
+		idx1 = 0
+	}
+	if idx1 > limit {
+		idx1 = limit
+	}
+	pos := idx1
+	for {
+		next := skipWSAndComments(src, pos, limit)
+		if next < limit && src[next] == ')' {
+			pos = next + 1
+			continue
+		}
+		break
+	}
+	exprEnd = pos
+	next := skipWSAndComments(src, exprEnd, limit)
+	if next < limit && src[next] == ';' {
+		return exprEnd, next + 1
+	}
+	return exprEnd, exprEnd
 }
 
 func collectTopLevelNames(stmt ast.Statement) []string {

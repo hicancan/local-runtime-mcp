@@ -407,4 +407,46 @@ func TestASTPersistenceClassRedeclareAndWebGlobals(t *testing.T) {
 	if !ok || m2["prevCounter"] != float64(17) || m2["newCounter"] != float64(103) || m2["restSum"] != float64(50) || m2["tag"] != "v18.2" {
 		t.Fatalf("unexpected AST turn 2 value: %#v", r2.Value)
 	}
+
+	// Turn 3: parenthesized initializers, side-parenthesized expressions, and trailing comments.
+	cases := []struct {
+		name string
+		code string
+		want float64
+	}{
+		{
+			name: "double-parenthesized",
+			code: `((10 + 5))`,
+			want: 15,
+		},
+		{
+			name: "left-parenthesized-binary",
+			code: `const base = (3 + 4); (base + 1) * 2; // trailing comment`,
+			want: 16,
+		},
+		{
+			name: "right-parenthesized-binary",
+			code: `const factor = ((2 + 1))` + "\n" + `2 * (base + factor)`,
+			want: 20,
+		},
+		{
+			name: "both-sides-parenthesized-after-func-empty-stmt",
+			code: `function add(a, b) { return a + b }; (add(base, factor)) * (2);`,
+			want: 20,
+		},
+	}
+	for _, tc := range cases {
+		res, err := eng.Run(ctx, RunOptions{
+			SessionID: "sess-ast",
+			Title:     "验证括号表达式边界: " + tc.name,
+			Code:      tc.code,
+		})
+		if err != nil || res.Status != "done" {
+			t.Fatalf("%s failed: status=%s err=%s goErr=%v", tc.name, res.Status, res.Error, err)
+		}
+		got, ok := res.Value.(float64)
+		if !ok || got != tc.want {
+			t.Fatalf("%s: want %v, got %#v", tc.name, tc.want, res.Value)
+		}
+	}
 }
