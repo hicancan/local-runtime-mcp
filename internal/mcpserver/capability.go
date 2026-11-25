@@ -46,7 +46,7 @@ type proposeInput struct {
 // proposeToolSpec lets an AI that explored a site write down a page tool for the owner to approve.
 func proposeToolSpec(registry *capability.Registry) toolSpec {
 	propose := inputTool[proposeInput](tool("capability_propose", "Propose page tool",
-		"After exploring a website with browser_snapshot and browser_action, write down how to do one task there as a page tool: a definition (title, description, exact origins, input and output JSON schemas, all four annotations) and a page-side JavaScript function. It is validated and stored as a proposal; nothing runs until the owner approves it in the browser extension's panel for that site. Prefer read-only tools that observe a loaded page; declare readOnlyHint false for anything that changes the site. Proposing the same name again replaces the earlier draft.",
+		"After exploring a website via run (using tab.snapshot, tab.eval, tab.network, etc.), distill one repeatable task into a deterministic page tool: a definition (title, description, exact origins, input and output JSON schemas, all four annotations) and a page-side JavaScript function. It is validated and stored as a proposal; nothing runs until the owner approves it in the browser extension's L panel for that site. Prefer read-only tools that observe a loaded page; declare readOnlyHint false for anything that changes the site. Proposing the same name again replaces the earlier draft.",
 		false, false, true, false), func(*jsonschema.Schema) {})
 	return toolSpec{
 		name: "capability_propose",
@@ -108,8 +108,8 @@ func capabilityInputSchema(raw json.RawMessage) map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"browser_id": map[string]any{"type": "string", "minLength": 1, "description": "Browser instance ID from browser_status"},
-			"tab_id":     map[string]any{"type": "string", "minLength": 1, "description": "Opaque tab ID from browser_tabs or browser_open"},
+			"browser_id": map[string]any{"type": "string", "minLength": 1, "description": "Browser instance ID from browser.status() (e.g. edge or chrome)"},
+			"tab_id":     map[string]any{"type": "string", "minLength": 1, "description": "Opaque tab ID from browser.tabs() or browser.open()"},
 			"arguments":  arguments,
 		},
 		"required":             []string{"browser_id", "tab_id", "arguments"},

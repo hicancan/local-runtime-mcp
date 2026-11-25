@@ -1,522 +1,301 @@
-# Local Runtime MCP
+<div align="center">
 
-[![Release](https://img.shields.io/github/v/release/hicancan/local-runtime-mcp)](https://github.com/hicancan/local-runtime-mcp/releases/latest)
-[![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
+# Local Runtime MCP (`lrmcp`)
+
+**一枚单文件常驻守护进程，让本地与云端 MCP 客户端通过 4 个正交原语和有状态并发 JS 编排引擎，统一掌控你的本机进程、原子文件、完整 Chrome DevTools（原生根级 CDP + 进程级 `Tracing.start`）与 Windows 原生桌面。**
+
+[![Release](https://img.shields.io/github/v/release/hicancan/local-runtime-mcp?style=flat-square)](https://github.com/hicancan/local-runtime-mcp/releases/latest)
+[![License](https://img.shields.io/badge/license-AGPL--3.0--only-blue?style=flat-square)](LICENSE)
+[![Go](https://img.shields.io/badge/Go-1.27-00ADD8?style=flat-square&logo=go&logoColor=white)](go.mod)
+[![Rust](https://img.shields.io/badge/Rust-Windows%20UIA-DEA584?style=flat-square&logo=rust&logoColor=black)](native/computer-windows)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-555?style=flat-square)](#安装与构建)
 
 [English](README.md) · **简体中文**
 
-让本地与云端 AI 客户端通过 **4 个正交 MCP 原语**（`run`、`wait`、`session`、`capability_propose`）和内嵌有状态并发 JavaScript 编排引擎，统一接管运行 `lrmcp` 的机器：并发进程、原子文件、原生图片、完整浏览器自动化与 Chrome DevTools（含浏览器进程级 `Tracing.start`、Network/Console 缓冲、Emulation、CSS、HeapSnapshot、AX 增量 Diff 与语义定位器），以及 Windows UI Automation 原生桌面控制。
+[为什么选 `lrmcp`](#为什么选-lrmcp) · [大一统架构](#大一统架构) · [4 个正交原语](#4-个正交原语) · [快速上手](#快速上手) · [远程隧道与 OAuth](#远程隧道与-oauth) · [Web & App MCP 沉淀](#web-mcp--app-mcp-正向沉淀) · [活动台与审计](#活动台与审计) · [安全与许可](#安全隐私与许可)
 
-`lrmcp` 以单一用户会话常驻守护进程（`127.0.0.1:9317`）运行，内置纯 Go SQLite WAL + FTS5 审计引擎（`lrmcp-audit.db`）、仅本机可访问的活动台（`lrmcp ui`）、直连 `DevToolsActivePort` 的浏览器级 CDP 引擎与内嵌 Rust Windows UIA 工作器；配套轻量扩展（`127.0.0.1:9315`）已彻底剥离 `chrome.debugger`，仅负责网页互联（Web Bridge）、`L` 授权面板与原生标签组视觉归类。所有本地客户端作为无状态 `stdio` 薄代理并发接入；云端客户端通过 OpenAI / Cloudflare 隧道热插拔接入，零重启、零中断。详见 [v18.0.0 发布说明](docs/releases/v18.0.0.md)。
+</div>
 
-不同进程会话、文件路径和浏览器标签页均可并发执行，共享文件和桌面物理输入遵循明确的资源协调规则。
+---
 
-- **原生多模态结果**：文件、网页和桌面观察直接返回文本与 MCP 图像内容。
-- **明确的浏览器目标**：连接多个 Chromium Profile，选择有名称的浏览器实例，通过不透明标签页句柄操作。
-- **不打扰人的桌面控制**：看到所有显示器和窗口，读出带文字的 UI Automation 树，通过控件模式操作控件，不碰鼠标、键盘和焦点。确需物理输入时凭令牌借用，屏幕底部的小提示条随时可点停。
-- **便携配置**：将 `local-runtime-mcp.yaml`、程序和浏览器集成保存在同一目录，支持固定磁盘与移动存储。
-- **独立连接入口**：为同一个 Runtime Host 启用 OpenAI、Cloudflare 或两者；公开 HTTP 支持静态 Bearer 凭据和经所有者批准的 OAuth 授权。
-- **按平台职责实现**：Go 承载运行时和 MCP 适配器，Rust 实现 Windows 捕获、UI Automation 和输入，TypeScript 实现 Chromium 集成。
+## 为什么选 `lrmcp`
 
-## 整体架构
+传统 MCP 方案把几十个扁平单步工具塞进各自独立的 Node/Python 子进程：每读一个文件、点一次按钮、查一条网络请求都要往返大模型一轮，把几十 KB 原始 DOM 和 JSON 倒进上下文；每换一个 IDE 或重启会话，Edge/Chrome 还得反复弹一次远程调试授权框。
 
-连接层负责请求怎样到达，能力层负责机器上执行什么。一个 Runtime Host 管理当前实例中所有已启用入口和客户端共享的资源。
+`lrmcp` 把整套能力收敛进**一枚 ~33 MB、零外部运行时依赖的 Go 单二进制守护进程**（内嵌 Rust Windows UIA 引擎 + SQLite WAL/FTS5 审计库 + 本地活动台 `/ui`），对外仅暴露 **4 个正交原语**：
 
-```mermaid
-flowchart TB
-    Operator[操作者] --> CLI[CLI + 配置]
-    CLI --> Supervisor[入口生命周期管理]
-    Supervisor --> Host[唯一 Runtime Host]
-    Local[本地 MCP 客户端] --> Stdio[MCP stdio]
-    Local --> Public[公开访问的 HTTP 源站 · Bearer 或 OAuth]
-    Remote[远端 AI 客户端] --> OpenAI[OpenAI Tunnel 适配器]
-    Remote --> Cloudflare[Cloudflare 适配器 + cloudflared]
-    OpenAI --> Private[私有 HTTP 源站 · 运行时凭据]
-    Cloudflare --> Public
-    Stdio --> MCP[MCP 适配器 · 22 个工具]
-    Private --> MCP
-    Public --> MCP
-    MCP --> Process[Process]
-    MCP --> Files[Filesystem]
-    MCP --> Image[Image]
-    MCP --> Computer[Computer]
-    MCP --> Browser[Browser]
-    Process --> Machine[本机进程 + 文件]
-    Files --> Machine
-    Image --> Machine
-    Computer --> Native[Rust Windows 引擎]
-    Native --> Desktop[当前交互桌面]
-    Browser --> Bridge[带认证的 loopback Bridge]
-    Bridge --> Profiles[多个 Profile 的扩展]
-    Profiles --> CDP[CDP 标签页 + Frame]
-    Host -. 生命周期 .-> MCP
-    Host -. 管理 .-> Process
-    Host -. 管理 .-> Files
-    Host -. 管理 .-> Computer
-    Host -. 管理 .-> Bridge
-    Supervisor -. 管理 Provider 生命周期 .-> OpenAI
-    Supervisor -. 管理 Provider 生命周期 .-> Cloudflare
-```
+| 维度 | 传统扁平 MCP / `chrome-devtools-mcp` | `lrmcp`（v18） |
+| --- | --- | --- |
+| **工具门面** | 25–40 个零散工具，Schema 臃肿、单步串行往返 | **4 个正交原语**（`run`、`wait`、`session`、`capability_propose`）+ 主人审批的站点/软件协议 |
+| **并发与状态** | 每步来回刷大模型，中间数据撑爆上下文 | **按会话常驻的并发 JS 引擎**（`Promise.allSettled`、AST 跨轮持久化、裸表达式回显）——内存内过滤，只吐精炼结果 |
+| **浏览器与 DevTools** | 每端独立 `npx`/Node 进程，换端反复弹窗；扩展 `chrome.debugger` 弹横幅冲突 | **全机唯一浏览器根级 CDP 长连接**（`DevToolsActivePort`）：点一次允许，全端共享免打扰。完整 DevTools + **进程级 `Tracing.start`** + 内核 Performance API + **AX 增量 Diff（体积 -77.8%）** |
+| **配套浏览器扩展** | 沉重的 `debugger` 调度器 | **瘦身零 `debugger` 扩展（~790 行 TS）**，仅管 Web Bridge 网页互联、主人 `L` 审批面板与原生 `tabGroups` |
+| **跨域协同与云端** | 仅限本地浏览器，各工具割裂 | 原生 `proc`（pipe/PTY）、SHA-256 原子 `fs`、`img`、Rust Windows WGC/UIA 桌面控制，外加热插拔 **OpenAI & Cloudflare 隧道** |
+| **治理与隐私** | 无跨端任务审计、常留僵尸标签页 | 嵌入式 **SQLite WAL + FTS5 审计**、本机 `/ui` 活动台、`session(done)` 自动回收临时页、**零外部遥测** |
 
-实线表示请求链路，虚线表示资源生命周期归属。文本与图像作为 MCP 内容传输。OpenAI 私有源站和公开访问的 HTTP 源站提供同一个 MCP Server，各自保留对应认证边界。Cloudflare 通过 loopback 访问源站，对外地址使用 HTTPS。
+---
 
-| 层 | 职责 |
-| --- | --- |
-| CLI 与配置 | 明确选择入口，一次性解析配置。 |
-| 入口生命周期管理 | 管理 Provider、报告退出状态，保持其他入口可用。 |
-| 连接适配器 | 通过 stdio、HTTP 或 Tunnel Provider 递送请求到共享 Server。 |
-| MCP 适配器 | 发布工具 schema、验证参数、编码结果。 |
-| 能力服务 | 定义资源身份、观察、操作与并发规则。 |
-| 平台后端 | 执行操作系统调用、Windows 原生交互和 Chromium CDP 命令。 |
+## 大一统架构
 
-Host 只创建一套 Process Manager、Filesystem Service、Browser Bridge 和 Computer Controller。Provider 失败只影响对应入口，Host 和其他在线入口继续运行。所有入口结束或操作者中断运行时，停止接收工作，取消待执行请求，清理受管进程与注入输入，关闭连接及配套程序。单次请求失败后，Host 和其他资源继续运行。连接恢复只恢复通信，机器操作由客户端明确发起。
-
-### 命令与传输
-
-```text
-lrmcp
-├── serve --transport stdio [--agent NAME] 纯 stdio 薄代理（未运行时自动拉起独立后台 Daemon）
-├── start [--http] [--tunnel ...]        确保后台用户会话 Daemon 已启动
-├── stop                                 优雅关闭运行中的 Daemon
-├── status                               查看 Daemon、在线浏览器与远端网线状态
-├── daemon [--http] [--tunnel ...]       在前台运行统一 Daemon
-├── tunnel
-│   ├── up <openai|cloudflare|http> [--ttl 2h]
-│   ├── down <openai|cloudflare|http|all>
-│   └── status
-├── grant remote <openai|http> [--read-only] [--tool NAME]
-├── ui [--no-open]                       打开仅本机可访问的极简主权活动台（/ui）
-├── audit
-│   ├── list [--limit N]
-│   ├── events [--session ID] [--agent ID]
-│   ├── search <query>
-│   ├── tail [--agent ID]
-│   └── export [--session ID] [--output FILE]
-├── setup
-│   ├── browser
-│   ├── local
-│   ├── client
-│   ├── oauth
-│   └── remote-token
-├── version
-└── help
-```
-
-唯一的用户会话常驻 Daemon 持有本机总线（`127.0.0.1:9317`）与双向扩展桥（`127.0.0.1:9315`）。完成 `lrmcp setup local` 后，所有配置为 `lrmcp serve --transport stdio` 的本地客户端都会在后台自动拉起并附着到同一独立 Daemon——关闭任何 IDE 窗口都不会让宿主机或其他客户端掉线。远端网线（`openai`、`cloudflare`、`http`）随时热插拔，零重启、零中断。
-
-| 命令 | 链路与行为 |
-| --- | --- |
-| `lrmcp serve --transport stdio` | 纯无状态 MCP stdio 薄代理；若 Daemon 尚未运行则自动在后台拉起独立进程并附着到 `127.0.0.1:9317/mcp/attach`（未配置 `local.token` 时退化为隔离单次进程）。 |
-| `lrmcp start [--http] [--tunnel openai\|cloudflare] [--ttl 2h]` | 幂等确保后台用户会话 Daemon 运行，并可按需挂载远端网线。 |
-| `lrmcp stop` | 通过 `127.0.0.1:9317/admin/shutdown` 优雅关闭运行中的 Daemon。 |
-| `lrmcp status` | 输出 Daemon PID、附着的本地会话数、浏览器实例、桌面锁状态、能力计数与各远端网线状态。 |
-| `lrmcp daemon [--http] [--tunnel ...]` | 在前台运行统一 Daemon（便于日志排查或登录计划任务）。 |
-| `lrmcp tunnel up openai [--ttl 2h]` | 确保 Daemon 在线并实时热插 OpenAI Secure MCP Tunnel（独立私跳端口，可选到期自动断开）。 |
-| `lrmcp tunnel up cloudflare [--ttl 2h]` | 实时热插公网回环 HTTP（`127.0.0.1:9316`）与 `cloudflared`（不重启 Daemon）。 |
-| `lrmcp tunnel down openai\|cloudflare\|http\|all` | 实时拔掉单条或全部远端网线；本地客户端与浏览器会话不受任何影响。 |
-| `lrmcp grant remote openai\|http [--read-only] [--tool NAME]` | 实时配置远端网线权限边界（如限制为仅只读工具）并立即广播 `tools/list_changed`。 |
-| `lrmcp ui [--no-open]` | 确保 Daemon 在线、签发一次性 60 秒引导链接并打开内置本地活动台（`http://127.0.0.1:9317/ui/`）。 |
-| `lrmcp audit list \| events \| search \| tail \| export` | 查询会话、FTS5 中英文毫秒级全文检索、实时 SSE 跟踪或导出 JSONL 审计流。 |
-| `lrmcp setup browser` | 生成 Bridge 凭据，释放和配置扩展。 |
-| `lrmcp setup local` | 生成本机专属面 `local.token`，开启多 `stdio` 客户端共享与热插拔控制面。 |
-| `lrmcp setup client --id NAME [--browser-id ID]` | 在 `grants.clients` 中注册同机受控应用并生成独立 Scoped Token（`--show` 查看）。 |
-| `lrmcp setup oauth --client-name NAME --redirect-uri URI` | 用准确回调地址注册 OAuth 客户端并生成凭据。 |
-| `lrmcp setup remote-token --id NAME [--read-only] [--tool NAME]` | 在 `grants.remote.tokens` 中为云端多实例生成独立 Bearer Token（可与 OAuth 共存于单条 Cloudflare 隧道）。 |
-| `lrmcp setup oauth --show` | 在本地终端明确查看已有 OAuth 凭据。 |
-| `lrmcp version` | 输出可执行文件版本。 |
-| `lrmcp help` | 显示命令与参数。 |
-
-OpenAI 适配器使用动态分配的本机端口和运行时生成、保存在内存中的私有链路凭据。Cloudflare 使用配置中的公开访问 loopback 源站及官方维护的配套程序。能力服务独立于 Provider。另一台机器运行自己的 Host 并使用独立连接地址，资源和句柄也属于各自机器。
-
-### 配置
-
-```mermaid
-flowchart LR
-    Defaults[默认值] --> YAML[程序同目录 YAML]
-    YAML --> Environment[环境变量覆盖]
-    Environment --> Flags[命令行覆盖]
-    Flags --> Config[最终配置]
-    Config --> Connection[连接适配器]
-    Config --> Host[Runtime Host]
-```
-
-优先级为 **命令行 > 环境变量 > YAML > 默认值**。配置固定读取 `<lrmcp 所在目录>/local-runtime-mcp.yaml`，按本次启用的组件验证配置。浏览器实例身份保存在各 Profile 的扩展存储中；进程、标签页和桌面观察句柄由当前资源生命周期管理。
-
-## 五个能力域
-
-| 领域 | 工具数量 |
-| --- | ---: |
-| Process | 2 |
-| Filesystem | 6 |
-| Image | 1 |
-| Computer | 5 |
-| Browser | 8 |
-| 活动播报（`agent_report`） | 1 |
-| **总计** | **23** |
-
-### Process · 2 个工具
+全机只运行一个独立的用户会话守护进程，统一托管本机总线（`127.0.0.1:9317`）、原生浏览器根级 CDP 长连（Edge/Chrome `DevToolsActivePort`）、回环轻扩展桥（`127.0.0.1:9315`）与热插拔公网面（`127.0.0.1:9316`）。关闭任何 IDE 或 CLI 都不会让守护进程或浏览器长连接掉线。
 
 ```mermaid
 flowchart TB
-    Run[process_run] --> Resolve[使用子进程 PATH 解析程序]
-    Resolve --> Launch[直接启动 · pipe 或 PTY]
-    Launch --> Final[完成结果]
-    Launch --> Sessions[独立进程会话]
-    Sessions --> Continue[process_continue · session_id]
-    Continue --> Input[按序 stdin + PTY 尺寸]
-    Continue --> Output[有界输出 · 游标读取 + 等待]
-    Output --> Cursor[已接收 output_cursor → 下次读取]
-    Sessions --> Retain[异步完成结果 · 最长保留 10 分钟]
-    Continue --> Stop[独立终止路径]
+    subgraph Callers["① 多端调用侧（本质同构 · 只差网线与 Grant 权限）"]
+        Local["本地客户端<br/>IDE / CLI / WSL<br/>无状态 stdio 薄代理 → :9317"]
+        Cloud["云端客户端<br/>ChatGPT / Gemini / 远端<br/>热插拔 OpenAI & Cloudflare → :9316"]
+        Scoped["受控应用与主人<br/>命名 Bearer 令牌 · 本机 /ui"]
+    end
+
+    subgraph Runtime["② 本机唯一常驻核心（lrmcp 单二进制） ⇄ 零 debugger 轻扩展"]
+        direction LR
+        subgraph Daemon["lrmcp Go 单二进制守护进程（用户会话常驻）"]
+            MCP["4 个正交探索原语<br/>run · wait · session · capability_propose<br/>+ 已批准的 Web / App MCP 协议"]
+            VM["有状态并发 JS 编排引擎（Goja AST）<br/>跨轮变量/类常驻 · Promise.allSettled<br/>严格 snake_case · help() · Web 全局对象"]
+            CDP["原生 Go 浏览器根级 CDP 引擎<br/>全端共享单 WS · 零竞态开页<br/>AX Diff · Network · CSS · Tracing.start"]
+            GOV["主权治理与审计<br/>SQLite WAL + FTS5 · /ui 活动台<br/>临时页自动回收 · SDK 级只读沙箱"]
+            MCP --> VM
+            VM --> CDP
+            VM -. 审计流 .-> GOV
+        end
+        Ext["瘦身扩展（~790 行 TS · 零 debugger）<br/>1. Web Bridge（:9315 网页零密钥反向调能力）<br/>2. 主人 L 审批与授权面板<br/>3. 原生 Tab Groups 标签组"]
+        Daemon <-->|":9315 本机回环 WS+HTTP"| Ext
+    end
+
+    subgraph World["③ 对称的能力世界（通用探索 → 编译沉淀 → 全端复用）"]
+        OS["本机操作系统与软件世界<br/>探索：proc · fs · desktop (Rust UIA) · img<br/>沉淀：App MCP (capabilities/&lt;app&gt;/)"]
+        Browser["真实 Chromium 浏览器（复用主账号登录态）<br/>探索+DevTools：直连根 CDP (9222/57419)<br/>沉淀：Web MCP (capabilities/&lt;site&gt;/)"]
+    end
+
+    Local --> MCP
+    Cloud --> MCP
+    Scoped --> MCP
+    VM -->|"原生 Go + 内嵌 Rust UIA"| OS
+    CDP ==>|"直连浏览器根级 CDP WS（点一次允许全端复用）"| Browser
+    Browser -. "Web Bridge（网页调本机 / 跨站互调）" .-> Ext
 ```
 
-- `process_run` 接收程序名、参数数组、工作目录、环境变量覆盖、初始 stdin、执行期限、输出上限和 pipe/PTY I/O 模式。
-- `process_continue` 按明确的字节位置读取保留输出、写入 stdin、关闭 pipe 输入、调整 PTY 尺寸、等待或终止受管会话。
+---
 
-pipe 和 PTY 都使用合并后的子进程 `PATH` 查找程序，Windows 还使用 `PATHEXT`。显式相对程序路径以请求的工作目录为基准。需要 shell 语法时，明确启动所需 shell 并传入参数。
+## 4 个正交原语
 
-不同会话并行运行。同一会话的输入按序写入，读取会保留有界的 stdout 与 stderr 缓冲。等待输出不会阻塞终止路径，stdin 写入堵塞时也能终止。输出和输入等待有容量上限，单次 stdin 最大为 16 MiB。
-
-每次结果都返回 `output_cursor: {stdout, stderr}`，表示两条流下一次读取的字节位置。将上一次成功收到的游标传给 `process_continue`，即可只取得新输出；省略游标则从零开始重读保留内容。返回的 `stdout_offset`、`stderr_offset` 表示实际起点；请求位置早于当前缓冲时，截断标志会明确指出前缀已被淘汰。已完成的异步会话最长保留 10 分钟。容量不足时，最早完成的会话让位给新进程，运行中的会话继续保留。
-
-纯读取的响应丢失后，可用相同的 `session_id` 和游标再次调用 `process_continue`；结果还可能包含重试前新产生的输出。成功收到结果后才推进游标并拼接输出。启动进程、写入 stdin、调整 PTY 尺寸或终止进程的请求，在结果不确定时应先检查资源状态，再决定是否重试。首次启动响应丢失时，客户端可能还没有取得会话 ID。
-
-`duration_ms` 在进程运行期间表示已运行时长，退出后固定为实际进程生命周期。稍后再采集完成结果时，这个时长保持不变。
-
-取消信号到达尚未交付运行中会话的 `process_run` 时，会终止并回收该进程。取消信号到达 `process_continue` 时，只结束本次等待；结束会话使用 `terminate=true`。HTTP 断连的取消传播遵循协商的 MCP 协议：SDK 对 `2026-07-28` 及更新协议传播请求上下文取消，旧版无状态请求可能在客户端断开后继续完成有界等待。进程执行期限与 Host 退出独立于单次 MCP 请求期限。
-
-### Filesystem · 6 个工具
-
-```mermaid
-flowchart TB
-    Read[列举 · stat · 读取 · 搜索] --> Files[本机文件系统]
-    Write[创建 · 替换 · 补丁] --> Path[解析提交路径身份]
-    Path --> Lock[按路径协调提交]
-    Lock --> Version[读取并校验预期 SHA-256]
-    Version --> Build[生成完整新内容]
-    Build --> Commit[原子发布]
-    Commit --> Files
-```
-
-| 工具 | 操作 |
+| 原语 | 职责 |
 | --- | --- |
-| `filesystem_list` | 有界目录遍历。 |
-| `filesystem_stat` | 元数据与可选 SHA-256。 |
-| `filesystem_read_text` | 按行范围读取 UTF-8，设置行数与字节上限。 |
-| `filesystem_search_text` | 字面文本或 Go 正则搜索。 |
-| `filesystem_write_text` | 明确选择 `mode=create` 或 `mode=replace`。 |
-| `filesystem_patch_text` | 带版本校验、唯一上下文锚点的补丁。 |
+| **`run(title, code, done_title?, yield_ms?, max_output_bytes?)`** | 在当前会话的持久 JS 虚拟机里并发调度 `proc`、`fs`、`browser`、`desktop`、`img`、`caps`、`emitImage`、`print`、`sleep`、`help()` 以及标准 Web 全局对象（`URL`、`URLSearchParams`、`atob`、`btoa`、`setTimeout`）。顶层 `let`/`const`/`var`/`function`/`class` 跨轮保留；末尾裸表达式自动回显在 `cell.value`。 |
+| **`wait(cell_id, yield_ms?, terminate?)`** | 续接耗时较长的执行单元、收集增量输出与图片，或随时一键终止。 |
+| **`session(action='start'\|'update'\|'done', ...)`** | 单次只读查询可直接调用 `run` 免开闭会话；多步任务或打开浏览器标签页时用 `start` 建立命名任务线，`done` 时自动关闭未移交用户的临时标签页并明确回传 `closed_tabs`。 |
+| **`capability_propose(name, definition, script)`** | 模型探索完某个网站后，把可复用步骤写成确定性脚本提交提案，经主人在扩展 `L` 面板审代码批准后正式生效。 |
 
-`create` 在目标不存在时发布完整文件；`replace` 要求文件已存在，并提供 `expected_sha256`。Patch 同样要求预期 hash，所有 hunk 都基于同一个不可变原始版本定位。
+### 一轮调用，多域真并发示例
 
-文本读取返回完整行。第一条目标行超过字节预算时返回有界错误；已经读取完整行后遇到超限则报告截断和下一行号。跳过的行使用固定内存扫描，需要 SHA-256 时通过流式读取计算整个文件的 hash。
+```js
+// 在一次 `run` 内并发完成网页开页、本地配置按行读取、命令执行与全套只读检查：
+const [tab, cfg, ver] = await Promise.all([
+  browser.open("https://example.com", { active: false }),
+  fs.read("D:\\Dev\\local-runtime-mcp\\config.example.yaml", { start_line: 1, end_line: 25 }),
+  proc.run("lrmcp", ["version"]),
+]);
 
-Filesystem Service 从版本校验到提交全程持有对应路径的锁。不同路径与读操作可并行。修改拒绝最终路径上的符号链接，并规范化已有父目录的别名以协调提交。
+const [snap, css, reqs] = await Promise.all([
+  tab.snapshot({ diff: true }),                                  // 增量 AX Diff
+  tab.css("a"),                                                  // 自动初始化 DOM + 计算/命中样式
+  tab.network({ resource_types: ["document", "fetch", "xhr"] }), // 从第 0 字节捕获主文档
+]);
 
-这些锁协调本 Host 发出的文件调用。外部编辑器和被启动的程序按各自规则访问文件系统。并发编码任务可以使用不同 Git worktree，分开索引和构建输出。
-
-### Image · 1 个工具
-
-```mermaid
-flowchart LR
-    Read[image_read] --> Open[只打开一次源文件]
-    Open --> Bytes[限制实际读取字节]
-    Bytes --> Header[校验格式 + 像素 + 尺寸]
-    Header --> Original[原始编码图像]
-    Header --> Transform[有内存预算的裁剪 + 缩放]
-    Transform --> Encode[有字节预算的 PNG 编码]
-    Original --> Result[MCP 图像 + 元数据]
-    Encode --> Result
+// 末尾裸表达式自动回显到 cell.value，无需手写 print/return：
+({
+  title: tab.title,
+  version: ver.stdout.trim(),
+  configLines: cfg.end_line,
+  docStatus: reqs[0]?.status,
+  linkColor: css.computed.color,
+  axLines: snap.text.split("\n").length,
+})
 ```
 
-`image_read` 支持 PNG、JPEG、GIF 和 WebP，返回原生 MCP 图像内容及实际源文件字节数和尺寸。可选裁剪与等比例缩放输出 PNG。编码输入、像素、尺寸、解码变换内存和输出编码都有上限，等待执行容量时可以取消。
+<details>
+<summary><strong>内置 JS SDK 完整速查（在 <code>run</code> 内随时执行 <code>help(topic?)</code> 同样可得）</strong></summary>
 
-Image 是无状态读取。Browser 与 Computer 截图各自保留对应的观察身份和坐标语义。
+所有 SDK 选项严格使用 `snake_case` 并开启 `DisallowUnknownFields`：传错参数立即附带正确签名报错，且无论是否被 `Promise.allSettled` 捕获，都会完整记入 `sub_ops` 与 `sub_op_errors`。
 
-### Computer · 5 个工具
+- **`proc`** — 原生进程与交互式 PTY（直接传 `(program, args)` 免去壳层转义）：
+  - `proc.run(program, args?, { cwd?, env?, stdin?, keep_stdin_open?, timeout_seconds?, max_output_bytes?, max_output_tokens?, yield_time_ms?, io_mode?: "pipe"|"pty", columns?, rows? })`
+  - `proc.run({ cmd, shell?: "pwsh"|"cmd"|"bash"|"sh", cwd?, env?, ... })`
+  - `proc.continue({ session_id, output_cursor?, stdin?, close_stdin?, terminate?, yield_time_ms? })` · `proc.kill(session_id)`
+- **`fs`** — 路径锁 + SHA-256 乐观锁原子文件系统：
+  - `fs.list(path, { max_depth?, include_hidden?, max_entries? }?)`
+  - `fs.stat(path, { with_sha256? }?)`
+  - `fs.read(path, { start_line?, end_line?, line_count?, max_bytes?, with_sha256? }?)`（1-based 闭区间）
+  - `fs.write(path, content, { mode?: "create"|"replace", expected_sha256?, create_parents? }?)`
+  - `fs.patch(path, [{ before?, old, new, after? }], expected_sha256)`
+  - `fs.search(path, query, { regex?, case_sensitive?, include_hidden?, max_results? }?)`
+- **`browser` 与 `TabHandle`** — 原生浏览器根级 CDP（自动发现 Edge/Chrome `DevToolsActivePort`）：
+  - `browser.status()` · `browser.connect(browser_id?)` · `browser.tabs(browser_id? | { browser_id?, include_workers? }?)`
+  - `browser.open(url, { browser_id?, active?, session_name? }?)`（先建 `about:blank` → 附着开全观测域 → `Page.navigate` → 等加载完毕，零竞态不漏主文档）
+  - `browser.tab(id)` · `browser.cdp(method, params?, browser_id?)` · `browser.cleanup()`
+  - `browser.traceStart({ browser_id?, tab_id?, reload?, ignore_cache?, categories? }?)` · `browser.traceStop(file_path?, browser_id?)`（`IO.read` 无损落盘原始轨迹 + 直接读取浏览器内核 Web Performance API：`ttfb_ms`、`fcp_ms`、`lcp_ms`、`dcl_ms`、`load_ms`、`cls`）
+  - `tab.goto(url)` · `reload()` · `back()` · `forward()` · `close()` · `markHandoff()`
+  - `tab.snapshot({ diff?: true, max_elements?, max_text? }?)` · `tab.screenshot({ full_page?, clip_x?, clip_y?, clip_width?, clip_height? }?)` · `tab.eval(js)` · `tab.cdp(method, params?)`
+  - 带自动等待的语义定位器：`tab.getByRole(role, nameOrOpts?)` · `getByText` · `getByLabel` · `getByPlaceholder` · `locator(css)` → `.click()` / `.doubleClick()` / `.hover()` / `.fill(t)` / `.type(t)` / `.press(k)` / `.select(o)` / `.check(b)` / `.uploadFiles(paths)` / `.waitFor({ timeout_ms? })` / `.nth(i)`
+  - 全套 DevTools：`tab.network({ resource_types?, url_contains?, include_preserved?, failed_only?, limit? }?)` · `tab.networkBody(request_id)` · `tab.console({ levels?, limit? }?)` · `tab.emulate({ width?, height?, mobile?, cpu_throttling_rate?, network_preset?, color_scheme?, reduced_motion?, forced_colors?, user_agent?, geolocation?, extra_headers? })` · `tab.css(selectorOrLoc)` · `tab.heapSnapshot(file_path?)` · `tab.logpoint(url, line, expr, col?)` · `tab.screencastStart(opts?)` · `tab.screencastStop()`
+- **`desktop`** — 内嵌 Rust Windows Graphics Capture（窗口被遮挡也能清晰抓帧）+ UI Automation（观察和语义控件操作绝不抢焦点；仅物理键鼠需借用独占令牌，屏幕底部带可随时点停的提示条）：
+  - `desktop.targets({ pid?, title?, process? }?)` · `desktop.state(opts?)` · `desktop.wait(opts)` · `desktop.action(act)` · `desktop.control("status"|"acquire"|"release", opts?)`
+- **`img` 与 `emitImage`** — `img.read(path, { max_bytes?, max_pixels?, crop_x?, crop_y?, crop_width?, crop_height?, max_width?, max_height? }?)` · `emitImage(imgOrShotOrPath, label?)` 直接回传原生 MCP 多模态图片。
+- **`caps` 与标准全局对象** — `caps.list()` · `caps.call(name, args?, browser_id?, tab_id?)` · `print(...)` · `sleep(ms)` · `setTimeout` / `clearTimeout` · `URL` / `URLSearchParams` · `atob` / `btoa` · `help(topic?)`。
 
-```mermaid
-flowchart TB
-    Targets[computer_targets] --> Worker[Rust 原生引擎]
-    State[computer_state] --> Worker
-    Wait[computer_wait · 轮询 computer_state] --> Worker
-    Action[computer_action] --> Kind{kind}
-    Kind -->|语义操作 · place| Worker
-    Kind -->|物理输入| Control[computer_control 令牌 + Go 桌面协调器]
-    Control --> Worker
-    Worker --> Displays[显示器 · 各自缩放]
-    Worker --> Capture[Windows Graphics Capture · 被遮挡的窗口也能截]
-    Worker --> UIA[UI Automation · 一次缓存请求取整棵树 · 控件模式]
-    Worker --> Input[物理输入 + 释放清理]
-    Worker --> Pill[屏幕底部小提示条 · 停止]
-    Pill -. 撤销控制 .-> Control
-```
+</details>
 
-AI 工作时，坐在电脑前的人照常干活。观察、等待、语义操作和摆放窗口都不碰鼠标、键盘和前台窗口；只有物理输入才借用它们。
+---
 
-```text
-computer_targets(process="StuDev") → 显示器 + 窗口（target_id）
-computer_state(target_id=..., image=false, automation_id="map") → ref_id
-computer_action(kind="invoke", element_ref=...)            # 不要控制权，不切换焦点
-computer_wait(target_id=..., name="搜地点", until="present") → 新的 ref_id
-computer_state(target_id=...) → 窗口被挡住时也能拿到它的像素
-computer_action(kind="place", target_id=..., bounds={...})  # 改大小但不激活
-```
+## 快速上手
 
-- `computer_targets` 返回所有显示器（ID、范围、工作区、缩放、是否主屏）和可见的顶层窗口：不透明的 target ID、进程、标题、类名、去掉不可见缩放边框后的可见外框、正常/最小化/最大化状态和所在显示器。被隐藏（cloaked）的窗口不列出。可按 `pid`、`title`、`process` 筛选。
-- `computer_state` 观察一个窗口、一块显示器或全部显示器。窗口通过 Windows Graphics Capture 截取，被其他窗口挡住、或是显卡交换链绘制的内容，都按实际画面截下。观察窗口时还返回 UI Automation 树，用一次跨进程缓存请求取得：角色、名称（含文字）、AutomationId、类名、值或勾选/选中/展开状态、位置、层级与父节点、禁用/屏外/焦点，以及支持的控件模式。`elements` 选 all、interactive 或 none；`name`、`automation_id`、`role` 筛选；`max_elements` 和 `offset` 分页。`region` 裁剪，`image=false` 不要像素，`cursor=true` 画出指针。
-- `computer_wait` 不截图地轮询窗口的控件树，直到符合 `name`、`automation_id` 或 `role` 的元素出现或消失，返回那次观察以及条件是否满足。
-- `computer_action` 的语义操作按 `element_ref` 通过控件模式操作元素：`invoke`、`toggle`、`select`、`expand`、`collapse`、`set_value`、`scroll_into_view`、`scroll_by`（按页）。`place` 把窗口移动或缩放到指定可见外框，或还原、最小化，都不激活窗口，跨不同缩放的显示器也准确。物理操作 `activate`、`move`、`click`、`double_click`、`drag`、`type_text`、`press_key`、`scroll` 需要 `control_id` 和用它观察得到的状态。
-- `computer_control` 把唯一的鼠标和键盘分配给一个工作流。空闲五分钟过期，受控操作会续期；释放、过期、本地停止和关闭都会取消未完成的工作、清理注入的输入，并使可操作的观察失效。
+### 1. 下载与初始化
 
-ref 在使用时会核对元素的运行时身份，控件被替换后旧 ref 直接报错，不会误操作别的东西。物理操作使之前的状态失效；语义操作不会。坐标相对观察的原点，原点是虚拟桌面的物理像素；主屏左边的显示器原点为负。
-
-持有物理控制权时，正在操作的那块屏幕底部会出现一个半透明小提示条，写着“AI 正在操作 · 点此停止”，点一下即撤销控制。它不描窗口边框，不抢焦点，也不会被截进图里。语义操作什么都不画。
-
-### Browser · 8 个工具
-
-```mermaid
-flowchart TB
-    Tools[Browser 工具] --> Registry[实例注册表 + 标签页路由]
-    Registry --> Bridge[带认证的 loopback Bridge]
-    Bridge <-->|WebSocket · 命令 + 心跳| Edge[Edge Profile 扩展]
-    Bridge <-->|WebSocket · 命令 + 心跳| Chrome[Chrome Profile 扩展]
-    Edge -->|HTTP · 结果 + 授权| Bridge
-    Chrome -->|HTTP · 结果 + 授权| Bridge
-    Chrome --> Intake[命令接收]
-    Intake --> Queue[有界标签页 FIFO 调度]
-    Queue --> TabA[标签页 A · CDP Frame]
-    Queue --> TabB[标签页 B · CDP Frame]
-    TabA --> Observation[文档纪元 + 快照 + 截图坐标]
-    TabB --> Observation
-```
-
-在每个用于 AI 操作的 Chromium Profile 中加载同一套 MV3 扩展，在扩展选项中填写容易识别的名称，例如 `Edge · 工作`、`Chrome · 研究`。扩展在该 Profile 中保存稳定 UUID，用 Bridge token 连接共享运行时。`chrome.debugger` 将 CDP 操作发送到明确的标签页和 Frame。
-
-每个 Profile 通过一条带认证的 loopback WebSocket 接收命令，每 20 秒交换一次心跳；浏览器 alarm 负责恢复中断的连接。结果回传和桌面操作授权通过同一 Bridge 的认证 HTTP 完成。浏览器任务空闲时连接仍保持活跃，遵循 Chromium 的[扩展 Worker WebSocket 生命周期](https://developer.chrome.com/docs/extensions/how-to/web-platform/websockets)。
-
-| 工具 | 目标与操作 |
-| --- | --- |
-| `browser_status` | 列出有名称的实例及连接状态。 |
-| `browser_tabs` | 指定 `browser_id`，发现标签页。 |
-| `browser_open` | 指定 `browser_id`，创建标签页，默认 `active=false`。 |
-| `browser_close` | 关闭不透明 `tab_id`。 |
-| `browser_navigate` | 对 `tab_id` 导航、后退、前进或刷新。 |
-| `browser_snapshot` | 跨 Frame 的有界可访问性文本和带版本元素引用。 |
-| `browser_screenshot` | 对 `tab_id` 获取视口、整页或裁剪 PNG。 |
-| `browser_action` | 使用引用或截图坐标操作，并支持表单、文件、对话框和 JavaScript。 |
-
-从状态结果复制 `browser_id`，从发现或创建结果复制不透明标签页 `id`，在后续调用中作为 `tab_id` 使用。句柄内部包含实例和生命周期身份。目标不存在或离线时返回错误，保持所选 Profile 的边界。扩展 Worker 重启或连接代次变化后，重新发现标签页、获取观察。
-
-动作包括 `click`、`double_click`、`hover`、`drag`、`type_text`、`set_value`、`press_key`、`scroll`、`select`、`check`、`upload_files`、`handle_dialog`、`evaluate`。视口坐标需要匹配的截图 ID；元素引用属于观察时的文档和 Frame 代次。导航、Frame 变化、重连与副作用会失效对应观察。
-
-不同实例与标签页可并行，同一个标签页按序执行。等待容量与执行槽有界，被取消的排队命令会丢弃。不同 Profile 保留各自浏览器数据，同一 Profile 的标签页共享其会话、cookie 和账户。
-
-改变当前可见桌面的 Browser 操作会与 Computer 控制权协调。后台标签页工作继续并行；可见操作遇到已占用桌面时，携带匹配的 `control_id`，或等待控制权释放。
-
-## 并发工作流
-
-| 资源 | 协调规则 |
-| --- | --- |
-| Process | 会话独立；每个会话按序输入，在保留范围内按游标重读输出。 |
-| Filesystem | 读取与不同路径并行；同路径按版本校验后提交。 |
-| Image | 在执行容量和内存预算内独立读取。 |
-| Browser | 明确实例和标签页路由；不同标签页并行，单标签页 FIFO。 |
-| Computer | 一个桌面输入控制者；只读观察仍可用。 |
-
-两个 AI 会话可以各自选择一个浏览器实例，打开自己的后台标签页，也可以同时运行独立进程；其中一个工作流使用桌面输入。如果选择同一个标签页、文件、仓库或云端账户，它们就共享对应资源。
-
-请求取消、进程执行期限和 Host 退出分别处理。一个失败或到期调用保留其他资源。动作可能已经产生副作用时，先观察目标，再决定是否重试非幂等操作。
-
-传输恢复测试覆盖响应头返回前的请求失败、不完整的响应体、协议相关的取消传播，以及 Tunnel 轮询和结果交付的短暂错误。单次故障之后，另一个客户端与新连接的客户端应继续可用。云端连接错误本身不能确定失败的链路，也不能确定工具是否执行；诊断需要单个工具名称、机器时间和 Provider 日志。分享日志时应隐去凭据与工具载荷。
-
-[双会话验收提示词](docs/concurrency-acceptance.zh-CN.md)可以通过已配置的客户端验证空闲浏览器连接、独立进程输出、明确的 Profile 路由与桌面控制权。[连接指南](docs/connections.zh-CN.md)说明 Gemini OAuth 配置和同一 Host 的跨 Provider 验收。
-
-## 安装
-
-从 [Releases](https://github.com/hicancan/local-runtime-mcp/releases/latest) 下载平台压缩包，校验公布的 SHA-256，解压到独立目录。
-
-| 平台 | Process、Filesystem、Image | Browser | Computer |
-| --- | --- | --- | --- |
-| Windows amd64 | 支持 | Chromium 扩展 | Windows 原生引擎 |
-| Linux amd64 / arm64 | 支持 | 桌面浏览器中的 Chromium 扩展 | 返回平台不可用 |
-
-Browser 需要 Chromium 120 或更新版本，以及正在运行并加载扩展的 Profile。Windows Computer 需要 Windows 10 2004 或更新版本（包括 Windows 11）、交互桌面，以及适合目标应用的账户权限。
-
-Windows 发布包包含：
-
-```text
-local-runtime-mcp/
-├── lrmcp.exe
-├── cloudflared.exe
-├── config.example.yaml
-├── README.md
-├── README.zh-CN.md
-├── SECURITY.md
-├── PRIVACY.md
-├── LICENSE
-├── THIRD_PARTY_NOTICES.md
-├── docs/
-├── licenses/
-└── cloudflared-LICENSE
-```
-
-将 `config.example.yaml` 复制为 `local-runtime-mcp.yaml`，填写本次传输和 Provider 所需配置：
-
-```yaml
-browser:
-  listen: 127.0.0.1:9315
-  token: "replace-with-a-random-token-of-at-least-32-characters"
-
-openai:
-  tunnel_id: "replace-with-your-openai-tunnel-id"
-  api_key: "replace-with-your-openai-tunnel-api-key"
-
-http:
-  listen: 127.0.0.1:9316
-  public_host: mcp.example.com
-  auth: bearer
-  bearer_token: "replace-with-a-random-token-of-at-least-32-characters"
-
-cloudflare:
-  tunnel_token: "replace-with-your-cloudflare-managed-tunnel-token"
-```
-
-按照含凭据应用目录的要求保护整个运行目录。移动运行目录时，浏览器安装、实例身份和账户数据仍属于原机器上的 Profile。
-
-### 浏览器准备
+从 [Releases](https://github.com/hicancan/local-runtime-mcp/releases/latest) 下载对应平台压缩包（或[从源码构建](#安装与构建)），解压到独立便携目录：
 
 ```powershell
+# 1. 初始化本机面（127.0.0.1:9317），让所有客户端共享同一常驻守护进程
+./lrmcp.exe setup local
+
+# 2. 初始化瘦身扩展桥（127.0.0.1:9315），用于 Web Bridge、L 面板与标签分组
 ./lrmcp.exe setup browser
 ```
 
-命令将 Bridge 凭据保存在同目录 YAML，并把扩展释放到可执行文件旁边的 `browser-extension`。在每个目标 Profile 中打开 `edge://extensions` 或 `chrome://extensions`，启用开发人员模式，选择“加载解压缩的扩展”，再选择该目录。打开扩展选项设置独立名称，确认 Bridge 地址与 token。启动 `lrmcp` 后通过 `browser_status` 查看连接中的实例。
+### 2. 开启浏览器原生远程调试（每个浏览器只需一次）
 
-### 本地 stdio
+- 打开 `edge://inspect`（Edge）或 `chrome://inspect/#remote-debugging`（Chrome）打开 **远程调试** 开关。
+- 在 `edge://extensions` / `chrome://extensions` 开启开发者模式，加载解压出来的 `browser-extension` 目录（无需 `"debugger"` 权限）。
+- 首次发起 CDP 连接时，在浏览器弹出的原生确认框点一次 **允许**。只要浏览器与守护进程未重启，此后所有本地与云端客户端均复用这一根长连接，不再反复弹窗。
+
+### 3. 接入任意本地 MCP 客户端
 
 ```json
 {
   "mcpServers": {
-    "local-runtime-mcp": {
-      "command": "C:\\Tools\\local-runtime-mcp\\lrmcp.exe",
-      "args": ["serve", "--transport", "stdio"]
+    "lrmcp": {
+      "command": "D:\\Dev\\local-runtime-mcp\\lrmcp.exe",
+      "args": ["serve", "--transport", "stdio", "--agent", "my-client"]
     }
   }
 }
 ```
 
-### OpenAI Tunnel
+首个接入的 `stdio` 客户端会在守护进程未运行时自动拉起独立后台进程，自身仅作无状态薄代理。
 
-填写 `openai` 段并初始化本机面（`./lrmcp.exe setup local`）后，按需热插拔（或在浏览器 `L` 扩展面板中一键开关）：
+---
+
+## 远程隧道与 OAuth
+
+在运行中的守护进程上**零重启热插拔**公网外线，插拔过程完全不打断本地客户端或浏览器长连接：
 
 ```powershell
+# 热插 OpenAI Secure MCP Tunnel（支持到期自动断开租约）
 ./lrmcp.exe tunnel up openai --ttl 2h
-./lrmcp.exe tunnel down openai
-```
 
-Provider 设置和受支持的客户端见 [OpenAI Secure MCP Tunnel 指南](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)。私有 HTTP 源站自动创建，端口与私有链路凭据只在本次运行中保留。
-
-### Streamable HTTP
-
-直接通过回环 HTTP 访问时，设置 `http.auth: bearer`、填写 `http.bearer_token` 并热插 HTTP 网线：
-
-```powershell
-./lrmcp.exe tunnel up http
-```
-
-默认端点为 `http://127.0.0.1:9316/mcp`。loopback 监听器使用配置的 Bearer token，也可以作为反向代理源站。启用 OAuth 后，还会在公开 HTTPS 地址下提供发现、授权和 token 端点。
-
-### Cloudflare Tunnel
-
-创建远程管理的 Cloudflare Tunnel，将域名路由到 `http://127.0.0.1:9316`，填写 `http.public_host`、`cloudflare.tunnel_token` 并配置 HTTP 认证后热插 Cloudflare：
-
-```powershell
+# 热插 Cloudflare Tunnel + 公网回环 HTTP（127.0.0.1:9316）
 ./lrmcp.exe tunnel up cloudflare
+
+# 实时将任意外线收紧为严格只读（在 JS SDK 层硬拦截写与进程执行）
+./lrmcp.exe grant remote openai --read-only
+
+# 拔掉单条或全部外线（拔除后外网暴露面严格为 0）
+./lrmcp.exe tunnel down all
 ```
 
-发布包附带固定版本的 `cloudflared`。远端 MCP 客户端使用 `https://<public_host>/mcp`。Bearer 模式在客户端 token 设置中填写 MCP Bearer token；OAuth 模式则注册该客户端的回调地址并使用对应客户端凭据。Cloudflare token 验证隧道程序，HTTP 凭据授权 MCP 客户端。
+<details>
+<summary><strong>OAuth、命名远端令牌与环境变量配置</strong></summary>
 
-### 同时开启两条隧道
-
-填写两种 Provider 的配置后，直接在同一个常驻 Daemon 上挂载两条远端网线：
-
-```powershell
-./lrmcp.exe tunnel up openai
-./lrmcp.exe tunnel up cloudflare
-```
-
-两个连接与全部本地 `stdio` 客户端共享同一个 Browser Bridge、进程会话注册表、文件提交协调服务和桌面控制器；随时插拔单条网线均不重启守护进程。使用 `lrmcp grant remote openai --read-only`（或在 `L` 扩展面板勾选“仅只读”）可实时收窄远端权限。
-
-### Gemini 与其他客户端的 OAuth
-
-将 `http.public_host` 设为可以公网访问的域名。在 MCP 客户端连接窗口复制准确的 redirect URI，然后在本地注册：
+复制 `config.example.yaml` 为同目录 `local-runtime-mcp.yaml`（优先级：**命令行参数 > `LOCAL_RUNTIME_MCP_*` 环境变量 > YAML > 默认值**）：
 
 ```powershell
-./lrmcp.exe setup oauth --client-name gemini --redirect-uri "https://<client-callback-host>/<callback-path>"
+# 注册 OAuth 客户端（如 Gemini / ChatGPT 连接器）并绑定精确回调地址
+./lrmcp.exe setup oauth --client-name gemini --redirect-uri "https://<callback-host>/<path>"
 ./lrmcp.exe setup oauth --client-name gemini --show
+
+# 签发独立命名的 Bearer 令牌（与 OAuth 在 :9316 共存）
+./lrmcp.exe setup remote-token --id worker-1 --read-only
+
+# 注册本机受控应用令牌
+./lrmcp.exe setup client --id my-app
 ```
 
-准备命令在同目录 YAML 中保存 OAuth 客户端和所有者批准密钥，并选择 `http.auth: oauth`。查看命令在本地显示该客户端的凭据。将生成的 **client ID** 和 **client secret** 填入 Gemini 的附加设置，服务 URL 使用 `https://<public_host>/mcp`。授权时，在 Local Runtime 的授权页面使用所有者批准密钥确认访问；该密钥由机器操作者保管。
-
-OAuth 授权开放此运行时的完整机器控制工具。每个客户端使用准确回调地址，需要多个回调时重复传入 `--redirect-uri`。访问 token 和刷新 token 保存在内存中，重启 `lrmcp` 后客户端需要重新授权。OpenAI 私有链路认证独立于公开 HTTP 的认证模式。
-
-[连接指南](docs/connections.zh-CN.md)给出完整步骤、凭据职责和验收方法。实际客户端行为在连接对应账户和回调之后验证。
-
-### 环境变量覆盖
-
-| 环境变量 | YAML 字段 |
+| 环境变量 | 对应 YAML 字段 |
 | --- | --- |
-| `LOCAL_RUNTIME_MCP_BROWSER_LISTEN` | `browser.listen` |
-| `LOCAL_RUNTIME_MCP_BROWSER_TOKEN` | `browser.token` |
-| `LOCAL_RUNTIME_MCP_LOCAL_LISTEN` | `local.listen` |
-| `LOCAL_RUNTIME_MCP_LOCAL_TOKEN` | `local.token` |
-| `LOCAL_RUNTIME_MCP_CLIENT_TOKEN` / `LOCAL_RUNTIME_MCP_CLIENT_TOKEN_<ID>` | `grants.clients[].token` |
-| `LOCAL_RUNTIME_MCP_REMOTE_TOKEN_<ID>` | `grants.remote.tokens[].token` |
-| `LOCAL_RUNTIME_MCP_OPENAI_TUNNEL_ID` | `openai.tunnel_id` |
-| `LOCAL_RUNTIME_MCP_OPENAI_API_KEY` | `openai.api_key` |
-| `LOCAL_RUNTIME_MCP_HTTP_LISTEN` | `http.listen` |
-| `LOCAL_RUNTIME_MCP_HTTP_PUBLIC_HOST` | `http.public_host` |
-| `LOCAL_RUNTIME_MCP_HTTP_AUTH` | `http.auth` |
-| `LOCAL_RUNTIME_MCP_HTTP_BEARER_TOKEN` | `http.bearer_token` |
+| `LOCAL_RUNTIME_MCP_LOCAL_LISTEN` / `_LOCAL_TOKEN` | `local.listen` / `local.token` |
+| `LOCAL_RUNTIME_MCP_BROWSER_LISTEN` / `_BROWSER_TOKEN` | `browser.listen` / `browser.token` |
+| `LOCAL_RUNTIME_MCP_OPENAI_TUNNEL_ID` / `_API_KEY` | `openai.tunnel_id` / `openai.api_key` |
+| `LOCAL_RUNTIME_MCP_HTTP_LISTEN` / `_PUBLIC_HOST` / `_AUTH` / `_BEARER_TOKEN` | `http.*` |
 | `LOCAL_RUNTIME_MCP_OAUTH_OWNER_TOKEN` | `http.oauth.owner_token` |
-| `LOCAL_RUNTIME_MCP_CLOUDFLARE_TUNNEL_TOKEN` | `cloudflare.tunnel_token` |
-| `LOCAL_RUNTIME_MCP_CLOUDFLARED` | `cloudflare.binary` |
+| `LOCAL_RUNTIME_MCP_CLOUDFLARE_TUNNEL_TOKEN` / `_CLOUDFLARED` | `cloudflare.tunnel_token` / `cloudflare.binary` |
+| `LOCAL_RUNTIME_MCP_CLIENT_TOKEN_<ID>` / `_REMOTE_TOKEN_<ID>` | `grants.clients` / `grants.remote.tokens` |
 
-运行 `lrmcp help` 查看对应命令行参数。
+完整接入步骤见 [docs/connections.md](docs/connections.md)。
 
-## 构建与测试
+</details>
 
-需要 Go 1.27、Node.js 24。Windows Computer 引擎使用 Rust 1.96.0 MSVC 工具链，CI 与发布构建固定使用 Rust 1.96.0，Windows 原生 Worker 静态链接 Microsoft CRT。原生构建前加载 Visual Studio 构建环境。
+---
+
+## Web MCP & App MCP 正向沉淀
+
+`lrmcp` 把高成本、不稳定的网页摸索持续“编译”成可版本化迭代的确定性站点与软件协议：
+
+1. **探索**：先用 `run`（`tab.snapshot`、`tab.network`、`tab.eval`）摸清陌生网站或桌面软件。
+2. **提案**：通过 `capability_propose(name, definition, script)` 提交带精确域名与输入/输出 JSON Schema 的确定性脚本。
+3. **审批与复用**：主人在扩展 **`L` 面板** 审完代码点批准，即刻落盘至 `capabilities/<site>/`（Web MCP）或 `capabilities/<app>/`（App MCP）并热重载——底层直接走 Go 原生 CDP 执行并校验来源与 Schema，同时供所有 MCP 客户端（直接调用或在 `run` 内经 `caps.call(...)` 并发混编）与获得主人授权的网页（经 `:9315` **Web Bridge** 零密钥调用）共同复用。
+
+---
+
+## 活动台与审计
+
+每一次调用都按任务线沉淀进纯 Go 嵌入式 **SQLite WAL + FTS5** 审计库（`lrmcp-audit.db`），支持 `title` → `done_title` 双态摘要翻转、细粒度 `sub_ops` 耗时与错参追踪，以及空置 15 分钟自动衰减为 `idle`。
 
 ```powershell
+# 打开仅本机可访问的活动台（http://127.0.0.1:9317/ui/）
+./lrmcp.exe ui
+
+# CLI 三层钻取排查
+./lrmcp.exe audit list --limit 10
+./lrmcp.exe audit events --session <ID> --compact
+./lrmcp.exe audit show <EVENT_ID>
+./lrmcp.exe audit search "example.com" --compact
+./lrmcp.exe audit tail
+```
+
+---
+
+## 安装与构建
+
+| 平台 | 进程、文件、图片 | 浏览器原生 CDP + DevTools | 桌面 UIA 控制 |
+| --- | --- | --- | --- |
+| **Windows amd64** | 完整支持 | Chromium 120+（`DevToolsActivePort`）+ 瘦身扩展 | 内嵌 Rust WGC + UIA |
+| **Linux amd64 / arm64** | 完整支持 | Chromium 120+（`DevToolsActivePort`）+ 瘦身扩展 | 明确返回平台不可用 |
+
+<details>
+<summary><strong>从源码构建与测试（Go 1.27 · Node.js 24 · Rust 1.96）</strong></summary>
+
+```powershell
+# 1. 构建并测试瘦身浏览器扩展（同步更新 internal/version/version.go）
 Push-Location browser-extension
-npm ci
-npm run build
-npm test
+npm ci && npm run build && npm test
 Pop-Location
+
+# 2. （Windows，仅在修改 Rust 桌面引擎时需要）构建内嵌工作器
 ./scripts/build-native.ps1
-cargo fmt --manifest-path native/computer-windows/Cargo.toml --check
-cargo clippy --manifest-path native/computer-windows/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path native/computer-windows/Cargo.toml --locked
-go test ./...
+
+# 3. 运行全量测试并编译单文件二进制
+go test -count=1 ./...
 go vet ./...
-go build ./cmd/lrmcp
+go build -trimpath -ldflags="-s -w" -o lrmcp.exe ./cmd/lrmcp
 ```
 
-Go 测试覆盖共享资源生命周期、Provider 管理、HTTP 认证与 OAuth 流程、响应归属、取消、文件竞争提交、进程 I/O 和浏览器身份路由。扩展调度测试覆盖顺序、公平性、取消和队列上限。Windows 可选 Chromium 验收会在临时 Profile 中加载真实扩展，覆盖空闲连接与页面操作：
+</details>
 
-```powershell
-$env:LOCAL_RUNTIME_MCP_BROWSER_E2E = '1'
-go test ./internal/browser -run 'TestEdgeExtension(IdleLifecycle|EndToEnd)' -count=3 -v
-go test ./internal/browser -run TestEdgeOAuthAuthorizationRedirect -count=3 -v
-```
+---
 
-OAuth 浏览器回归使用测试凭据验证批准、取消、错误密钥重试、跨站回调链、客户端认证和刷新令牌轮换。CI 覆盖 Windows 与 Linux。本地协议与浏览器测试验证对应执行链路；真实客户端验收针对已配置的账户和 Tunnel 单独进行。
+## 安全、隐私与许可
 
-## 安全、隐私与协议
-
-通过认证的客户端使用运行 `lrmcp` 的账户权限。资源句柄在共享机器内部协调目标与工作流，并发协调与独立租户权限属于不同边界。需要工作负载分离时，使用专用操作系统账户与浏览器 Profile。
-
-[SECURITY.md](SECURITY.md) 说明部署与私密漏洞报告；[PRIVACY.md](PRIVACY.md) 说明本地保留和外部 Provider 数据流。
-
-项目使用 [GNU AGPL v3.0 only](LICENSE)。`cloudflared` 配套程序使用独立协议，依赖归属见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+- 通过认证的客户端以运行 `lrmcp` 的系统账户权限执行；本机面（`127.0.0.1:9317`）与扩展桥（`127.0.0.1:9315`）严格拒绝非回环主机、跨源请求与代理头。
+- 远端外线严格遵循 `grants.remote` 权限边界（含 SDK 级只读沙箱），OAuth 访问与刷新令牌仅驻留内存、重启即清空。
+- **零遥测、零静默上报**——除你主动插上的隧道之外，一切数据留在本地。
+- 详见 [SECURITY.md](SECURITY.md)、[PRIVACY.md](PRIVACY.md) 与 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+- 遵循 [GNU AGPL v3.0 only](LICENSE) 开源许可。

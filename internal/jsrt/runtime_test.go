@@ -349,3 +349,62 @@ func TestStrictValidationReplAutoReturnHelpAndSubOpErrors(t *testing.T) {
 		t.Fatalf("unexpected help doc: %q", doc)
 	}
 }
+
+func TestASTPersistenceClassRedeclareAndWebGlobals(t *testing.T) {
+	ctx := context.Background()
+	eng := NewEngine(ctx, Dependencies{})
+	defer eng.Close()
+
+	// Turn 1: class, nested destructuring, const declaration, and Web globals.
+	r1, err := eng.Run(ctx, RunOptions{
+		SessionID: "sess-ast",
+		Title:     "验证 AST 持久化与标准 Web 全局对象",
+		Code: `
+			class Counter {
+				constructor(n) { this.n = n; }
+				inc(by = 1) { this.n += by; return this.n; }
+			}
+			const { meta: { tag }, nums: [first, ...rest] } = { meta: { tag: "v18" }, nums: [10, 20, 30] };
+			const c = new Counter(first);
+			const u = new URL("https://example.com/a/b?x=1&y=two#top");
+			u.searchParams.set("z", "3");
+			const encoded = btoa("hello-lrmcp");
+			const decoded = atob(encoded);
+			const timed = await new Promise((resolve) => {
+				const skip = setTimeout(() => resolve("cancelled"), 5);
+				clearTimeout(skip);
+				setTimeout((v) => resolve(v), 15, "timer-ok");
+			});
+			({ tag, first, restLen: rest.length, val: c.inc(5), href: u.href, y: u.searchParams.get("y"), decoded, timed })
+		`,
+	})
+	if err != nil || r1.Status != "done" {
+		t.Fatalf("AST turn 1 failed: status=%s err=%s goErr=%v", r1.Status, r1.Error, err)
+	}
+	m1, ok := r1.Value.(map[string]any)
+	if !ok || m1["tag"] != "v18" || m1["val"] != float64(15) || m1["decoded"] != "hello-lrmcp" || m1["timed"] != "timer-ok" || m1["y"] != "two" {
+		t.Fatalf("unexpected AST turn 1 value: %#v", r1.Value)
+	}
+	href, _ := m1["href"].(string)
+	if !strings.Contains(href, "z=3") || !strings.HasSuffix(href, "#top") {
+		t.Fatalf("unexpected URL href: %q", href)
+	}
+
+	// Turn 2: reuse class Counter, nested destructured vars, AND re-declare const `tag` cleanly.
+	r2, err := eng.Run(ctx, RunOptions{
+		SessionID: "sess-ast",
+		Title:     "验证跨轮复用类与重声明同名 const",
+		Code: `
+			const tag = "v18.2";
+			const c2 = new Counter(100);
+			({ prevCounter: c.inc(2), newCounter: c2.inc(3), restSum: rest[0] + rest[1], tag })
+		`,
+	})
+	if err != nil || r2.Status != "done" {
+		t.Fatalf("AST turn 2 failed: status=%s err=%s goErr=%v", r2.Status, r2.Error, err)
+	}
+	m2, ok := r2.Value.(map[string]any)
+	if !ok || m2["prevCounter"] != float64(17) || m2["newCounter"] != float64(103) || m2["restSum"] != float64(50) || m2["tag"] != "v18.2" {
+		t.Fatalf("unexpected AST turn 2 value: %#v", r2.Value)
+	}
+}

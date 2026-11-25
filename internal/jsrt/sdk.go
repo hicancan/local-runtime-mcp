@@ -130,6 +130,7 @@ func (v *sessionVM) installGlobals() {
 	_ = v.vm.Set("emitImage", emitImageFn)
 	_ = v.vm.Set("sleep", sleepFn)
 	_ = v.vm.Set("help", helpFn)
+	v.installWebGlobals()
 }
 
 func (v *sessionVM) isReadOnly() bool {

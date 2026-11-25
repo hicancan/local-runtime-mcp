@@ -118,10 +118,12 @@ DevTools:
 - caps.list() -> Promise<CapabilityDefinition[]>
 - caps.call(name, args?, browser_id?, tab_id?) -> Promise<any>`,
 
-	"utils": `Built-in helpers:
+	"utils": `Built-in helpers & Web globals:
 - print(...args) / console.log(...args) -> appends line to cell.output
 - write(...args) -> appends raw text without trailing newline
 - sleep(ms) -> Promise<true> (capped at 300000ms)
+- setTimeout(fn, ms, ...args) / clearTimeout(id)
+- URL / URLSearchParams / atob(b64) / btoa(str)
 - help(topic?) -> returns SDK documentation string`,
 }
 

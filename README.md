@@ -1,522 +1,301 @@
-# Local Runtime MCP
+<div align="center">
 
-[![Release](https://img.shields.io/github/v/release/hicancan/local-runtime-mcp)](https://github.com/hicancan/local-runtime-mcp/releases/latest)
-[![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
+# Local Runtime MCP (`lrmcp`)
+
+**One single-binary daemon for local & cloud MCP clients — stateful concurrent JS orchestration, native browser-level Chrome DevTools (CDP + `Tracing.start`), atomic OS control, and Windows UI Automation through 4 orthogonal primitives.**
+
+[![Release](https://img.shields.io/github/v/release/hicancan/local-runtime-mcp?style=flat-square)](https://github.com/hicancan/local-runtime-mcp/releases/latest)
+[![License](https://img.shields.io/badge/license-AGPL--3.0--only-blue?style=flat-square)](LICENSE)
+[![Go](https://img.shields.io/badge/Go-1.27-00ADD8?style=flat-square&logo=go&logoColor=white)](go.mod)
+[![Rust](https://img.shields.io/badge/Rust-Windows%20UIA-DEA584?style=flat-square&logo=rust&logoColor=black)](native/computer-windows)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-555?style=flat-square)](#installation)
 
 **English** · [简体中文](README.zh-CN.md)
 
-Give local and cloud AI clients unified, concurrent control over the machine running `lrmcp` — processes, atomic files, native images, full browser automation + Chrome DevTools (including browser-process-level `Tracing.start`), and Windows UI Automation desktop control — through **4 orthogonal MCP primitives** (`run`, `wait`, `session`, `capability_propose`) backed by an embedded stateful JavaScript orchestration engine.
+[Why `lrmcp`](#why-lrmcp) · [Architecture](#architecture) · [4 Primitives](#the-4-orthogonal-primitives) · [Quick Start](#quick-start) · [Remote Tunnels](#remote-tunnels--oauth) · [Web & App MCP](#web-mcp--app-mcp-compilation) · [Activity Studio](#activity-studio--audit) · [Security](#security-privacy-and-license)
 
-`lrmcp` runs as one persistent user-session Go daemon (`127.0.0.1:9317`) with an embedded SQLite WAL + FTS5 audit store (`lrmcp-audit.db`), local-only Activity Studio (`lrmcp ui`), native browser-level CDP connections (via `DevToolsActivePort` or `browser.cdp_endpoints`), an embedded Rust Windows UIA worker, and a slim companion extension (`127.0.0.1:9315`) strictly for Web-to-Local capabilities, the owner `L` grants panel, and visual Tab Groups (zero `chrome.debugger`). Local clients attach concurrently over stateless `stdio` thin proxies; remote clients connect live through OpenAI Secure MCP Tunnel or Cloudflare Tunnel with zero daemon restarts. See [v18.0.0 release notes](docs/releases/v18.0.0.md).
+</div>
 
-Independent process sessions, filesystem paths, and browser tabs run concurrently; shared files and desktop physical input have explicit coordination rules.
+---
 
-- **Native multimodal results.** Files, browser pages, and desktop observations return text and MCP image content directly.
-- **Explicit browser targets.** Connect several Chromium profiles, select a named browser instance, and operate its opaque tab handles.
-- **Desktop control that leaves you working.** See every display and window, read UI Automation trees with their text, and operate controls through their patterns without the pointer, keyboard or focus. Physical input, when needed, borrows them under a token, shown by a small pill you can click to stop.
-- **Portable configuration.** Keep `local-runtime-mcp.yaml`, the executable, and browser integration together on a fixed or removable drive.
-- **Independent connection providers.** Enable OpenAI, Cloudflare, or both for the same Runtime Host. Public HTTP supports static Bearer credentials or OAuth authorization with owner approval.
-- **Platform-specific engines.** Go hosts the runtime and MCP adapters; Rust implements Windows capture, UI Automation, and input; TypeScript implements Chromium integration.
+## Why `lrmcp`
+
+Most MCP setups scatter 30+ flat single-step tools across separate per-IDE Node/Python subprocesses: every click, file read, and network check costs an LLM round-trip, dumps megabytes of raw DOM into context, and re-prompts your browser for remote debugging every time a client restarts.
+
+`lrmcp` collapses the entire stack into **one portable, zero-dependency Go binary** (`~33 MB`, embedded Rust Windows UIA worker + SQLite WAL/FTS5 audit engine + local Activity Studio) and **4 orthogonal primitives**:
+
+| Capability | Traditional Flat MCP / `chrome-devtools-mcp` | `lrmcp` (v18) |
+| --- | --- | --- |
+| **Tool surface** | 25–40 flat tools; large schemas & serial round-trips | **4 orthogonal primitives** (`run`, `wait`, `session`, `capability_propose`) + owner-approved site/app protocols |
+| **Concurrency & state** | 1 step per turn; intermediate data bloats LLM context | **Persistent per-session JS VM** (`Promise.allSettled`, AST top-level persistence, REPL auto-return) — filter in memory, return only answers |
+| **Browser & DevTools** | Per-client `npx`/Node subprocess; re-prompts on reconnect; extension `chrome.debugger` banner conflicts | **One shared browser-root CDP WebSocket** (`DevToolsActivePort`): approve once, share across every local & cloud client. Full DevTools + **browser-process `Tracing.start`** + Web Performance API + **-77.8% AX incremental diff** |
+| **Companion extension** | Heavy debugger scheduler | **Slim zero-`debugger` extension (~790L TS)** strictly for Web Bridge, owner `L` approval panel, and native `tabGroups` |
+| **OS + Desktop + Cloud** | Browser-only, local stdio only | Native `proc` (pipe/PTY), SHA-256 atomic `fs`, `img`, Rust Windows WGC + UIA `desktop`, plus hot-plug **OpenAI & Cloudflare Tunnels** |
+| **Governance & telemetry** | No cross-client audit; orphan browser tabs | Embedded **SQLite WAL + FTS5 audit**, local `/ui` Activity Studio, `session(done)` auto-closes temp tabs, **zero external telemetry** |
+
+---
 
 ## Architecture
 
-The connection layer delivers MCP requests. The capability layer defines machine operations. One Runtime Host owns the resources shared by every enabled entry point and client of a running instance.
+One detached user-session daemon owns the OS runtime (`127.0.0.1:9317`), the native browser-level CDP connections (`Edge`/`Chrome` `DevToolsActivePort`), the loopback extension bridge (`127.0.0.1:9315`), and hot-pluggable remote wires (`127.0.0.1:9316`). Closing any IDE never drops the daemon or your browser session.
 
 ```mermaid
 flowchart TB
-    Operator[Operator] --> CLI[CLI + configuration]
-    CLI --> Supervisor[Entry-point supervisor]
-    Supervisor --> Host[One Runtime Host]
-    Local[Local MCP client] --> Stdio[MCP stdio]
-    Local --> Public[Public-facing HTTP origin · Bearer or OAuth]
-    Remote[Remote AI clients] --> OpenAI[OpenAI Tunnel adapter]
-    Remote --> Cloudflare[Cloudflare adapter + cloudflared]
-    OpenAI --> Private[Private HTTP origin · runtime credential]
-    Cloudflare --> Public
-    Stdio --> MCP[MCP adapter · 22 tools]
-    Private --> MCP
-    Public --> MCP
-    MCP --> Process[Process]
-    MCP --> Files[Filesystem]
-    MCP --> Image[Image]
-    MCP --> Computer[Computer]
-    MCP --> Browser[Browser]
-    Process --> Machine[Machine processes + files]
-    Files --> Machine
-    Image --> Machine
-    Computer --> Native[Rust Windows engine]
-    Native --> Desktop[Interactive desktop]
-    Browser --> Bridge[Authenticated loopback bridge]
-    Bridge --> Profiles[Chromium profile extensions]
-    Profiles --> CDP[CDP tabs + frames]
-    Host -. resource lifetime .-> MCP
-    Host -. owns .-> Process
-    Host -. owns .-> Files
-    Host -. owns .-> Computer
-    Host -. owns .-> Bridge
-    Supervisor -. owns provider lifetime .-> OpenAI
-    Supervisor -. owns provider lifetime .-> Cloudflare
+    subgraph Callers["1. Unified Clients (Same Protocol · Distinct Wires & Grants)"]
+        Local["Local Clients<br/>IDE / CLI / WSL<br/>stateless stdio proxy → :9317"]
+        Cloud["Cloud Clients<br/>ChatGPT / Gemini / Remote<br/>hot-plug OpenAI & Cloudflare → :9316"]
+        Scoped["Scoped Apps & Owner<br/>Named Bearer Tokens · Local /ui"]
+    end
+
+    subgraph Runtime["2. Single Detached Daemon (lrmcp)  ⇄  Slim Extension"]
+        direction LR
+        subgraph Daemon["lrmcp Go Single Binary (User-Session Resident)"]
+            MCP["4 Orthogonal Primitives<br/>run · wait · session · capability_propose<br/>+ Approved Web / App MCP Tools"]
+            VM["Stateful Concurrent JS VM (Goja AST)<br/>Cross-turn variables · Promise.allSettled<br/>Strict snake_case · help() · Web globals"]
+            CDP["Native Browser-Root CDP Engine<br/>Single shared WS · Zero-race open<br/>AX Diff · Network · CSS · Tracing.start"]
+            GOV["Governance & Audit<br/>SQLite WAL + FTS5 · /ui Studio<br/>Auto tab cleanup · Read-only grants"]
+            MCP --> VM
+            VM --> CDP
+            VM -. telemetry .-> GOV
+        end
+        Ext["Slim Extension (~790L TS · Zero debugger)<br/>1. Web Bridge (:9315 zero-secret page calls)<br/>2. Owner L Approval Panel<br/>3. Native Tab Groups"]
+        Daemon <-->|":9315 loopback WS+HTTP"| Ext
+    end
+
+    subgraph World["3. Symmetric Capability Worlds (Explore → Compile → Reuse)"]
+        OS["OS & Desktop World<br/>Explore: proc · fs · desktop (Rust UIA) · img<br/>Compiled: App MCP (capabilities/&lt;app&gt;/)"]
+        Browser["Real Chromium Profiles (Your Active Logins)<br/>Explore + DevTools: Direct CDP (9222/57419)<br/>Compiled: Web MCP (capabilities/&lt;site&gt;/)"]
+    end
+
+    Local --> MCP
+    Cloud --> MCP
+    Scoped --> MCP
+    VM -->|"Native Go + Rust UIA"| OS
+    CDP ==>|"Direct browser-root CDP WS (approve once)"| Browser
+    Browser -. "Web Bridge (page → local / cross-site)" .-> Ext
 ```
 
-Solid arrows show request flow; dotted arrows show lifetime ownership. Text and images travel as MCP content. OpenAI's private origin and the public-facing HTTP origin publish the same MCP Server while retaining their respective authentication boundaries. Cloudflare reaches the public origin over loopback; its external URL uses HTTPS.
+---
 
-| Layer | Responsibility |
+## The 4 Orthogonal Primitives
+
+| Primitive | Purpose |
 | --- | --- |
-| CLI and configuration | Select entry points explicitly and resolve configuration once. |
-| Entry-point supervisor | Own provider lifetimes, report exits, and keep surviving entry points available. |
-| Connection adapters | Deliver requests through stdio, HTTP, or a tunnel provider to the shared Server. |
-| MCP adapter | Publish tool schemas, validate inputs, and encode results. |
-| Capability services | Define resource identities, observations, actions, and concurrency. |
-| Platform backends | Execute OS operations, Windows native interaction, and Chromium CDP commands. |
+| **`run(title, code, done_title?, yield_ms?, max_output_bytes?)`** | Execute async JavaScript in this session's persistent VM with full concurrent access to `proc`, `fs`, `browser`, `desktop`, `img`, `caps`, `emitImage`, `print`, `sleep`, `help()`, and Web globals (`URL`, `URLSearchParams`, `atob`, `btoa`, `setTimeout`). Top-level `let`/`const`/`var`/`function`/`class` persist across turns; bare final expressions auto-return in `cell.value`. |
+| **`wait(cell_id, yield_ms?, terminate?)`** | Collect incremental output/images or cancel any long-running cell cleanly. |
+| **`session(action='start'\|'update'\|'done', ...)`** | Optional for single-shot read-only queries (call `run` directly). For multi-step or browser tasks, opens a named thread in `/ui` and automatically reclaims temporary browser tabs on `done` (unless marked via `tab.markHandoff()`). |
+| **`capability_propose(name, definition, script)`** | Distill a repeatable website workflow explored via `run` into a deterministic Web MCP tool proposal for owner review in the extension's `L` panel. |
 
-The Host creates one Process Manager, Filesystem Service, Browser Bridge, and Computer Controller. A provider failure affects that entry point; the Host and other live entry points continue. When all entry points finish, or the operator interrupts the runtime, shutdown stops admission, cancels pending work, cleans up managed processes and input, and closes listeners and helpers. Individual request failures retain the running Host and its other resources. Recovery restores connectivity without replaying machine actions.
+### One Turn, Multi-Domain Concurrency
 
-### Commands and transports
+```js
+// Executed inside a single `run` call — zero extra LLM round-trips:
+const [tab, cfg, ver] = await Promise.all([
+  browser.open("https://example.com", { active: false }),
+  fs.read("D:\\Dev\\local-runtime-mcp\\config.example.yaml", { start_line: 1, end_line: 25 }),
+  proc.run("lrmcp", ["version"]),
+]);
 
-```text
-lrmcp
-├── serve --transport stdio [--agent NAME] Pure stdio thin proxy (auto-starts detached daemon)
-├── start [--http] [--tunnel ...]        Ensure detached user-session daemon is running
-├── stop                                 Gracefully stop the running daemon
-├── status                               Inspect live daemon, browser profiles, and wires
-├── daemon [--http] [--tunnel ...]       Run unified daemon in foreground
-├── tunnel
-│   ├── up <openai|cloudflare|http> [--ttl 2h]
-│   ├── down <openai|cloudflare|http|all>
-│   └── status
-├── grant remote <openai|http> [--read-only] [--tool NAME]
-├── ui [--no-open]                       Open local Sovereign Activity & Audit Studio
-├── audit
-│   ├── list [--limit N]
-│   ├── events [--session ID] [--agent ID]
-│   ├── search <query>
-│   ├── tail [--agent ID]
-│   └── export [--session ID] [--output FILE]
-├── setup
-│   ├── browser
-│   ├── local
-│   ├── client
-│   ├── oauth
-│   └── remote-token
-├── version
-└── help
+const [snap, css, reqs] = await Promise.all([
+  tab.snapshot({ diff: true }),                                  // incremental AX diff
+  tab.css("a"),                                                  // auto DOM init + computed & matched rules
+  tab.network({ resource_types: ["document", "fetch", "xhr"] }), // main Document captured from byte 0
+]);
+
+// Bare final expression auto-returns directly in cell.value:
+({
+  title: tab.title,
+  version: ver.stdout.trim(),
+  configLines: cfg.end_line,
+  docStatus: reqs[0]?.status,
+  linkColor: css.computed.color,
+  axLines: snap.text.split("\n").length,
+})
 ```
 
-One detached user-session daemon owns the OS runtime (`127.0.0.1:9317`) and browser extension bridge (`127.0.0.1:9315`). When `local.token` is configured (`lrmcp setup local`), the first `lrmcp serve --transport stdio` client automatically spawns the detached daemon and attaches as a stateless thin proxy; closing any IDE never stops the daemon or disconnects other clients. Remote wires (`openai`, `cloudflare`, `http`) plug and unplug live without restarting the daemon.
+<details>
+<summary><strong>Full Built-in JS SDK Reference (also available live inside <code>run</code> via <code>help(topic?)</code>)</strong></summary>
 
-| Command | Behavior and credentials |
-| --- | --- |
-| `lrmcp serve --transport stdio` | Pure MCP stdio thin proxy; auto-spawns the detached daemon if not yet running and attaches to `127.0.0.1:9317/mcp/attach` (isolated in-process host if `local.token` is unset). |
-| `lrmcp start [--http] [--tunnel openai\|cloudflare] [--ttl 2h]` | Ensures the background user-session daemon is running and optionally attaches remote wires. |
-| `lrmcp stop` | Gracefully shuts down the running daemon via `127.0.0.1:9317/admin/shutdown`. |
-| `lrmcp status` | Prints live daemon PID, attached stdio clients, browser profiles, desktop lock, capability counts, and remote wire states. |
-| `lrmcp daemon [--http] [--tunnel ...]` | Runs the unified daemon in the foreground. |
-| `lrmcp tunnel up openai [--ttl 2h]` | Ensures daemon is running and hot-plugs OpenAI Secure MCP Tunnel on its private loopback hop (zero restart, optional auto-expiry lease). |
-| `lrmcp tunnel up cloudflare [--ttl 2h]` | Hot-plugs public loopback HTTP (`127.0.0.1:9316`) and `cloudflared` (zero restart). |
-| `lrmcp tunnel down openai\|cloudflare\|http\|all` | Hot-unplugs one or all remote wires live; local clients and browser sessions continue uninterrupted. |
-| `lrmcp grant remote openai\|http [--read-only] [--tool NAME]` | Constrains what a remote wire may list and invoke; live-updates connected clients via `tools/list_changed`. |
-| `lrmcp ui [--no-open]` | Ensures the daemon is running, mints a single-use 60s bootstrap link, and opens the embedded local Activity Studio (`http://127.0.0.1:9317/ui/`). |
-| `lrmcp audit list \| events \| search \| tail \| export` | Query, FTS5 full-text search, live-tail over SSE, or export the embedded SQLite WAL audit log as JSONL. |
-| `lrmcp setup browser` | Generate bridge credentials and extract/configure the extension. |
-| `lrmcp setup local` | Generate `local.token` for multi-client detached daemon sharing on `127.0.0.1:9317`. |
-| `lrmcp setup client --id NAME [--browser-id ID]` | Register a scoped local native client in `grants.clients` (`--show` displays credentials). |
-| `lrmcp setup oauth --client-name NAME --redirect-uri URI` | Register an OAuth client with its exact callback URI and generate credentials. |
-| `lrmcp setup remote-token --id NAME [--read-only] [--tool NAME]` | Mint an independent named Bearer token under `grants.remote.tokens` for multi-client cloud access on `9316` (coexists with OAuth). |
-| `lrmcp setup oauth --show` | Display existing OAuth credentials deliberately in the local terminal. |
-| `lrmcp version` | Print the executable version. |
-| `lrmcp help` | Show commands and flags. |
+All SDK options use strict `snake_case` with `DisallowUnknownFields` — mismatches fail fast with the exact signature and are recorded in `sub_ops` and `sub_op_errors`.
 
-OpenAI starts its private endpoint on a dynamically assigned loopback port and uses a fresh, in-memory private-hop credential. Cloudflare uses the configured public-facing loopback origin and its maintained companion executable. Domain services remain independent of either provider. A second machine runs its own Host and uses a distinct connection address; independent machines have independent resources and handles.
+- **`proc`** — Native OS processes & PTYs (bypassing shell escaping when passing `(program, args)`):
+  - `proc.run(program, args?, { cwd?, env?, stdin?, keep_stdin_open?, timeout_seconds?, max_output_bytes?, max_output_tokens?, yield_time_ms?, io_mode?: "pipe"|"pty", columns?, rows? })`
+  - `proc.run({ cmd, shell?: "pwsh"|"cmd"|"bash"|"sh", cwd?, env?, ... })`
+  - `proc.continue({ session_id, output_cursor?, stdin?, close_stdin?, terminate?, yield_time_ms? })` · `proc.kill(session_id)`
+- **`fs`** — Path-locked atomic filesystem with optimistic SHA-256 concurrency control:
+  - `fs.list(path, { max_depth?, include_hidden?, max_entries? }?)`
+  - `fs.stat(path, { with_sha256? }?)`
+  - `fs.read(path, { start_line?, end_line?, line_count?, max_bytes?, with_sha256? }?)` (1-based inclusive)
+  - `fs.write(path, content, { mode?: "create"|"replace", expected_sha256?, create_parents? }?)`
+  - `fs.patch(path, [{ before?, old, new, after? }], expected_sha256)`
+  - `fs.search(path, query, { regex?, case_sensitive?, include_hidden?, max_results? }?)`
+- **`browser` & `TabHandle`** — Native browser-level CDP (auto-discovers Edge/Chrome `DevToolsActivePort`):
+  - `browser.status()` · `browser.connect(browser_id?)` · `browser.tabs(browser_id? | { browser_id?, include_workers? }?)`
+  - `browser.open(url, { browser_id?, active?, session_name? }?)` (creates `about:blank` → attaches & enables domains → `Page.navigate` → awaits load)
+  - `browser.tab(id)` · `browser.cdp(method, params?, browser_id?)` · `browser.cleanup()`
+  - `browser.traceStart({ browser_id?, tab_id?, reload?, ignore_cache?, categories? }?)` · `browser.traceStop(file_path?, browser_id?)` (streams lossless raw trace via `IO.read` + reads exact kernel Web Performance API metrics: `ttfb_ms`, `fcp_ms`, `lcp_ms`, `dcl_ms`, `load_ms`, `cls`)
+  - `tab.goto(url)` · `reload()` · `back()` · `forward()` · `close()` · `markHandoff()`
+  - `tab.snapshot({ diff?: true, max_elements?, max_text? }?)` · `tab.screenshot({ full_page?, clip_x?, clip_y?, clip_width?, clip_height? }?)` · `tab.eval(js)` · `tab.cdp(method, params?)`
+  - Semantic locators with auto-wait: `tab.getByRole(role, nameOrOpts?)` · `getByText` · `getByLabel` · `getByPlaceholder` · `locator(css)` → `.click()` / `.doubleClick()` / `.hover()` / `.fill(t)` / `.type(t)` / `.press(k)` / `.select(o)` / `.check(b)` / `.uploadFiles(paths)` / `.waitFor({ timeout_ms? })` / `.nth(i)`
+  - DevTools: `tab.network({ resource_types?, url_contains?, include_preserved?, failed_only?, limit? }?)` · `tab.networkBody(request_id)` · `tab.console({ levels?, limit? }?)` · `tab.emulate({ width?, height?, mobile?, cpu_throttling_rate?, network_preset?, color_scheme?, reduced_motion?, forced_colors?, user_agent?, geolocation?, extra_headers? })` · `tab.css(selectorOrLoc)` · `tab.heapSnapshot(file_path?)` · `tab.logpoint(url, line, expr, col?)` · `tab.screencastStart(opts?)` · `tab.screencastStop()`
+- **`desktop`** — Embedded Rust Windows Graphics Capture (even for covered windows) + UI Automation (zero focus stealing for observation/semantic actions; physical input borrows a revocable token with a clickable bottom-of-screen Stop pill):
+  - `desktop.targets({ pid?, title?, process? }?)` · `desktop.state(opts?)` · `desktop.wait(opts)` · `desktop.action(act)` · `desktop.control("status"|"acquire"|"release", opts?)`
+- **`img` & `emitImage`** — `img.read(path, { max_bytes?, max_pixels?, crop_x?, crop_y?, crop_width?, crop_height?, max_width?, max_height? }?)` · `emitImage(imgOrShotOrPath, label?)` returns native MCP `ImageContent`.
+- **`caps` & Web Globals** — `caps.list()` · `caps.call(name, args?, browser_id?, tab_id?)` · `print(...)` · `sleep(ms)` · `setTimeout` / `clearTimeout` · `URL` / `URLSearchParams` · `atob` / `btoa` · `help(topic?)`.
 
-### Configuration
+</details>
 
-```mermaid
-flowchart LR
-    Defaults[Defaults] --> YAML[Adjacent YAML]
-    YAML --> Environment[Environment overrides]
-    Environment --> Flags[Command-line overrides]
-    Flags --> Config[Resolved configuration]
-    Config --> Connection[Connection adapter]
-    Config --> Host[Runtime Host]
-```
+---
 
-Precedence is **command line > environment > YAML > defaults**. The file path is always `<lrmcp directory>/local-runtime-mcp.yaml`. Configuration validation covers the components selected for this invocation. Browser instance identity belongs to each browser profile's extension storage; process, tab, and desktop observation handles belong to the current runtime lifecycle.
+## Quick Start
 
-## Capability domains
+### 1. Install & Initialize
 
-| Domain | Tools |
-| --- | ---: |
-| Process | 2 |
-| Filesystem | 6 |
-| Image | 1 |
-| Computer | 5 |
-| Browser | 8 |
-| Activity (`agent_report`) | 1 |
-| **Total** | **23** |
-
-### Process · 2 tools
-
-```mermaid
-flowchart TB
-    Run[process_run] --> Resolve[Resolve program using child PATH]
-    Resolve --> Launch[Direct launch · pipe or PTY]
-    Launch --> Final[Completed result]
-    Launch --> Sessions[Independent process sessions]
-    Sessions --> Continue[process_continue · session_id]
-    Continue --> Input[Serialized stdin + PTY resize]
-    Continue --> Output[Bounded output · cursor read + wait]
-    Output --> Cursor[Received output_cursor → next read]
-    Sessions --> Retain[Completed async result · up to 10 minutes]
-    Continue --> Stop[Independent terminate path]
-```
-
-- `process_run` accepts `program`, argument array, working directory, environment overrides, initial stdin, execution timeout, output limits, and pipe or PTY I/O.
-- `process_continue` reads retained output from explicit byte offsets, writes stdin, closes pipe input, resizes a PTY, waits, or terminates a managed session.
-
-Bare program names use the merged child `PATH` in both I/O modes; Windows also uses `PATHEXT`. Explicit relative executable paths resolve against the requested working directory. To execute shell syntax, launch the desired shell explicitly with its arguments.
-
-Different sessions run concurrently. Within one session, input writes are serialized and output reads preserve the bounded stdout and stderr buffers. Waiting for output leaves termination available, including when stdin is blocked. Output and queued input are bounded; a single stdin payload is limited to 16 MiB.
-
-Each result includes `output_cursor: {stdout, stderr}` with the next byte offsets. Pass the last successfully received cursor to `process_continue` to collect only new output. Omitting the cursor starts at zero and rereads the retained output. The returned `stdout_offset` and `stderr_offset` identify the actual start of each stream; a truncation flag indicates that the requested prefix has aged out of its buffer. Completed asynchronous sessions remain readable for up to ten minutes. Under capacity pressure, the oldest completed session makes room for a new process; active sessions keep their place.
-
-If a pure-read response is lost, repeat `process_continue` with the same `session_id` and cursor. The response can include output produced since the previous attempt. Advance the cursor and append output only after receiving a successful result. Calls that start a process or change stdin, PTY size, or process lifetime require checking the resource before retrying after an uncertain response. A lost initial launch response may leave the client without a session ID.
-
-`duration_ms` is elapsed process time while the program runs and its fixed lifetime after exit. Collecting a completed session later leaves that duration unchanged.
-
-Cancellation delivered to `process_run` before it returns a live session terminates and collects that process. Cancellation delivered to `process_continue` stops that call's wait; use `terminate=true` to end the session. HTTP disconnect cancellation follows the negotiated MCP protocol: SDK request-context propagation applies to protocol `2026-07-28` and newer; older stateless requests may finish their bounded wait after the client disconnects. Execution timeout and Host shutdown terminate managed processes independently of the MCP request deadline.
-
-### Filesystem · 6 tools
-
-```mermaid
-flowchart TB
-    Read[List · stat · read · search] --> Files[Machine filesystem]
-    Write[Create · replace · patch] --> Path[Resolve commit path identity]
-    Path --> Lock[Per-path commit coordination]
-    Lock --> Version[Read and verify expected SHA-256]
-    Version --> Build[Build complete new content]
-    Build --> Commit[Atomic publish]
-    Commit --> Files
-```
-
-| Tool | Operation |
-| --- | --- |
-| `filesystem_list` | Bounded directory traversal. |
-| `filesystem_stat` | File metadata and optional SHA-256. |
-| `filesystem_read_text` | UTF-8 line ranges with byte and line limits. |
-| `filesystem_search_text` | Literal text or Go-regexp search. |
-| `filesystem_write_text` | Explicit `mode=create` or `mode=replace`. |
-| `filesystem_patch_text` | Version-checked, uniquely anchored contextual hunks. |
-
-`create` publishes a complete file only if the destination is absent. `replace` requires an existing file and `expected_sha256`. Patches also require the expected hash and resolve all hunks against one immutable source version.
-
-Text reads return complete lines. When the first selected line exceeds the byte budget, the call returns a bounded error; after earlier complete lines it reports truncation and the next line. Skipped lines are scanned with bounded memory, and requested SHA-256 values cover the entire file through streaming reads.
-
-The Filesystem Service holds one path's commit lock from version validation through publication. Different paths and read operations remain concurrent. Final-component symbolic links are rejected for mutation; existing parent aliases are normalized for coordination.
-
-These locks coordinate calls made through this Host. External editors and invoked programs retain their own access to the filesystem. Concurrent coding tasks can use separate Git worktrees to separate indexes and build outputs.
-
-### Image · 1 tool
-
-```mermaid
-flowchart LR
-    Read[image_read] --> Open[Open source once]
-    Open --> Bytes[Bound actual bytes read]
-    Bytes --> Header[Validate format + pixels + dimensions]
-    Header --> Original[Original encoded image]
-    Header --> Transform[Memory-bounded crop + resize]
-    Transform --> Encode[Byte-bounded PNG encoding]
-    Original --> Result[MCP image + metadata]
-    Encode --> Result
-```
-
-`image_read` supports PNG, JPEG, GIF, and WebP, returning native MCP image content with actual source bytes and dimensions. Optional crop and proportional resize produce PNG output. Encoded reads, pixel counts, dimensions, decoded transformation memory, and output encoding are bounded. Capacity waits respect request cancellation.
-
-Image reading is stateless. Browser and Computer captures carry their own observation identities and coordinate semantics.
-
-### Computer · 5 tools
-
-```mermaid
-flowchart TB
-    Targets[computer_targets] --> Worker[Rust native engine]
-    State[computer_state] --> Worker
-    Wait[computer_wait · polls computer_state] --> Worker
-    Action[computer_action] --> Kind{kind}
-    Kind -->|semantic · place| Worker
-    Kind -->|physical input| Control[computer_control token + Go Desktop Coordinator]
-    Control --> Worker
-    Worker --> Displays[Displays · per-monitor scale]
-    Worker --> Capture[Windows Graphics Capture · covered windows too]
-    Worker --> UIA[UI Automation · one cached tree request · patterns]
-    Worker --> Input[Physical input + release cleanup]
-    Worker --> Pill[Bottom-of-display pill · Stop]
-    Pill -. revoke control .-> Control
-```
-
-The person at the computer keeps working while an agent does. Observation, waiting, semantic actions and window placement never touch the pointer, the keyboard or the foreground window; only physical input borrows them.
-
-```text
-computer_targets(process="StuDev") → displays + windows (target_id)
-computer_state(target_id=..., image=false, automation_id="map") → ref_id
-computer_action(kind="invoke", element_ref=...)            # no control, no focus change
-computer_wait(target_id=..., name="搜地点", until="present") → fresh ref_ids
-computer_state(target_id=...) → pixels of the window even while it is covered
-computer_action(kind="place", target_id=..., bounds={...})  # resize without activating
-```
-
-- `computer_targets` returns every display (ID, bounds, work area, scale, primary) and the visible top-level windows: opaque target ID, process, title, class, visible frame without the invisible resize borders, normal/minimized/maximized state and display. Cloaked windows are left out. Filter by `pid`, `title` or `process`.
-- `computer_state` observes one window, one display or every display. Windows are captured through Windows Graphics Capture, so a window covered by others, including GPU swap-chain content, is captured as it is drawn. For a window it also returns the UI Automation tree, fetched in one cached cross-process request: role, name (text included), AutomationId, class, value or toggle/selection/expansion state, bounds, depth and parent, disabled/offscreen/focused, and the supported patterns. `elements` chooses all, interactive or none; `name`, `automation_id` and `role` filter; `max_elements` and `offset` page. `region` crops, `image=false` skips pixels, `cursor=true` draws the pointer.
-- `computer_wait` polls a window's tree without pixels until an element matching `name`, `automation_id` or `role` is present or absent, then returns that observation and whether the condition was met.
-- `computer_action` semantic kinds operate an element by `element_ref` through its pattern: `invoke`, `toggle`, `select`, `expand`, `collapse`, `set_value`, `scroll_into_view`, `scroll_by` (pages). `place` moves or resizes a window to a visible frame and restores or minimizes it without activating it, across displays of different scale. Physical kinds, `activate`, `move`, `click`, `double_click`, `drag`, `type_text`, `press_key` and `scroll`, need `control_id` and a state observed with it.
-- `computer_control` allocates the single pointer and keyboard to one workflow. It has a five-minute idle expiry refreshed by controlled operations; release, expiry, local Stop and shutdown cancel pending work, clear injected input and invalidate actionable observations.
-
-Refs are verified against the element's runtime identity at use, so a ref whose control was replaced fails instead of acting on something else. Physical actions invalidate prior states; semantic actions keep them. Coordinates are relative to an observation's origin, which is in physical virtual-desktop pixels; displays to the left of the primary have negative origins.
-
-While physical control is held, a small translucent pill at the bottom of the display being worked on reads “AI 正在操作 · 点此停止”; clicking it revokes control. It never outlines windows, never takes focus, and is excluded from capture. Nothing is drawn for semantic actions.
-
-### Browser · 8 tools
-
-```mermaid
-flowchart TB
-    Tools[Browser tools] --> Registry[Instance registry + tab routing]
-    Registry --> Bridge[Authenticated loopback bridge]
-    Bridge <-->|WebSocket · commands + keepalive| Edge[Edge profile extension]
-    Bridge <-->|WebSocket · commands + keepalive| Chrome[Chrome profile extension]
-    Edge -->|HTTP · results + authorization| Bridge
-    Chrome -->|HTTP · results + authorization| Bridge
-    Chrome --> Intake[Command intake]
-    Intake --> Queue[Bounded per-tab FIFO scheduler]
-    Queue --> TabA[Tab A · CDP frames]
-    Queue --> TabB[Tab B · CDP frames]
-    TabA --> Observation[Document epoch + snapshots + screenshot space]
-    TabB --> Observation
-```
-
-Install the same MV3 extension in each intended Chromium profile. Give each instance a readable label in extension options, such as `Edge · Work` or `Chrome · Research`. The extension keeps a stable UUID in that profile and connects to the shared bridge using its token. `chrome.debugger` sends CDP operations directly to tabs and frames.
-
-Each profile receives commands over one authenticated loopback WebSocket and exchanges keepalive messages every 20 seconds. A browser alarm restores interrupted connections. Results and desktop-operation authorization use authenticated HTTP on the same bridge. This connection remains active while browser tasks are idle, following Chromium's [extension service-worker WebSocket lifecycle](https://developer.chrome.com/docs/extensions/how-to/web-platform/websockets).
-
-| Tool | Target and operation |
-| --- | --- |
-| `browser_status` | List named browser instances and their connection health. |
-| `browser_tabs` | Select `browser_id` and discover tabs. |
-| `browser_open` | Select `browser_id`; open a tab, with `active=false` by default. |
-| `browser_close` | Close an opaque `tab_id`. |
-| `browser_navigate` | URL, back, forward, or reload for `tab_id`. |
-| `browser_snapshot` | Bounded accessibility text and versioned element refs across frames. |
-| `browser_screenshot` | Viewport, full-page, or clipped PNG for `tab_id`. |
-| `browser_action` | Ref- or screenshot-targeted input, forms, files, dialogs, and JavaScript evaluation. |
-
-Copy `browser_id` from status and the opaque tab `id` from discovery or creation into subsequent `tab_id` arguments. The tab handle includes its instance and lifecycle identity internally; callers treat it as an opaque string. A missing or offline target returns an error, preserving the selected profile. After extension worker restart or reconnect generation change, discover tabs again and acquire fresh observations.
-
-Actions include `click`, `double_click`, `hover`, `drag`, `type_text`, `set_value`, `press_key`, `scroll`, `select`, `check`, `upload_files`, `handle_dialog`, and `evaluate`. Viewport coordinate actions require the matching screenshot ID. Element references belong to the observed document/frame generation; navigation, frame changes, reconnects, and side effects invalidate observations.
-
-Different browser instances and tabs execute concurrently. Operations on one tab are serialized. Queue capacity and execution slots are bounded, and canceled queued work is discarded. Profiles keep their own browser data; tabs in one profile share that profile's sessions, cookies, and accounts.
-
-Browser operations that change the visible desktop coordinate with Computer control. Background tab work remains independent; when a visible operation conflicts with an owned desktop, supply the matching `control_id` or wait until control is released.
-
-## Concurrent workflows
-
-| Resource | Coordination |
-| --- | --- |
-| Process | Independent sessions; ordered input and replayable cursor reads within retained output. |
-| Filesystem | Parallel reads and different paths; serialized version-checked commits on one path. |
-| Image | Independent reads within bounded memory and execution capacity. |
-| Browser | Explicit instance/tab routing; parallel tabs with FIFO execution per tab. |
-| Computer | One desktop input owner; read-only observation remains available. |
-
-For two AI conversations, each can select a different browser instance and open its own background tab. Both can run independent process sessions while one workflow owns desktop input. If both choose the same tab, file, repository, or cloud account, they intentionally share that resource.
-
-Request cancellation is distinct from process execution timeout and Host shutdown. A failed or expired call retains other resources. When a side effect may already have occurred, observe the target before retrying a non-idempotent action.
-
-Transport recovery tests cover failed requests before response headers, incomplete response bodies, protocol-specific cancellation, and transient tunnel poll and response-delivery errors. A surviving peer client and a newly connected client must remain usable after an individual failure. A cloud connection error alone identifies neither the failing hop nor whether the tool executed; diagnosis uses the individual tool name, machine time, and provider logs. Keep credentials and tool payloads private when sharing those logs.
-
-The [two-conversation acceptance prompts](docs/concurrency-acceptance.zh-CN.md) exercise idle browser connectivity, independent process output, explicit profile routing, and desktop ownership through configured clients. The [connection guide](docs/connections.md) covers Gemini OAuth setup and cross-provider acceptance against one Host.
-
-## Installation
-
-Download a platform archive from [Releases](https://github.com/hicancan/local-runtime-mcp/releases/latest), verify its published SHA-256, and extract it into its own directory.
-
-| Platform | Process, Filesystem, Image | Browser | Computer |
-| --- | --- | --- | --- |
-| Windows amd64 | Supported | Chromium extension | Native Windows engine |
-| Linux amd64 / arm64 | Supported | Chromium extension in a desktop browser | Reports platform unavailability |
-
-Browser control requires Chromium 120 or newer and a running profile with the extension loaded. Windows Computer requires Windows 10 version 2004 or newer, including Windows 11, an interactive desktop, and permissions appropriate for the target applications.
-
-The Windows archive contains:
-
-```text
-local-runtime-mcp/
-├── lrmcp.exe
-├── cloudflared.exe
-├── config.example.yaml
-├── README.md
-├── README.zh-CN.md
-├── SECURITY.md
-├── PRIVACY.md
-├── LICENSE
-├── THIRD_PARTY_NOTICES.md
-├── docs/
-├── licenses/
-└── cloudflared-LICENSE
-```
-
-Copy `config.example.yaml` to `local-runtime-mcp.yaml` and fill the sections used by your selected transport and providers:
-
-```yaml
-browser:
-  listen: 127.0.0.1:9315
-  token: "replace-with-a-random-token-of-at-least-32-characters"
-
-openai:
-  tunnel_id: "replace-with-your-openai-tunnel-id"
-  api_key: "replace-with-your-openai-tunnel-api-key"
-
-http:
-  listen: 127.0.0.1:9316
-  public_host: mcp.example.com
-  auth: bearer
-  bearer_token: "replace-with-a-random-token-of-at-least-32-characters"
-
-cloudflare:
-  tunnel_token: "replace-with-your-cloudflare-managed-tunnel-token"
-```
-
-Protect the runtime directory as a credential-bearing application directory. Browser profile installation and identity stay with that machine's browser profile when the runtime directory moves.
-
-### Browser setup
+Download the release archive from [Releases](https://github.com/hicancan/local-runtime-mcp/releases/latest) (or [build from source](#build-and-test)) into its own portable folder:
 
 ```powershell
+# 1. Initialize local plane (127.0.0.1:9317) so all clients share one detached daemon
+./lrmcp.exe setup local
+
+# 2. Initialize slim browser extension (127.0.0.1:9315) for Web Bridge, L panel & Tab Groups
 ./lrmcp.exe setup browser
 ```
 
-The command saves bridge credentials to the adjacent YAML and extracts `browser-extension` beside the executable. In each intended profile, open `edge://extensions` or `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select that directory. Open extension options to set a distinct label and confirm the bridge address and token. Start `lrmcp` and use `browser_status` to discover connected instances.
+### 2. Enable Native Browser Debugging (Once per Browser)
 
-### Local stdio
+- Open `edge://inspect` (Edge) or `chrome://inspect/#remote-debugging` (Chrome) and toggle **Remote debugging** on.
+- Load the extracted `browser-extension` directory unpacked in `edge://extensions` / `chrome://extensions` (no `"debugger"` permission required).
+- On the first CDP connection, click **Allow** once in your browser's native confirmation dialog. Every local and cloud client attached to `lrmcp` reuses that single authenticated WebSocket until the browser or daemon restarts.
+
+### 3. Connect Any Local MCP Client
 
 ```json
 {
   "mcpServers": {
-    "local-runtime-mcp": {
-      "command": "C:\\Tools\\local-runtime-mcp\\lrmcp.exe",
-      "args": ["serve", "--transport", "stdio"]
+    "lrmcp": {
+      "command": "D:\\Dev\\local-runtime-mcp\\lrmcp.exe",
+      "args": ["serve", "--transport", "stdio", "--agent", "my-client"]
     }
   }
 }
 ```
 
-### OpenAI Tunnel
+The first `stdio` client automatically spawns the detached daemon if not yet running and attaches as a thin proxy.
 
-Fill the `openai` section, ensure `local.token` is initialized (`./lrmcp.exe setup local`), and hot-plug the wire live (or toggle it directly in the browser extension `L` panel):
+---
+
+## Remote Tunnels & OAuth
+
+Plug and unplug remote wires onto the live daemon with **zero restarts** and **zero disruption** to local clients or active browser sessions:
 
 ```powershell
+# Hot-plug OpenAI Secure MCP Tunnel (optional auto-expiry lease)
 ./lrmcp.exe tunnel up openai --ttl 2h
-./lrmcp.exe tunnel down openai
-```
 
-See the [OpenAI Secure MCP Tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) for provider setup and supported clients. The private HTTP origin is created automatically; its port and private-hop credential remain runtime-only.
-
-### Streamable HTTP
-
-For direct loopback HTTP access, choose `http.auth: bearer`, fill `http.bearer_token`, and hot-plug the HTTP wire:
-
-```powershell
-./lrmcp.exe tunnel up http
-```
-
-The default MCP endpoint is `http://127.0.0.1:9316/mcp`. The loopback listener accepts the configured Bearer token and can serve as a reverse-proxy origin. An OAuth-enabled origin additionally serves discovery, authorization, and token endpoints under its public HTTPS address.
-
-### Cloudflare Tunnel
-
-Create a remotely managed Cloudflare Tunnel, route its hostname to `http://127.0.0.1:9316`, fill `http.public_host` and `cloudflare.tunnel_token`, configure HTTP authentication, then hot-plug Cloudflare:
-
-```powershell
+# Hot-plug Cloudflare Tunnel + public loopback HTTP (127.0.0.1:9316)
 ./lrmcp.exe tunnel up cloudflare
+
+# Restrict any remote wire to strict read-only (enforced inside JS SDK) live
+./lrmcp.exe grant remote openai --read-only
+
+# Unplug one or all remote wires (external attack surface drops to 0)
+./lrmcp.exe tunnel down all
 ```
 
-The release includes the pinned `cloudflared` companion. Configure the remote MCP client to use `https://<public_host>/mcp`. With Bearer authentication, enter the MCP Bearer token in the client's token setting. With OAuth, register that client's redirect URI and use its client credentials. The Cloudflare tunnel token authenticates the tunnel process; HTTP credentials authorize MCP clients.
+<details>
+<summary><strong>OAuth, Named Remote Tokens & Configuration Reference</strong></summary>
 
-### Both tunnels
-
-Fill both provider sections and attach both wires onto the same running daemon:
-
-```powershell
-./lrmcp.exe tunnel up openai
-./lrmcp.exe tunnel up cloudflare
-```
-
-Both connections share one browser bridge, process-session registry, filesystem coordination service, and desktop controller. Detaching or restarting either wire never interrupts local `stdio` clients or the surviving peer wire. Use `lrmcp grant remote openai --read-only` or `lrmcp grant remote http --read-only` (or the `L` extension panel) to restrict any remote wire live.
-
-### OAuth for Gemini and other clients
-
-Set `http.public_host` to the externally reachable hostname. In the MCP client's connection dialog, copy its exact redirect URI and register it locally:
+Copy `config.example.yaml` to `local-runtime-mcp.yaml` beside `lrmcp` (precedence: **CLI flags > `LOCAL_RUNTIME_MCP_*` env > YAML > defaults**):
 
 ```powershell
-./lrmcp.exe setup oauth --client-name gemini --redirect-uri "https://<client-callback-host>/<callback-path>"
+# Register an OAuth client (e.g. Gemini / ChatGPT connector) with exact redirect URI
+./lrmcp.exe setup oauth --client-name gemini --redirect-uri "https://<callback-host>/<path>"
 ./lrmcp.exe setup oauth --client-name gemini --show
+
+# Mint an independent named Bearer token (coexists with OAuth on :9316)
+./lrmcp.exe setup remote-token --id worker-1 --read-only
+
+# Register a scoped local native app token
+./lrmcp.exe setup client --id my-app
 ```
 
-The setup command saves the OAuth client and an owner approval key in the adjacent YAML, and selects `http.auth: oauth`. The show command displays that client's credentials locally. Enter the generated **client ID** and **client secret** in Gemini's additional settings, and use `https://<public_host>/mcp` as its server URL. During authorization, approve access on Local Runtime's consent page using the owner approval key. Keep that approval key with the machine's operator.
-
-OAuth authorization grants access to the runtime's complete machine-control tool surface. Register each client with exact redirect URIs; repeat `--redirect-uri` when one client needs several callbacks. Access and refresh tokens are held in memory. Restarting `lrmcp` requires clients to authorize again. OpenAI's private-hop authentication remains independent of this public HTTP mode.
-
-See [the connection guide](docs/connections.md) for the complete setup sequence, credential roles, and acceptance checks. Real client behavior is verified after connecting that client's account and callback.
-
-### Environment overrides
-
-| Environment variable | YAML field |
+| Environment Variable | YAML Field |
 | --- | --- |
-| `LOCAL_RUNTIME_MCP_BROWSER_LISTEN` | `browser.listen` |
-| `LOCAL_RUNTIME_MCP_BROWSER_TOKEN` | `browser.token` |
-| `LOCAL_RUNTIME_MCP_LOCAL_LISTEN` | `local.listen` |
-| `LOCAL_RUNTIME_MCP_LOCAL_TOKEN` | `local.token` |
-| `LOCAL_RUNTIME_MCP_CLIENT_TOKEN` / `LOCAL_RUNTIME_MCP_CLIENT_TOKEN_<ID>` | `grants.clients[].token` |
-| `LOCAL_RUNTIME_MCP_REMOTE_TOKEN_<ID>` | `grants.remote.tokens[].token` |
-| `LOCAL_RUNTIME_MCP_OPENAI_TUNNEL_ID` | `openai.tunnel_id` |
-| `LOCAL_RUNTIME_MCP_OPENAI_API_KEY` | `openai.api_key` |
-| `LOCAL_RUNTIME_MCP_HTTP_LISTEN` | `http.listen` |
-| `LOCAL_RUNTIME_MCP_HTTP_PUBLIC_HOST` | `http.public_host` |
-| `LOCAL_RUNTIME_MCP_HTTP_AUTH` | `http.auth` |
-| `LOCAL_RUNTIME_MCP_HTTP_BEARER_TOKEN` | `http.bearer_token` |
+| `LOCAL_RUNTIME_MCP_LOCAL_LISTEN` / `_LOCAL_TOKEN` | `local.listen` / `local.token` |
+| `LOCAL_RUNTIME_MCP_BROWSER_LISTEN` / `_BROWSER_TOKEN` | `browser.listen` / `browser.token` |
+| `LOCAL_RUNTIME_MCP_OPENAI_TUNNEL_ID` / `_API_KEY` | `openai.tunnel_id` / `openai.api_key` |
+| `LOCAL_RUNTIME_MCP_HTTP_LISTEN` / `_PUBLIC_HOST` / `_AUTH` / `_BEARER_TOKEN` | `http.*` |
 | `LOCAL_RUNTIME_MCP_OAUTH_OWNER_TOKEN` | `http.oauth.owner_token` |
-| `LOCAL_RUNTIME_MCP_CLOUDFLARE_TUNNEL_TOKEN` | `cloudflare.tunnel_token` |
-| `LOCAL_RUNTIME_MCP_CLOUDFLARED` | `cloudflare.binary` |
+| `LOCAL_RUNTIME_MCP_CLOUDFLARE_TUNNEL_TOKEN` / `_CLOUDFLARED` | `cloudflare.tunnel_token` / `cloudflare.binary` |
+| `LOCAL_RUNTIME_MCP_CLIENT_TOKEN_<ID>` / `_REMOTE_TOKEN_<ID>` | `grants.clients` / `grants.remote.tokens` |
 
-Run `lrmcp help` for corresponding command-line flags.
+See [docs/connections.md](docs/connections.md) for step-by-step OpenAI, Cloudflare, and OAuth walkthroughs.
 
-## Build and test
+</details>
 
-Requirements: Go 1.27, Node.js 24, and Rust 1.96.0 with the Windows MSVC toolchain for the Computer engine. CI and release builds pin Rust 1.96.0, and the Windows native worker statically links the Microsoft CRT. Run the native build on Windows with the Visual Studio build environment loaded.
+---
+
+## Web MCP & App MCP Compilation
+
+`lrmcp` turns expensive exploratory browsing into versioned, deterministic site and app protocols:
+
+1. **Explore** any website using `run` (`tab.snapshot`, `tab.network`, `tab.eval`).
+2. **Propose** a reusable typed function via `capability_propose(name, definition, script)`.
+3. **Approve** the exact JavaScript in the browser extension's **`L` panel** — it persists under `capabilities/<site>/` (Web MCP) or `capabilities/<app>/` (App MCP), hot-reloads immediately, executes over native CDP with strict origin & JSON-Schema verification, and can be consumed both by MCP clients (`caps.call(...)` or direct tool call) and by owner-authorized web pages via the zero-secret **Web Bridge** (`:9315`).
+
+---
+
+## Activity Studio & Audit
+
+Every call is recorded into an embedded pure-Go **SQLite WAL + FTS5** database (`lrmcp-audit.db`) with dual-state `title` → `done_title` summaries, per-operation `sub_ops` timings/errors, and automatic 15-minute idle session decay.
 
 ```powershell
+# Open local-only Activity Studio (http://127.0.0.1:9317/ui/)
+./lrmcp.exe ui
+
+# Three-layer CLI drill-down
+./lrmcp.exe audit list --limit 10
+./lrmcp.exe audit events --session <ID> --compact
+./lrmcp.exe audit show <EVENT_ID>
+./lrmcp.exe audit search "example.com" --compact
+./lrmcp.exe audit tail
+```
+
+---
+
+## Installation & Build
+
+| Platform | Process, Filesystem, Image | Browser CDP + DevTools | Desktop UIA |
+| --- | --- | --- | --- |
+| **Windows amd64** | Full | Chromium 120+ (`DevToolsActivePort`) + Slim Extension | Embedded Rust WGC + UIA |
+| **Linux amd64 / arm64** | Full | Chromium 120+ (`DevToolsActivePort`) + Slim Extension | Reports platform unavailability |
+
+<details>
+<summary><strong>Build & Test From Source (Go 1.27 · Node.js 24 · Rust 1.96)</strong></summary>
+
+```powershell
+# 1. Build & test slim browser extension (also syncs internal/version/version.go)
 Push-Location browser-extension
-npm ci
-npm run build
-npm test
+npm ci && npm run build && npm test
 Pop-Location
+
+# 2. (Windows, optional if native worker unchanged) Build embedded Rust UIA worker
 ./scripts/build-native.ps1
-cargo fmt --manifest-path native/computer-windows/Cargo.toml --check
-cargo clippy --manifest-path native/computer-windows/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path native/computer-windows/Cargo.toml --locked
-go test ./...
+
+# 3. Test & build single portable binary
+go test -count=1 ./...
 go vet ./...
-go build ./cmd/lrmcp
+go build -trimpath -ldflags="-s -w" -o lrmcp.exe ./cmd/lrmcp
 ```
 
-Go tests cover shared resource lifetimes, provider supervision, HTTP authentication and OAuth flows, response correlation, cancellation, competing file commits, process I/O, and browser identity routing. Extension scheduler tests cover ordering, fairness, cancellation, and queue limits. The opt-in Windows Chromium suite loads the real extension in disposable browser profiles and includes an idle-only connection test:
+</details>
 
-```powershell
-$env:LOCAL_RUNTIME_MCP_BROWSER_E2E = '1'
-go test ./internal/browser -run 'TestEdgeExtension(IdleLifecycle|EndToEnd)' -count=3 -v
-go test ./internal/browser -run TestEdgeOAuthAuthorizationRedirect -count=3 -v
-```
+---
 
-The OAuth browser regression exercises consent, cancellation, incorrect-key retry, cross-origin callback chains, client authentication, and refresh rotation with fixture credentials. CI exercises Windows and Linux. Local protocol and browser tests validate those execution paths; live client acceptance is performed separately against the configured account and tunnel.
+## Security, Privacy, and License
 
-## Security, privacy, and license
-
-Authenticated clients operate with the authority of the account running `lrmcp`. Resource handles coordinate targets and workflows within that shared host. Separate tenant permissions require dedicated OS accounts or machines; browser profiles separate browser data.
-
-See [SECURITY.md](SECURITY.md) for deployment guidance and private vulnerability reporting, and [PRIVACY.md](PRIVACY.md) for local storage and provider data flows.
-
-Local Runtime MCP is licensed under [GNU AGPL v3.0 only](LICENSE). The separately licensed `cloudflared` companion and dependency attributions are documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+- Authenticated clients operate under the OS account running `lrmcp`; `127.0.0.1:9317` (local plane) and `127.0.0.1:9315` (extension bridge) strictly reject non-loopback hosts, foreign origins, and proxy headers.
+- Remote wires obey per-wire `grants.remote` boundaries (including SDK-enforced read-only mode), and OAuth access/refresh tokens live in memory only.
+- **Zero telemetry or phone-home** — everything stays on your machine unless you explicitly plug in a tunnel.
+- See [SECURITY.md](SECURITY.md), [PRIVACY.md](PRIVACY.md), and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+- Licensed under [GNU AGPL v3.0 only](LICENSE).
