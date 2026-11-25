@@ -435,6 +435,11 @@ func TestASTPersistenceClassRedeclareAndWebGlobals(t *testing.T) {
 			code: `function add(a, b) { return a + b }; (add(base, factor)) * (2);`,
 			want: 20,
 		},
+		{
+			name: "zero-arg-new-expression-and-utf8-comments",
+			code: "// 中文注释\nconst d0 = new Date();\nconst d1 = new Date;\nconst d2 = (new Date());\nconst 偏移 = d0 instanceof Date && d1 instanceof Date && d2 instanceof Date ? 42 : 0;\n(偏移)",
+			want: 42,
+		},
 	}
 	for _, tc := range cases {
 		res, err := eng.Run(ctx, RunOptions{

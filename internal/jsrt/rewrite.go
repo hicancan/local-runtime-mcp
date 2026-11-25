@@ -6,6 +6,7 @@ import (
 
 	"github.com/dop251/goja"
 	"github.com/dop251/goja/ast"
+	"github.com/dop251/goja/file"
 	"github.com/dop251/goja/parser"
 )
 
@@ -46,9 +47,9 @@ func compileReplCode(code string) (*goja.Program, error) {
 			var end int
 			switch stmt.(type) {
 			case *ast.FunctionDeclaration, *ast.ClassDeclaration:
-				end = int(stmt.Idx1()) - base
+				end = int(trueIdx1(stmt)) - base
 			default:
-				_, end = statementEndAfter(wrapped, int(stmt.Idx1())-base, blockEnd)
+				_, end = statementEndAfter(wrapped, int(trueIdx1(stmt))-base, blockEnd)
 			}
 			if end >= 0 && end <= len(wrapped) {
 				var sb strings.Builder
@@ -73,13 +74,13 @@ func compileReplCode(code string) (*goja.Program, error) {
 					prev := stmts[i-1]
 					switch prev.(type) {
 					case *ast.FunctionDeclaration, *ast.ClassDeclaration:
-						prevEnd = int(prev.Idx1()) - base
+						prevEnd = int(trueIdx1(prev)) - base
 					default:
-						_, prevEnd = statementEndAfter(wrapped, int(prev.Idx1())-base, blockEnd)
+						_, prevEnd = statementEndAfter(wrapped, int(trueIdx1(prev))-base, blockEnd)
 					}
 				}
 				innerStart := int(exprStmt.Expression.Idx0()) - base
-				innerEnd := int(exprStmt.Expression.Idx1()) - base
+				innerEnd := int(trueIdx1(exprStmt.Expression)) - base
 				if innerStart < prevEnd {
 					prevEnd = innerStart
 				}
@@ -201,6 +202,81 @@ func statementEndAfter(src string, idx1, limit int) (exprEnd, stmtEnd int) {
 		return exprEnd, next + 1
 	}
 	return exprEnd, exprEnd
+}
+
+// trueIdx1 works around Goja's upstream NewExpression.Idx1() bug where zero-argument
+// `new Foo()` leaves ArgumentList == nil and erroneously returns Callee.Idx1() before `()`,
+// propagating that exact end offset through right-edge wrapper nodes.
+func trueIdx1(n ast.Node) file.Idx {
+	if n == nil {
+		return 0
+	}
+	switch x := n.(type) {
+	case *ast.NewExpression:
+		if x.RightParenthesis > 0 {
+			return x.RightParenthesis + 1
+		}
+		return trueIdx1(x.Callee)
+	case *ast.LexicalDeclaration:
+		if len(x.List) > 0 {
+			return trueIdx1(x.List[len(x.List)-1])
+		}
+	case *ast.VariableStatement:
+		if len(x.List) > 0 {
+			return trueIdx1(x.List[len(x.List)-1])
+		}
+	case *ast.Binding:
+		if x.Initializer != nil {
+			return trueIdx1(x.Initializer)
+		}
+		return trueIdx1(x.Target)
+	case *ast.ExpressionStatement:
+		return trueIdx1(x.Expression)
+	case *ast.AssignExpression:
+		return trueIdx1(x.Right)
+	case *ast.AwaitExpression:
+		return trueIdx1(x.Argument)
+	case *ast.BinaryExpression:
+		return trueIdx1(x.Right)
+	case *ast.ConditionalExpression:
+		return trueIdx1(x.Alternate)
+	case *ast.SequenceExpression:
+		if len(x.Sequence) > 0 {
+			return trueIdx1(x.Sequence[len(x.Sequence)-1])
+		}
+	case *ast.UnaryExpression:
+		if !x.Postfix {
+			return trueIdx1(x.Operand)
+		}
+	case *ast.OptionalChain:
+		return trueIdx1(x.Expression)
+	case *ast.Optional:
+		return trueIdx1(x.Expression)
+	case *ast.ReturnStatement:
+		if x.Argument != nil {
+			return trueIdx1(x.Argument)
+		}
+	case *ast.ThrowStatement:
+		return trueIdx1(x.Argument)
+	case *ast.IfStatement:
+		if x.Alternate != nil {
+			return trueIdx1(x.Alternate)
+		}
+		return trueIdx1(x.Consequent)
+	case *ast.ForStatement:
+		return trueIdx1(x.Body)
+	case *ast.ForInStatement:
+		return trueIdx1(x.Body)
+	case *ast.ForOfStatement:
+		return trueIdx1(x.Body)
+	case *ast.WhileStatement:
+		return trueIdx1(x.Body)
+	case *ast.WithStatement:
+		return trueIdx1(x.Body)
+	case *ast.LabelledStatement:
+		return trueIdx1(x.Statement)
+	}
+	return n.Idx1()
 }
 
 func collectTopLevelNames(stmt ast.Statement) []string {
