@@ -78,13 +78,13 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		default:
 			return errors.New("setup requires browser, local, client, oauth, or remote-token")
 		}
-	case "version":
+	case "version", "--version", "-v":
 		if len(args) != 1 {
 			return errors.New("version does not accept arguments")
 		}
 		_, err := fmt.Fprintln(stdout, "lrmcp", mcpserver.Version)
 		return err
-	case "help":
+	case "help", "--help", "-h":
 		usage(stdout)
 		return nil
 	default:

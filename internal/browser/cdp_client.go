@@ -20,6 +20,7 @@ const (
 	maxNetworkEntries  = 500
 	maxConsoleEntries  = 500
 	maxScreencastBuf   = 20
+	maxTraceEvents     = 250_000
 )
 
 type cdpRequest struct {
@@ -121,6 +122,7 @@ type tabSession struct {
 	lastAXLines      []string
 	snapshots        map[string]map[string]axTargetRef
 	snapshotOrder    []string
+	snapshotSeq      int64
 	viewport         *viewportCapture
 	openDialog       bool
 	dialogWaiters    []chan struct{}
@@ -308,9 +310,9 @@ func (c *cdpClient) ProductVersion() string {
 	return c.productVersion
 }
 
-func (c *cdpClient) Send(ctx context.Context, sessionID, method string, params any, out any) error {
+func (c *cdpClient) sendRaw(ctx context.Context, sessionID, method string, params any) (json.RawMessage, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, err
 	}
 	id := c.seq.Add(1)
 	respCh := make(chan cdpEnvelope, 1)
@@ -321,7 +323,7 @@ func (c *cdpClient) Send(ctx context.Context, sessionID, method string, params a
 	c.stateMu.Unlock()
 	if closed {
 		c.pendMu.Unlock()
-		return errors.New("CDP browser connection is closed")
+		return nil, errors.New("CDP browser connection is closed")
 	}
 	c.pending[id] = respCh
 	c.pendMu.Unlock()
@@ -339,7 +341,7 @@ func (c *cdpClient) Send(ctx context.Context, sessionID, method string, params a
 		SessionID: sessionID,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	c.writeMu.Lock()
@@ -347,28 +349,36 @@ func (c *cdpClient) Send(ctx context.Context, sessionID, method string, params a
 	writeErr := websocket.Message.Send(c.conn, string(payload))
 	c.writeMu.Unlock()
 	if writeErr != nil {
-		return fmt.Errorf("CDP send %s: %w", method, writeErr)
+		return nil, fmt.Errorf("CDP send %s: %w", method, writeErr)
 	}
 
 	select {
 	case env, ok := <-respCh:
 		if !ok {
-			return errors.New("CDP browser connection closed while awaiting response")
+			return nil, errors.New("CDP browser connection closed while awaiting response")
 		}
 		if env.Error != nil {
-			return env.Error
+			return nil, env.Error
 		}
-		if out != nil && len(env.Result) > 0 {
-			if err := json.Unmarshal(env.Result, out); err != nil {
-				return fmt.Errorf("decode CDP %s result: %w", method, err)
-			}
-		}
-		return nil
+		return env.Result, nil
 	case <-ctx.Done():
-		return ctx.Err()
+		return nil, ctx.Err()
 	case <-c.done:
-		return errors.New("CDP browser connection closed")
+		return nil, errors.New("CDP browser connection closed")
 	}
+}
+
+func (c *cdpClient) Send(ctx context.Context, sessionID, method string, params any, out any) error {
+	raw, err := c.sendRaw(ctx, sessionID, method, params)
+	if err != nil {
+		return err
+	}
+	if out != nil && len(raw) > 0 {
+		if err := json.Unmarshal(raw, out); err != nil {
+			return fmt.Errorf("decode CDP %s result: %w", method, err)
+		}
+	}
+	return nil
 }
 
 func (c *cdpClient) readLoop() {
@@ -386,7 +396,7 @@ func (c *cdpClient) readLoop() {
 	}()
 
 	for {
-		var raw string
+		var raw []byte
 		if err := websocket.Message.Receive(c.conn, &raw); err != nil {
 			c.stateMu.Lock()
 			c.closeErr = err
@@ -394,7 +404,7 @@ func (c *cdpClient) readLoop() {
 			return
 		}
 		var env cdpEnvelope
-		if err := json.Unmarshal([]byte(raw), &env); err != nil {
+		if err := json.Unmarshal(raw, &env); err != nil {
 			continue
 		}
 		if env.ID > 0 {
@@ -414,7 +424,7 @@ func (c *cdpClient) readLoop() {
 }
 
 func (c *cdpClient) handleEvent(env cdpEnvelope) {
-	// Browser-level tracing events (sessionId == "")
+	// Browser-level events (sessionId == "") and lifecycle detaches
 	switch env.Method {
 	case "Tracing.dataCollected":
 		var p struct {
@@ -422,7 +432,11 @@ func (c *cdpClient) handleEvent(env cdpEnvelope) {
 		}
 		if json.Unmarshal(env.Params, &p) == nil && len(p.Value) > 0 {
 			c.traceMu.Lock()
-			if c.traceActive {
+			if c.traceActive && len(c.traceChunks) < maxTraceEvents {
+				rem := maxTraceEvents - len(c.traceChunks)
+				if len(p.Value) > rem {
+					p.Value = p.Value[:rem]
+				}
 				c.traceChunks = append(c.traceChunks, p.Value...)
 			}
 			c.traceMu.Unlock()
@@ -460,14 +474,52 @@ func (c *cdpClient) handleEvent(env cdpEnvelope) {
 		}
 		if json.Unmarshal(env.Params, &p) == nil && p.TargetID != "" {
 			c.stateMu.Lock()
-			if ts := c.tabs[p.TargetID]; ts != nil {
-				delete(c.tabs, p.TargetID)
+			ts := c.tabs[p.TargetID]
+			delete(c.tabs, p.TargetID)
+			delete(c.attached, p.TargetID)
+			if ts != nil {
 				delete(c.bySession, ts.sessionID)
+				ts.mu.Lock()
 				for child := range ts.childSessions {
 					delete(c.bySession, child)
 				}
+				ts.mu.Unlock()
 			}
 			c.stateMu.Unlock()
+		}
+		return
+	case "Target.detachedFromTarget":
+		var p struct {
+			SessionID string `json:"sessionId"`
+			TargetID  string `json:"targetId"`
+		}
+		if json.Unmarshal(env.Params, &p) == nil && p.SessionID != "" {
+			c.stateMu.Lock()
+			ts := c.bySession[p.SessionID]
+			if ts == nil && p.TargetID != "" {
+				ts = c.tabs[p.TargetID]
+			}
+			if ts != nil && ts.sessionID == p.SessionID {
+				// Main tab session detached (crash / close / DevTools detach): evict cleanly so next call re-attaches.
+				delete(c.tabs, ts.targetID)
+				delete(c.attached, ts.targetID)
+				delete(c.bySession, ts.sessionID)
+				ts.mu.Lock()
+				for child := range ts.childSessions {
+					delete(c.bySession, child)
+				}
+				ts.mu.Unlock()
+				c.stateMu.Unlock()
+				return
+			}
+			delete(c.bySession, p.SessionID)
+			c.stateMu.Unlock()
+			if ts != nil {
+				ts.mu.Lock()
+				delete(ts.childSessions, p.SessionID)
+				ts.bumpEpochLocked()
+				ts.mu.Unlock()
+			}
 		}
 		return
 	}
@@ -553,6 +605,7 @@ func (c *cdpClient) handleEvent(env cdpEnvelope) {
 						delete(ts.networkByID, e.RequestID)
 					}
 				}
+				clear(ts.network[len(kept):])
 				ts.network = kept
 			}
 			ts.mu.Unlock()
@@ -605,7 +658,9 @@ func (c *cdpClient) handleEvent(env cdpEnvelope) {
 			ts.networkByID[p.RequestID] = entry
 			if len(ts.network) > maxNetworkEntries {
 				dropped := ts.network[0]
-				ts.network = ts.network[1:]
+				copy(ts.network, ts.network[1:])
+				ts.network[len(ts.network)-1] = nil
+				ts.network = ts.network[:len(ts.network)-1]
 				if ts.networkByID[dropped.RequestID] == dropped {
 					delete(ts.networkByID, dropped.RequestID)
 				}
@@ -779,7 +834,10 @@ func (c *cdpClient) handleEvent(env cdpEnvelope) {
 						Data:      raw,
 					})
 					if len(ts.screencastFrames) > maxScreencastBuf {
-						ts.screencastFrames = ts.screencastFrames[len(ts.screencastFrames)-maxScreencastBuf:]
+						excess := len(ts.screencastFrames) - maxScreencastBuf
+						copy(ts.screencastFrames, ts.screencastFrames[excess:])
+						clear(ts.screencastFrames[maxScreencastBuf:])
+						ts.screencastFrames = ts.screencastFrames[:maxScreencastBuf]
 					}
 				}
 				ts.mu.Unlock()
@@ -817,11 +875,14 @@ func (ts *tabSession) appendConsole(entry ConsoleEntry) {
 	ts.consoleSeq++
 	entry.ID = ts.consoleSeq
 	if len(entry.Text) > 4096 {
-		entry.Text = entry.Text[:4096] + "…"
+		entry.Text = truncateUTF8Bytes(entry.Text, 4096) + "…"
 	}
 	ts.console = append(ts.console, entry)
 	if len(ts.console) > maxConsoleEntries {
-		ts.console = ts.console[len(ts.console)-maxConsoleEntries:]
+		excess := len(ts.console) - maxConsoleEntries
+		copy(ts.console, ts.console[excess:])
+		clear(ts.console[maxConsoleEntries:])
+		ts.console = ts.console[:maxConsoleEntries]
 	}
 }
 
@@ -930,13 +991,26 @@ func (c *cdpClient) sendAllowDialog(ctx context.Context, ts *tabSession, session
 		ts.mu.Unlock()
 	}()
 
-	errCh := make(chan error, 1)
+	type rawRes struct {
+		raw json.RawMessage
+		err error
+	}
+	resCh := make(chan rawRes, 1)
 	go func() {
-		errCh <- c.Send(ctx, sessionID, method, params, out)
+		raw, err := c.sendRaw(ctx, sessionID, method, params)
+		resCh <- rawRes{raw: raw, err: err}
 	}()
 	select {
-	case err := <-errCh:
-		return err
+	case res := <-resCh:
+		if res.err != nil {
+			return res.err
+		}
+		if out != nil && len(res.raw) > 0 {
+			if err := json.Unmarshal(res.raw, out); err != nil {
+				return fmt.Errorf("decode CDP %s result: %w", method, err)
+			}
+		}
+		return nil
 	case <-waiter:
 		return nil
 	case <-ctx.Done():

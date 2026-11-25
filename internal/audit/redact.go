@@ -3,12 +3,24 @@ package audit
 import (
 	"encoding/json"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
 	maxFieldChars = 12 * 1024
 	maxJSONChars  = 48 * 1024
 )
+
+func truncateUTF8(s string, maxBytes int) string {
+	if maxBytes <= 0 || len(s) <= maxBytes {
+		return s
+	}
+	i := maxBytes
+	for i > 0 && !utf8.RuneStart(s[i]) {
+		i--
+	}
+	return s[:i]
+}
 
 var sensitiveKeyFragments = []string{
 	"token", "secret", "password", "passwd", "api_key", "apikey",
@@ -58,7 +70,7 @@ func redactValue(key string, v any, depth int) any {
 		return out
 	case string:
 		if len(val) > maxFieldChars {
-			return val[:maxFieldChars] + "…[truncated]"
+			return truncateUTF8(val, maxFieldChars) + "…[truncated]"
 		}
 		return val
 	default:
@@ -76,12 +88,12 @@ func RedactRaw(raw json.RawMessage) string {
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		s := string(raw)
 		if len(s) > 1024 {
-			s = s[:1024] + "…"
+			s = truncateUTF8(s, 1024) + "…"
 		}
 		b, _ := json.Marshal(map[string]string{"raw": s})
 		return string(b)
 	}
-	return RedactAny(parsed)
+	return marshalRedacted(parsed)
 }
 
 // RedactAny redacts and serializes any Go value into bounded JSON.
@@ -98,13 +110,17 @@ func RedactAny(v any) string {
 	if err := json.Unmarshal(b, &generic); err != nil {
 		return "{}"
 	}
+	return marshalRedacted(generic)
+}
+
+func marshalRedacted(generic any) string {
 	cleaned := redactValue("", generic, 0)
 	out, err := json.Marshal(cleaned)
 	if err != nil {
 		return "{}"
 	}
 	if len(out) > maxJSONChars {
-		preview := string(out[:maxJSONChars])
+		preview := truncateUTF8(string(out), maxJSONChars)
 		wrapped, _ := json.Marshal(map[string]any{
 			"truncated": true,
 			"bytes":     len(out),

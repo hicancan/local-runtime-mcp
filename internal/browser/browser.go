@@ -46,9 +46,10 @@ type Bridge struct {
 	token          string
 	server         *http.Server
 
-	mu         sync.Mutex
-	cdpConns   map[string]*cdpEntry // browserID -> managed CDP connection
-	tabOwners  map[string]*tabOwnership
+	mu           sync.Mutex
+	cdpConns     map[string]*cdpEntry // browserID -> managed CDP connection
+	lastDiscover time.Time
+	tabOwners    map[string]*tabOwnership
 	instances  map[string]*instance // thin extension peers (for web_bridge + tab groups)
 	extTabs    map[string]tabRoute
 	gate       DesktopGate
@@ -253,7 +254,7 @@ func Start(ctx context.Context, configuration config.Browser) (*Bridge, error) {
 	}
 
 	// Discover local Chromium DevToolsActivePort files & configured CDP endpoints immediately.
-	bridge.refreshDiscovered()
+	bridge.refreshDiscovered(true)
 
 	// Optionally start the thin extension bridge (127.0.0.1:9315) for Web Bridge,
 	// owner Grants panel, and visual Tab Groups (never chrome.debugger).
@@ -342,10 +343,22 @@ func (b *Bridge) SetDesktopGate(gate DesktopGate) {
 	b.mu.Unlock()
 }
 
-func (b *Bridge) refreshDiscovered() {
+const discoverTTL = 2 * time.Second
+
+func (b *Bridge) refreshDiscovered(force bool) {
+	if !force {
+		b.mu.Lock()
+		fresh := !b.lastDiscover.IsZero() && time.Since(b.lastDiscover) < discoverTTL
+		b.mu.Unlock()
+		if fresh {
+			return
+		}
+	}
 	found := DiscoverBrowsers(b.cdpEndpoints, b.disableAutoCDP)
+	now := time.Now()
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.lastDiscover = now
 	active := map[string]bool{}
 	for _, d := range found {
 		active[d.ID] = true
@@ -382,7 +395,7 @@ func (b *Bridge) refreshDiscovered() {
 
 // Status reports all discovered/connected Chromium CDP instances plus extension panel link state.
 func (b *Bridge) Status() Status {
-	b.refreshDiscovered()
+	b.refreshDiscovered(true)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -445,44 +458,51 @@ func (b *Bridge) Connect(ctx context.Context, browserID string) (InstanceStatus,
 	return InstanceStatus{BrowserID: cl.id, Label: cl.label, Browser: cl.ProductVersion(), State: "connected", Connected: true, LastSeen: time.Now()}, nil
 }
 
-func (b *Bridge) resolveClient(ctx context.Context, browserID string, forceRetry bool) (*cdpClient, error) {
-	b.refreshDiscovered()
-
-	b.mu.Lock()
-	var entry *cdpEntry
+func (b *Bridge) selectEntryLocked(browserID string) *cdpEntry {
 	if browserID != "" {
-		entry = b.cdpConns[browserID]
-	} else {
-		// Prefer already-connected browser, then edge, then chrome, then alphabetical.
-		order := make([]string, 0, len(b.cdpConns))
-		for id := range b.cdpConns {
-			order = append(order, id)
+		return b.cdpConns[browserID]
+	}
+	// Prefer already-connected browser, then edge, then chrome, then alphabetical.
+	var bestID string
+	var bestEntry *cdpEntry
+	bestRank := 99
+	for id, e := range b.cdpConns {
+		r := 3
+		if e.client != nil && e.client.Alive() {
+			r = 0
+		} else if id == "edge" {
+			r = 1
+		} else if id == "chrome" {
+			r = 2
 		}
-		sort.Slice(order, func(i, j int) bool {
-			rank := func(id string) int {
-				e := b.cdpConns[id]
-				if e.client != nil && e.client.Alive() {
-					return 0
-				}
-				switch id {
-				case "edge":
-					return 1
-				case "chrome":
-					return 2
-				default:
-					return 3
-				}
-			}
-			ri, rj := rank(order[i]), rank(order[j])
-			if ri != rj {
-				return ri < rj
-			}
-			return order[i] < order[j]
-		})
-		if len(order) > 0 {
-			entry = b.cdpConns[order[0]]
+		if bestEntry == nil || r < bestRank || (r == bestRank && id < bestID) {
+			bestID = id
+			bestEntry = e
+			bestRank = r
 		}
 	}
+	return bestEntry
+}
+
+func (b *Bridge) resolveClient(ctx context.Context, browserID string, forceRetry bool) (*cdpClient, error) {
+	// Zero-I/O fast path: reuse an already-connected live CDP client without
+	// scanning DevToolsActivePort files on every browser operation.
+	if !forceRetry {
+		b.mu.Lock()
+		entry := b.selectEntryLocked(browserID)
+		if entry != nil && entry.client != nil && entry.client.Alive() {
+			cl := entry.client
+			entry.lastSeen = time.Now()
+			b.mu.Unlock()
+			return cl, nil
+		}
+		b.mu.Unlock()
+	}
+
+	b.refreshDiscovered(forceRetry)
+
+	b.mu.Lock()
+	entry := b.selectEntryLocked(browserID)
 	if entry == nil {
 		b.mu.Unlock()
 		if browserID != "" {
@@ -539,10 +559,21 @@ func (b *Bridge) resolveClient(ctx context.Context, browserID string, forceRetry
 	entry.dialing = false
 	if err != nil {
 		entry.lastError = err.Error()
+		if errors.Is(err, context.Canceled) {
+			entry.state = "offline"
+			b.mu.Unlock()
+			return nil, err
+		}
 		if errors.Is(err, context.DeadlineExceeded) {
 			entry.state = "awaiting_approval"
 			b.mu.Unlock()
 			return nil, fmt.Errorf("%s is waiting for one-time 'Allow' on its remote debugging prompt (%s)", disc.Label, wsURL)
+		}
+		var opErr *net.OpError
+		if errors.As(err, &opErr) && opErr.Op == "dial" {
+			entry.state = "offline"
+			b.mu.Unlock()
+			return nil, fmt.Errorf("connect CDP %s: %w", disc.Label, err)
 		}
 		entry.state = "rejected"
 		entry.rejectedFP = disc.Fingerprint

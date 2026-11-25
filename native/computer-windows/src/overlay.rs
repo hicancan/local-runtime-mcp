@@ -2,7 +2,8 @@
 //! display being worked on, shown while a workflow holds the pointer and keyboard. Clicking it
 //! stops that workflow. It never outlines windows, never takes focus and is excluded from capture.
 use super::Rectangle;
-use std::sync::{OnceLock, mpsc};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::Duration;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -11,18 +12,32 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
 
-const LABEL: &str = "AI 正在操作 · 点此停止";
+const DEFAULT_LABEL: &str = "AI 正在操作 · 点此停止";
+const WM_APP_CMD: u32 = WM_APP + 1;
 
 enum Command {
-    Show(u64),
+    Show(u64, String),
     Near(Rectangle),
     Hide,
 }
+
 static CHANNEL: OnceLock<mpsc::Sender<Command>> = OnceLock::new();
+static THREAD_ID: AtomicU32 = AtomicU32::new(0);
+static ACTIVE_LABEL: OnceLock<Mutex<String>> = OnceLock::new();
+
+fn wake_overlay_thread() {
+    let tid = THREAD_ID.load(Ordering::SeqCst);
+    if tid != 0 {
+        unsafe {
+            let _ = PostThreadMessageW(tid, WM_APP_CMD, WPARAM(0), LPARAM(0));
+        }
+    }
+}
 
 pub struct Overlay {
     sender: mpsc::Sender<Command>,
@@ -34,6 +49,7 @@ impl Overlay {
         let (sender, receiver) = mpsc::channel();
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let _ = CHANNEL.set(sender.clone());
+        let _ = ACTIVE_LABEL.set(Mutex::new(DEFAULT_LABEL.to_string()));
         std::thread::spawn(move || unsafe {
             let instance = GetModuleHandleW(None).unwrap_or_default();
             let class = WNDCLASSW {
@@ -47,7 +63,7 @@ impl Overlay {
             let Ok(pill) = CreateWindowExW(
                 WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
                 w!("LocalRuntimeMCPControl"),
-                w!("AI control"),
+                w!("Desktop control"),
                 WS_POPUP,
                 0,
                 0,
@@ -74,44 +90,57 @@ impl Overlay {
                 &corner as *const _ as *const _,
                 size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
             );
+            // Force message queue creation before publishing thread ID so PostThreadMessageW never races.
+            let mut init_msg = MSG::default();
+            let _ = PeekMessageW(&mut init_msg, None, WM_USER, WM_USER, PM_NOREMOVE);
+            THREAD_ID.store(GetCurrentThreadId(), Ordering::SeqCst);
             let _ = ready_sender.send(true);
+
             let mut active = false;
             let mut near: Option<Rectangle> = None;
-            loop {
-                while let Ok(command) = receiver.try_recv() {
-                    match command {
-                        Command::Show(generation) => {
-                            if generation
-                                == super::STOP_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
-                            {
-                                active = true;
-                                place(pill, near);
+            let mut message = MSG::default();
+            // Pure event-driven Win32 message loop: 0% idle CPU and full C-state sleep.
+            while GetMessageW(&mut message, None, 0, 0).as_bool() {
+                if message.message == WM_APP_CMD {
+                    while let Ok(command) = receiver.try_recv() {
+                        match command {
+                            Command::Show(generation, label) => {
+                                if generation == super::STOP_GENERATION.load(Ordering::SeqCst) {
+                                    if let Some(lock) = ACTIVE_LABEL.get()
+                                        && let Ok(mut guard) = lock.lock()
+                                    {
+                                        *guard = format_pill_label(&label);
+                                    }
+                                    active = true;
+                                    place(pill, near);
+                                }
                             }
-                        }
-                        Command::Near(bounds) => {
-                            near = Some(bounds);
-                            if active {
-                                place(pill, near);
+                            Command::Near(bounds) => {
+                                near = Some(bounds);
+                                if active {
+                                    place(pill, near);
+                                }
                             }
-                        }
-                        Command::Hide => {
-                            active = false;
-                            near = None;
-                            let _ = ShowWindow(pill, SW_HIDE);
+                            Command::Hide => {
+                                active = false;
+                                near = None;
+                                let _ = ShowWindow(pill, SW_HIDE);
+                            }
                         }
                     }
+                    if super::SHUTTING_DOWN.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    continue;
                 }
-                let mut message = MSG::default();
-                while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
-                    let _ = TranslateMessage(&message);
-                    DispatchMessageW(&message);
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+                if super::SHUTTING_DOWN.load(Ordering::SeqCst) {
+                    break;
                 }
-                if super::SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
-                    let _ = DestroyWindow(pill);
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(8));
             }
+            THREAD_ID.store(0, Ordering::SeqCst);
+            let _ = DestroyWindow(pill);
         });
         Self {
             sender,
@@ -121,27 +150,50 @@ impl Overlay {
         }
     }
 
-    pub fn show(&self) -> Result<(), String> {
-        let generation = super::STOP_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
+    pub fn show(&self, label: &str) -> Result<(), String> {
+        let generation = super::STOP_GENERATION.load(Ordering::SeqCst);
         super::input::check_cancel()?;
         if !self.ready {
             return Err(
                 "desktop control indicator could not initialize with capture exclusion".into(),
             );
         }
-        let _ = self.sender.send(Command::Show(generation));
+        let _ = self
+            .sender
+            .send(Command::Show(generation, label.trim().to_string()));
+        wake_overlay_thread();
         Ok(())
     }
 
     /// Moves the pill to the display holding the given bounds.
     pub fn near(&self, bounds: Rectangle) {
         let _ = self.sender.send(Command::Near(bounds));
+        wake_overlay_thread();
     }
+}
+
+fn format_pill_label(label: &str) -> String {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_LABEL.to_string();
+    }
+    let clipped: String = trimmed.chars().take(24).collect();
+    format!("{clipped} · 点此停止")
 }
 
 pub fn hide_global() {
     if let Some(sender) = CHANNEL.get() {
         let _ = sender.send(Command::Hide);
+        wake_overlay_thread();
+    }
+}
+
+pub fn shutdown_global() {
+    let tid = THREAD_ID.load(Ordering::SeqCst);
+    if tid != 0 {
+        unsafe {
+            let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
+        }
     }
 }
 
@@ -163,7 +215,12 @@ unsafe fn place(pill: HWND, near: Option<Rectangle>) {
     let (mut dpi, mut unused) = (96u32, 96u32);
     let _ = unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut unused) };
     let scale = |value: i32| value * dpi as i32 / 96;
-    let (width, height) = (scale(208), scale(32));
+    let char_count = ACTIVE_LABEL
+        .get()
+        .and_then(|lock| lock.lock().ok().map(|s| s.chars().count()))
+        .unwrap_or(14);
+    let base_w = (char_count as i32 * 13 + 40).clamp(208, 360);
+    let (width, height) = (scale(base_w), scale(32));
     let work = info.rcWork;
     let x = (work.left + work.right - width) / 2;
     let y = work.bottom - height - scale(20);
@@ -224,7 +281,11 @@ unsafe extern "system" fn window_proc(
                 let previous = SelectObject(dc, font.into());
                 SetBkMode(dc, TRANSPARENT);
                 SetTextColor(dc, COLORREF(0x00F2F2F2));
-                let mut wide: Vec<u16> = LABEL.encode_utf16().collect();
+                let label_text = ACTIVE_LABEL
+                    .get()
+                    .and_then(|lock| lock.lock().ok().map(|s| s.clone()))
+                    .unwrap_or_else(|| DEFAULT_LABEL.to_string());
+                let mut wide: Vec<u16> = label_text.encode_utf16().collect();
                 let _ = DrawTextW(
                     dc,
                     &mut wide,

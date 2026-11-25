@@ -1,6 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -8,7 +8,8 @@ use std::sync::{OnceLock, atomic::AtomicU64};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use image::{GenericImage, ImageEncoder, RgbaImage, codecs::png::PngEncoder};
+use image::codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder};
+use image::{GenericImage, ImageEncoder, RgbaImage};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use windows::Win32::Foundation::{CloseHandle, FILETIME, HWND, LPARAM, POINT, RECT};
@@ -219,6 +220,10 @@ struct StateParams {
     max_elements: usize,
     #[serde(default)]
     offset: usize,
+    #[serde(default)]
+    max_width: u32,
+    #[serde(default)]
+    max_height: u32,
 }
 
 #[derive(Deserialize)]
@@ -268,6 +273,7 @@ struct Engine {
     epoch: u64,
     sequence: u64,
     states: HashMap<String, StateRecord>,
+    state_order: VecDeque<String>,
     uia: uia::Worker,
     overlay: overlay::Overlay,
 }
@@ -293,6 +299,7 @@ impl Engine {
             epoch: 1,
             sequence: 0,
             states: HashMap::new(),
+            state_order: VecDeque::new(),
             uia: uia::Worker::new(),
             overlay: overlay::Overlay::new(),
         }
@@ -328,8 +335,9 @@ impl Engine {
                 Ok((json!({"success": true}), None))
             }
             "show_control" => {
+                let label = request.params["label"].as_str().unwrap_or("");
                 self.invalidate();
-                self.overlay.show()?;
+                self.overlay.show(label)?;
                 Ok((json!({"success":true}), None))
             }
             "invalidate" => {
@@ -377,7 +385,7 @@ impl Engine {
             let display = displays
                 .iter()
                 .find(|display| display.display_id == params.display_id)
-                .ok_or("display_id is unknown; call computer_targets again")?;
+                .ok_or("display_id is unknown; call desktop.targets() again")?;
             (None, Some(display.clone()), String::new(), display.bounds)
         } else {
             (None, None, String::new(), virtual_bounds(&displays)?)
@@ -388,7 +396,7 @@ impl Engine {
                 (Some(window), _) => {
                     if unsafe { IsIconic(window) }.as_bool() {
                         return Err(
-                            "target is minimized; computer_action place with show=restore brings it back without activating it"
+                            "target is minimized; desktop.action({ kind: \"place\", show: \"restore\", target_id }) brings it back without activating it"
                                 .into(),
                         );
                     }
@@ -443,9 +451,9 @@ impl Engine {
             }
             None => (image, origin),
         };
-        let (mut elements, total, uia_status) = match (window, scope) {
-            (_, "none") => (Vec::new(), 0, "not_requested".to_string()),
-            (None, _) => (Vec::new(), 0, "window_target_required".to_string()),
+        let (mut elements, total, uia_truncated, uia_status) = match (window, scope) {
+            (_, "none") => (Vec::new(), 0, false, "not_requested".to_string()),
+            (None, _) => (Vec::new(), 0, false, "window_target_required".to_string()),
             (Some(window), scope) => match self.uia.collect(
                 window,
                 origin,
@@ -458,8 +466,13 @@ impl Engine {
                     offset: params.offset,
                 },
             ) {
-                Ok(collected) => (collected.elements, collected.total, "available".to_string()),
-                Err(error) => (Vec::new(), 0, error),
+                Ok(collected) => (
+                    collected.elements,
+                    collected.total,
+                    collected.truncated,
+                    "available".to_string(),
+                ),
+                Err(error) => (Vec::new(), 0, false, error),
             },
         };
         check_cancel()?;
@@ -479,9 +492,9 @@ impl Engine {
             let _ = GetCursorPos(&mut cursor);
         }
         let cursor_shape = cursor_shape();
-        let truncated = params.offset + elements.len() < total;
+        let truncated = uia_truncated || params.offset + elements.len() < total;
         let encoded = match &image {
-            Some(frame) => Some(encode_png(frame)?),
+            Some(frame) => Some(encode_png(frame, params.max_width, params.max_height)?),
             None => None,
         };
         let state = StateOutput {
@@ -508,9 +521,15 @@ impl Engine {
             actionable,
             uia_status,
         };
-        if self.states.len() >= MAX_STATES {
-            self.states.clear();
+        while self.states.len() >= MAX_STATES {
+            if let Some(oldest) = self.state_order.pop_front() {
+                self.states.remove(&oldest);
+            } else {
+                self.states.clear();
+                break;
+            }
         }
+        self.state_order.push_back(state_id.clone());
         self.states.insert(
             state_id,
             StateRecord {
@@ -551,14 +570,14 @@ impl Engine {
         }
         if params.state_id.is_empty() {
             return Err(
-                "state_id is required; call computer_state immediately before acting".into(),
+                "state_id is required; call desktop.state({ control_id, ... }) immediately before acting".into(),
             );
         }
         let record = self
             .states
             .get(&params.state_id)
             .cloned()
-            .ok_or("state_id is unknown or stale; call computer_state again")?;
+            .ok_or("state_id is unknown or stale; call desktop.state() again")?;
         if !record.actionable {
             return Err(
                 "physical input needs a state observed with control_id; semantic actions do not"
@@ -573,12 +592,12 @@ impl Engine {
         }
         let foreground = unsafe { GetForegroundWindow() }.0 as isize;
         if foreground != record.foreground {
-            return Err("foreground window changed; call computer_state again".into());
+            return Err("foreground window changed; call desktop.state() again".into());
         }
         if !params.target_id.is_empty()
             && Some(frame_bounds(resolve_target(&params.target_id)?)) != record.frame
         {
-            return Err("target bounds changed; call computer_state again".into());
+            return Err("target bounds changed; call desktop.state() again".into());
         }
         self.invalidate();
         let live = if params.element_ref.is_empty() {
@@ -644,6 +663,7 @@ impl Engine {
     fn invalidate(&mut self) {
         self.epoch += 1;
         self.states.clear();
+        self.state_order.clear();
     }
 }
 
@@ -737,16 +757,40 @@ fn capture_desktop(
     Ok(desktop)
 }
 
-fn encode_png(frame: &RgbaImage) -> Result<Vec<u8>, String> {
-    let mut encoded = Vec::new();
-    PngEncoder::new(&mut encoded)
-        .write_image(
-            frame.as_raw(),
-            frame.width(),
-            frame.height(),
-            image::ExtendedColorType::Rgba8,
-        )
-        .map_err(|error| format!("encode {}x{} PNG: {error}", frame.width(), frame.height()))?;
+fn encode_png(frame: &RgbaImage, max_width: u32, max_height: u32) -> Result<Vec<u8>, String> {
+    let resized;
+    let src = if (max_width > 0 && frame.width() > max_width)
+        || (max_height > 0 && frame.height() > max_height)
+    {
+        let mut scale = 1.0_f64;
+        if max_width > 0 && frame.width() > max_width {
+            scale = scale.min(max_width as f64 / frame.width() as f64);
+        }
+        if max_height > 0 && frame.height() > max_height {
+            scale = scale.min(max_height as f64 / frame.height() as f64);
+        }
+        let nw = ((frame.width() as f64 * scale).round() as u32).max(1);
+        let nh = ((frame.height() as f64 * scale).round() as u32).max(1);
+        resized = image::imageops::resize(frame, nw, nh, image::imageops::FilterType::Triangle);
+        &resized
+    } else {
+        frame
+    };
+
+    // Strip opaque alpha channel (RGBA -> RGB24) to cut raw scanline payload by 25%,
+    // then encode with Fast compression + Sub filter (~5x faster than Default+Adaptive).
+    let w = src.width();
+    let h = src.height();
+    let raw = src.as_raw();
+    let mut rgb = Vec::with_capacity((w as usize) * (h as usize) * 3);
+    for px in raw.chunks_exact(4) {
+        rgb.extend_from_slice(&px[..3]);
+    }
+
+    let mut encoded = Vec::with_capacity(rgb.len() / 6);
+    PngEncoder::new_with_quality(&mut encoded, CompressionType::Fast, PngFilterType::Sub)
+        .write_image(&rgb, w, h, image::ExtendedColorType::Rgb8)
+        .map_err(|error| format!("encode {w}x{h} PNG: {error}"))?;
     Ok(encoded)
 }
 
@@ -1215,7 +1259,7 @@ fn target_id(hwnd: isize, pid: u32, started: u64) -> String {
 fn resolve_target(value: &str) -> Result<HWND, String> {
     let fields: Vec<_> = value.split('-').collect();
     if fields.len() != 4 || fields[0] != "win" {
-        return Err("target_id is invalid; call computer_targets again".into());
+        return Err("target_id is invalid; call desktop.targets() again".into());
     }
     let raw = isize::from_str_radix(fields[1], 16).map_err(|_| "target_id is invalid")?;
     let expected_pid = u32::from_str_radix(fields[2], 16).map_err(|_| "target_id is invalid")?;
@@ -1229,7 +1273,7 @@ fn resolve_target(value: &str) -> Result<HWND, String> {
         GetWindowThreadProcessId(window, Some(&mut pid));
     }
     if pid != expected_pid || process_start(pid)? != expected_start {
-        return Err("target_id is stale; call computer_targets again".into());
+        return Err("target_id is stale; call desktop.targets() again".into());
     }
     Ok(window)
 }
@@ -1288,7 +1332,7 @@ static ACTIVE: OnceLock<Mutex<ActiveRequest>> = OnceLock::new();
 static STOP_GENERATION: AtomicU64 = AtomicU64::new(0);
 pub static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
-fn write_value(value: &Value) -> io::Result<()> {
+fn write_serializable<T: Serialize>(value: &T) -> io::Result<()> {
     let data = serde_json::to_vec(value).map_err(io::Error::other)?;
     let mut output = OUTPUT
         .get_or_init(|| Mutex::new(io::stdout()))
@@ -1299,7 +1343,7 @@ fn write_value(value: &Value) -> io::Result<()> {
     output.flush()
 }
 fn emit_event(value: Value) {
-    let _ = write_value(&value);
+    let _ = write_serializable(&value);
 }
 fn cancel_active(request: Option<u64>) -> bool {
     let mut matched = request.is_none();
@@ -1358,6 +1402,7 @@ fn main() -> io::Result<()> {
         }
         local_stop();
         SHUTTING_DOWN.store(true, Ordering::SeqCst);
+        overlay::shutdown_global();
     });
     let mut engine = Engine::new();
     while let Ok((request, cancel)) = receiver.recv() {
@@ -1381,7 +1426,7 @@ fn main() -> io::Result<()> {
                 image_base64: None,
             },
         };
-        write_value(&serde_json::to_value(response).map_err(io::Error::other)?)?;
+        write_serializable(&response)?;
         let mut active = ACTIVE.get_or_init(|| Mutex::new(None)).lock().unwrap();
         if active.as_ref().is_some_and(|(id, _)| *id == request.id) {
             *active = None;
@@ -1389,6 +1434,7 @@ fn main() -> io::Result<()> {
     }
     input::release_all();
     SHUTTING_DOWN.store(true, Ordering::SeqCst);
+    overlay::shutdown_global();
     Ok(())
 }
 

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hicancan/local-runtime-mcp/internal/audit"
@@ -44,6 +45,30 @@ type HTTPConfig struct {
 type HTTPServer struct {
 	server   *http.Server
 	listener net.Listener
+
+	closeMu sync.Mutex
+	onClose []func()
+}
+
+// OnClose registers a cleanup callback invoked when the server terminates,
+// including immediate Close() shutdowns that bypass net/http RegisterOnShutdown.
+func (s *HTTPServer) OnClose(fn func()) {
+	if s == nil || fn == nil {
+		return
+	}
+	s.closeMu.Lock()
+	s.onClose = append(s.onClose, fn)
+	s.closeMu.Unlock()
+}
+
+func (s *HTTPServer) runOnClose() {
+	s.closeMu.Lock()
+	fns := s.onClose
+	s.onClose = nil
+	s.closeMu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
 }
 
 func NewHTTP(server *mcp.Server, cfg HTTPConfig) (*HTTPServer, error) {
@@ -238,6 +263,7 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	case <-ctx.Done():
 		// This server is stateless: terminal shutdown should take the machine
 		// offline immediately instead of waiting on a client's open HTTP body.
+		s.runOnClose()
 		err := s.server.Close()
 		serveErr := <-errorsChannel
 		if errors.Is(serveErr, http.ErrServerClosed) {

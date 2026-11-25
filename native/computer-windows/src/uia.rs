@@ -2,7 +2,7 @@
 //! cross-process request, and semantic actions that operate a control through its
 //! automation patterns without the foreground, the pointer or the keyboard.
 use super::{Element, Rectangle, error_string, rectangle};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -55,6 +55,7 @@ pub enum Semantic {
 pub struct Collected {
     pub elements: Vec<Element>,
     pub total: usize,
+    pub truncated: bool,
 }
 
 struct Work {
@@ -79,6 +80,48 @@ struct LiveElement {
     runtime_id: Vec<i32>,
 }
 
+struct LiveStore {
+    items: HashMap<u64, LiveElement>,
+    order: VecDeque<u64>,
+    sequence: u64,
+}
+
+impl LiveStore {
+    fn new() -> Self {
+        Self {
+            items: HashMap::new(),
+            order: VecDeque::new(),
+            sequence: 0,
+        }
+    }
+
+    fn evict_if_full(&mut self) {
+        if self.items.len() >= MAX_LIVE {
+            for _ in 0..(MAX_LIVE / 4) {
+                if let Some(old_key) = self.order.pop_front() {
+                    self.items.remove(&old_key);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn next_key(&mut self) -> u64 {
+        self.sequence += 1;
+        self.sequence
+    }
+
+    fn insert(&mut self, key: u64, elem: LiveElement) {
+        self.items.insert(key, elem);
+        self.order.push_back(key);
+    }
+
+    fn get(&self, key: &u64) -> Option<&LiveElement> {
+        self.items.get(key)
+    }
+}
+
 /// Bounded so a long session cannot grow the live element table without limit.
 const MAX_LIVE: usize = 40_000;
 /// Elements visited in one observation; deeper or wider trees report truncation.
@@ -93,8 +136,8 @@ impl Worker {
             let initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
             let automation: Result<IUIAutomation, _> =
                 CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER);
-            let mut live = HashMap::<u64, LiveElement>::new();
-            let mut sequence = 0u64;
+            let cached_req = automation.as_ref().ok().and_then(|a| cache_request(a).ok());
+            let mut live = LiveStore::new();
             while let Ok(work) = receiver.recv() {
                 let available =
                     Instant::now() < work.deadline && !work.cancel.load(Ordering::SeqCst);
@@ -105,11 +148,11 @@ impl Worker {
                         } else if let Ok(automation) = &automation {
                             collect(
                                 automation,
+                                cached_req.as_ref(),
                                 HWND(hwnd as *mut _),
                                 origin,
                                 &query,
                                 &mut live,
-                                &mut sequence,
                                 &work.cancel,
                             )
                         } else {
@@ -279,25 +322,31 @@ fn text(value: windows::core::Result<windows::core::BSTR>) -> String {
 
 unsafe fn collect(
     automation: &IUIAutomation,
+    cached_req: Option<&IUIAutomationCacheRequest>,
     window: HWND,
     origin: Rectangle,
     query: &Query,
-    live: &mut HashMap<u64, LiveElement>,
-    sequence: &mut u64,
+    live: &mut LiveStore,
     cancel: &AtomicBool,
 ) -> Result<Collected, String> {
-    let request = unsafe { cache_request(automation) }?;
+    let owned_req;
+    let request = match cached_req {
+        Some(r) => r,
+        None => {
+            owned_req = unsafe { cache_request(automation) }?;
+            &owned_req
+        }
+    };
     let root = unsafe { automation.ElementFromHandle(window) }.map_err(error_string)?;
     // One cross-process round trip brings the whole control-view subtree with its properties.
-    let root = unsafe { root.BuildUpdatedCache(&request) }.map_err(error_string)?;
-    if live.len() > MAX_LIVE {
-        live.clear();
-    }
+    let root = unsafe { root.BuildUpdatedCache(request) }.map_err(error_string)?;
+    live.evict_if_full();
     let interactive_only = query.scope == "interactive";
     let name_filter = query.name.to_lowercase();
     let mut elements = Vec::new();
     let mut matched = 0usize;
     let mut visited = 0usize;
+    let mut hit_visit_cap = false;
     // Depth-first in document order: (element, depth, parent index in `elements`).
     let mut stack: Vec<(IUIAutomationElement, u32, Option<usize>)> = Vec::new();
     push_children(&root, 0, None, &mut stack);
@@ -307,46 +356,47 @@ unsafe fn collect(
         }
         visited += 1;
         if visited > MAX_VISITED {
-            return Err(format!(
-                "the window exposes more than {MAX_VISITED} automation elements; narrow the query"
-            ));
+            hit_visit_cap = true;
+            break;
         }
         let kind = unsafe { element.CachedControlType() }
             .map(|value| value.0)
             .unwrap_or(0);
+        let role = role_name(kind);
         let name = text(unsafe { element.CachedName() });
         let automation_id = text(unsafe { element.CachedAutomationId() });
-        let patterns: Vec<&'static str> = PATTERNS
-            .iter()
-            .filter(|(pattern, _)| {
-                unsafe { element.GetCachedPatternAs::<windows::core::IUnknown>(*pattern) }.is_ok()
-            })
-            .map(|(_, label)| *label)
-            .collect();
-        let role = role_name(kind);
-        // Every element in a scrollable view can scroll itself into view; that alone is not operable.
-        let operable = patterns
-            .iter()
-            .any(|pattern| *pattern != "scroll_into_view")
-            || interactive_role(kind);
-        let reported = if interactive_only {
-            operable
-        } else {
-            operable || !name.is_empty() || !automation_id.is_empty()
-        };
+
+        let pre_matches = (query.role.is_empty() || role == query.role)
+            && (query.automation_id.is_empty() || automation_id == query.automation_id)
+            && (name_filter.is_empty() || name.to_lowercase().contains(&name_filter));
+
         let mut index = parent;
-        if reported {
-            let matches = (name_filter.is_empty() || name.to_lowercase().contains(&name_filter))
-                && (query.automation_id.is_empty() || automation_id == query.automation_id)
-                && (query.role.is_empty() || role == query.role);
-            if matches {
+        if pre_matches {
+            let patterns: Vec<&'static str> = PATTERNS
+                .iter()
+                .filter(|(pattern, _)| {
+                    unsafe { element.GetCachedPatternAs::<windows::core::IUnknown>(*pattern) }
+                        .is_ok()
+                })
+                .map(|(_, label)| *label)
+                .collect();
+            // Every element in a scrollable view can scroll itself into view; that alone is not operable.
+            let operable = patterns
+                .iter()
+                .any(|pattern| *pattern != "scroll_into_view")
+                || interactive_role(kind);
+            let reported = if interactive_only {
+                operable
+            } else {
+                operable || !name.is_empty() || !automation_id.is_empty()
+            };
+            if reported {
                 matched += 1;
                 if matched > query.offset && elements.len() < query.limit {
                     let rect = unsafe { element.CachedBoundingRectangle() }
                         .map(rectangle)
                         .unwrap_or_default();
-                    *sequence += 1;
-                    let key = *sequence;
+                    let key = live.next_key();
                     if let Ok(runtime_id) = unsafe { cached_runtime_id(&element) } {
                         live.insert(
                             key,
@@ -396,6 +446,7 @@ unsafe fn collect(
     Ok(Collected {
         elements,
         total: matched,
+        truncated: hit_visit_cap,
     })
 }
 
@@ -506,6 +557,14 @@ unsafe fn semantic(
     fn missing(label: &str) -> String {
         format!("element does not support the {label} pattern; see its patterns list")
     }
+    struct SemanticGuard;
+    impl Drop for SemanticGuard {
+        fn drop(&mut self) {
+            if let Ok(mut active) = SEMANTIC_ACTIVE.lock() {
+                *active = false;
+            }
+        }
+    }
     {
         let mut active = SEMANTIC_ACTIVE.lock().map_err(error_string)?;
         if stop_generation != super::STOP_GENERATION.load(Ordering::SeqCst)
@@ -515,7 +574,8 @@ unsafe fn semantic(
         }
         *active = true;
     }
-    let result = unsafe {
+    let _guard = SemanticGuard;
+    unsafe {
         match action {
             Semantic::Invoke => element
                 .GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId)
@@ -590,9 +650,7 @@ unsafe fn semantic(
                 result
             }
         }
-    };
-    *SEMANTIC_ACTIVE.lock().map_err(error_string)? = false;
-    result
+    }
 }
 
 fn interactive_role(value: i32) -> bool {

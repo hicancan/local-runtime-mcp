@@ -21,9 +21,14 @@ import (
 )
 
 const (
-	maxBlobBytes     = 8 << 20
-	maxSubscribers   = 64
-	sessionIdleAfter = 15 * time.Minute
+	maxBlobBytes      = 8 << 20
+	maxSubscribers    = 64
+	sessionIdleAfter  = 15 * time.Minute
+	ftsExcerptBytes   = 1024
+	maxRetainedEvents = 20_000
+	maxEventAge       = 90 * 24 * time.Hour
+	orphanBlobGrace   = 5 * time.Minute
+	auditSchemaVer    = 3
 )
 
 var validBlobHash = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -124,6 +129,17 @@ type NoteInput struct {
 	Status     string
 }
 
+type inFlightMeta struct {
+	sessionID string
+	agentID   string
+	wire      string
+	kind      string
+	toolName  string
+	summary   string
+	argsJSON  string
+	createdAt int64
+}
+
 // Store owns the embedded SQLite WAL database, optional blob directory, and
 // real-time subscriber hub.
 type Store struct {
@@ -131,18 +147,24 @@ type Store struct {
 	dbPath  string
 	blobDir string
 
+	inFlightMu sync.Mutex
+	inFlight   map[int64]inFlightMeta
+
 	blobMu   sync.RWMutex
 	memBlobs map[string][]byte
 
 	subMu       sync.Mutex
 	subscribers map[chan LivePacket]struct{}
 	closed      bool
+
+	stopPrune chan struct{}
+	pruneDone chan struct{}
 }
 
 // Open initializes (or opens) the SQLite WAL + FTS5 audit store.
 // Passing dbPath == "" opens an isolated in-memory database suitable for tests.
 func Open(dbPath string) (*Store, error) {
-	dsn := "file::memory:?cache=shared"
+	dsn := ":memory:"
 	blobDir := ""
 	if dbPath != "" {
 		abs, err := filepath.Abs(dbPath)
@@ -169,9 +191,15 @@ func Open(dbPath string) (*Store, error) {
 		"PRAGMA busy_timeout = 5000;",
 		"PRAGMA foreign_keys = ON;",
 		"PRAGMA cache_size = -16000;",
+		"PRAGMA temp_store = MEMORY;",
 	}
 	if dbPath != "" {
-		pragmas = append([]string{"PRAGMA journal_mode = WAL;", "PRAGMA synchronous = NORMAL;"}, pragmas...)
+		pragmas = append([]string{
+			"PRAGMA auto_vacuum = INCREMENTAL;",
+			"PRAGMA journal_mode = WAL;",
+			"PRAGMA synchronous = NORMAL;",
+			"PRAGMA journal_size_limit = 8388608;",
+		}, pragmas...)
 	}
 	for _, p := range pragmas {
 		if _, err := db.Exec(p); err != nil {
@@ -179,21 +207,35 @@ func Open(dbPath string) (*Store, error) {
 			return nil, fmt.Errorf("audit pragma %q: %w", p, err)
 		}
 	}
-	if err := migrate(db); err != nil {
+	if err := migrate(db, dbPath != ""); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	return &Store{
+	store := &Store{
 		db:          db,
 		dbPath:      dbPath,
 		blobDir:     blobDir,
+		inFlight:    map[int64]inFlightMeta{},
 		memBlobs:    map[string][]byte{},
 		subscribers: map[chan LivePacket]struct{}{},
-	}, nil
+	}
+	if dbPath != "" {
+		store.stopPrune = make(chan struct{})
+		store.pruneDone = make(chan struct{})
+		go store.pruneLoop()
+	}
+	return store, nil
 }
 
-func migrate(db *sql.DB) error {
-	const schema = `
+func ftsExcerpt(s string) string {
+	if len(s) <= ftsExcerptBytes {
+		return s
+	}
+	return truncateUTF8(s, ftsExcerptBytes)
+}
+
+func migrate(db *sql.DB, onDisk bool) error {
+	const baseSchema = `
 CREATE TABLE IF NOT EXISTS sessions (
 	id TEXT PRIMARY KEY,
 	agent_id TEXT NOT NULL,
@@ -230,38 +272,109 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind, id DESC);
+CREATE INDEX IF NOT EXISTS idx_events_status ON events(status);
+CREATE INDEX IF NOT EXISTS idx_events_agent ON events(agent_id);
+`
+	if _, err := db.Exec(baseSchema); err != nil {
+		return err
+	}
 
-CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+	var userVer int
+	_ = db.QueryRow(`PRAGMA user_version;`).Scan(&userVer)
+	if userVer >= auditSchemaVer {
+		return nil
+	}
+
+	// Migrate legacy trigger-driven external-content FTS5 (which caused 3x write
+	// amplification per tool call and indexed full 48 KB JSON blobs) to a compact
+	// standalone FTS5 table populated once per completed event with bounded excerpts.
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	const ftsMigration = `
+DROP TRIGGER IF EXISTS events_ai;
+DROP TRIGGER IF EXISTS events_ad;
+DROP TRIGGER IF EXISTS events_au;
+DROP TABLE IF EXISTS events_fts;
+CREATE VIRTUAL TABLE events_fts USING fts5(
 	summary,
 	tool_name,
 	args_json,
 	result_json,
 	error_text,
 	agent_id,
-	content='events',
-	content_rowid='id',
+	content='',
+	contentless_delete=1,
 	tokenize='trigram'
 );
-
-CREATE TRIGGER IF NOT EXISTS events_ai AFTER INSERT ON events BEGIN
-	INSERT INTO events_fts(rowid, summary, tool_name, args_json, result_json, error_text, agent_id)
-	VALUES (new.id, new.summary, new.tool_name, new.args_json, new.result_json, new.error_text, new.agent_id);
-END;
-
-CREATE TRIGGER IF NOT EXISTS events_ad AFTER DELETE ON events BEGIN
-	INSERT INTO events_fts(events_fts, rowid, summary, tool_name, args_json, result_json, error_text, agent_id)
-	VALUES ('delete', old.id, old.summary, old.tool_name, old.args_json, old.result_json, old.error_text, old.agent_id);
-END;
-
-CREATE TRIGGER IF NOT EXISTS events_au AFTER UPDATE ON events BEGIN
-	INSERT INTO events_fts(events_fts, rowid, summary, tool_name, args_json, result_json, error_text, agent_id)
-	VALUES ('delete', old.id, old.summary, old.tool_name, old.args_json, old.result_json, old.error_text, old.agent_id);
-	INSERT INTO events_fts(rowid, summary, tool_name, args_json, result_json, error_text, agent_id)
-	VALUES (new.id, new.summary, new.tool_name, new.args_json, new.result_json, new.error_text, new.agent_id);
-END;
 `
-	_, err := db.Exec(schema)
-	return err
+	if _, err := tx.Exec(ftsMigration); err != nil {
+		return err
+	}
+
+	// Backfill existing events into the compact standalone FTS5 index.
+	rows, err := tx.Query(`SELECT id, summary, tool_name, args_json, result_json, error_text, agent_id FROM events`)
+	if err != nil {
+		return err
+	}
+	type ftsRow struct {
+		id         int64
+		summary    string
+		toolName   string
+		argsJSON   string
+		resultJSON string
+		errorText  string
+		agentID    string
+	}
+	var existing []ftsRow
+	for rows.Next() {
+		var r ftsRow
+		if err := rows.Scan(&r.id, &r.summary, &r.toolName, &r.argsJSON, &r.resultJSON, &r.errorText, &r.agentID); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		existing = append(existing, r)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(existing) > 0 {
+		stmt, err := tx.Prepare(`INSERT INTO events_fts(rowid, summary, tool_name, args_json, result_json, error_text, agent_id) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+		if err != nil {
+			return err
+		}
+		for _, r := range existing {
+			if _, err := stmt.Exec(r.id, r.summary, r.toolName, ftsExcerpt(r.argsJSON), ftsExcerpt(r.resultJSON), r.errorText, r.agentID); err != nil {
+				_ = stmt.Close()
+				return err
+			}
+		}
+		_ = stmt.Close()
+	}
+	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d;", auditSchemaVer)); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	// Reclaim legacy FTS5 bloat and activate incremental auto_vacuum on existing disk DBs.
+	if onDisk && len(existing) > 0 {
+		var av int
+		_ = db.QueryRow(`PRAGMA auto_vacuum;`).Scan(&av)
+		if av != 2 {
+			_, _ = db.Exec(`PRAGMA auto_vacuum = INCREMENTAL;`)
+		}
+		_, _ = db.Exec(`VACUUM;`)
+		_, _ = db.Exec(`PRAGMA wal_checkpoint(TRUNCATE);`)
+	}
+	return nil
 }
 
 func normalizeIDs(sessionID, agentID, clientName, wire string) (string, string, string) {
@@ -283,11 +396,22 @@ func normalizeIDs(sessionID, agentID, clientName, wire string) (string, string, 
 	return sessionID, agentID, wire
 }
 
-func (s *Store) upsertSession(id, agentID, clientName, wire, title, status string, now int64, incTool, incErr int) (Session, error) {
+func (s *Store) hasSubscribers() bool {
+	s.subMu.Lock()
+	n := len(s.subscribers)
+	s.subMu.Unlock()
+	return n > 0
+}
+
+type sqlExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func upsertSessionExec(ex sqlExecer, id, agentID, clientName, wire, title, status string, now int64, incTool, incErr int) error {
 	if status == "" {
 		status = "active"
 	}
-	_, err := s.db.Exec(`
+	_, err := ex.Exec(`
 		INSERT INTO sessions (id, agent_id, client_name, wire, title, status, tool_count, error_count, started_at, last_seen_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
@@ -299,10 +423,15 @@ func (s *Store) upsertSession(id, agentID, clientName, wire, title, status strin
 			error_count = sessions.error_count + excluded.error_count,
 			last_seen_at = excluded.last_seen_at
 	`, id, agentID, clientName, wire, title, status, incTool, incErr, now, now)
-	if err != nil {
-		return Session{}, err
-	}
-	return s.getSession(id)
+	return err
+}
+
+func insertFTSEntry(ex sqlExecer, id int64, summary, toolName, argsJSON, resultJSON, errorText, agentID string) {
+	_, _ = ex.Exec(`DELETE FROM events_fts WHERE rowid = ?`, id)
+	_, _ = ex.Exec(`
+		INSERT INTO events_fts(rowid, summary, tool_name, args_json, result_json, error_text, agent_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, id, summary, toolName, ftsExcerpt(argsJSON), ftsExcerpt(resultJSON), errorText, agentID)
 }
 
 func normalizeSessionStatus(s Session, nowMS int64) Session {
@@ -342,31 +471,62 @@ func (s *Store) StartTool(in StartToolInput) (int64, string) {
 	args := RedactRaw(in.RawArgs)
 	summary := SummarizeTool(in.ToolName, in.RawArgs)
 
-	sess, err := s.upsertSession(sid, aid, in.ClientName, wire, "", "working", now, 1, 0)
+	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, sid
 	}
-	res, err := s.db.Exec(`
+	if err := upsertSessionExec(tx, sid, aid, in.ClientName, wire, "", "working", now, 1, 0); err != nil {
+		_ = tx.Rollback()
+		return 0, sid
+	}
+	res, err := tx.Exec(`
 		INSERT INTO events (session_id, agent_id, wire, kind, tool_name, summary, args_json, result_json, status, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 'running', ?)
 	`, sid, aid, wire, kind, in.ToolName, summary, args, now)
 	if err != nil {
+		_ = tx.Rollback()
 		return 0, sid
 	}
 	id, _ := res.LastInsertId()
-	ev := Event{
-		ID:        id,
-		SessionID: sid,
-		AgentID:   aid,
-		Wire:      wire,
-		Kind:      kind,
-		ToolName:  in.ToolName,
-		Summary:   summary,
-		ArgsJSON:  args,
-		Status:    "running",
-		CreatedAt: now,
+	if err := tx.Commit(); err != nil {
+		return 0, sid
 	}
-	s.broadcast(LivePacket{Type: "event", Event: &ev, Session: &sess})
+
+	s.inFlightMu.Lock()
+	if len(s.inFlight) >= 4096 {
+		clear(s.inFlight)
+	}
+	s.inFlight[id] = inFlightMeta{
+		sessionID: sid,
+		agentID:   aid,
+		wire:      wire,
+		kind:      kind,
+		toolName:  in.ToolName,
+		summary:   summary,
+		argsJSON:  args,
+		createdAt: now,
+	}
+	s.inFlightMu.Unlock()
+
+	if s.hasSubscribers() {
+		ev := Event{
+			ID:        id,
+			SessionID: sid,
+			AgentID:   aid,
+			Wire:      wire,
+			Kind:      kind,
+			ToolName:  in.ToolName,
+			Summary:   summary,
+			ArgsJSON:  args,
+			Status:    "running",
+			CreatedAt: now,
+		}
+		var sessPtr *Session
+		if sess, err := s.getSession(sid); err == nil {
+			sessPtr = &sess
+		}
+		s.broadcast(LivePacket{Type: "event", Event: &ev, Session: sessPtr})
+	}
 	return id, sid
 }
 
@@ -384,7 +544,7 @@ func (s *Store) FinishTool(eventID int64, sessionID string, in FinishToolInput) 
 	resultJSON := RedactAny(in.Result)
 	errText := in.ErrorText
 	if len(errText) > 4096 {
-		errText = errText[:4096] + "…"
+		errText = truncateUTF8(errText, 4096) + "…"
 	}
 	blobHash := ""
 	blobMIME := ""
@@ -395,39 +555,97 @@ func (s *Store) FinishTool(eventID int64, sessionID string, in FinishToolInput) 
 		}
 	}
 	finalSummary := strings.TrimSpace(in.FinalSummary)
-	var err error
-	if finalSummary != "" {
-		_, err = s.db.Exec(`
-			UPDATE events
-			SET status = ?, summary = ?, result_json = ?, image_blob = ?, image_mime = ?, error_text = ?, duration_ms = ?
-			WHERE id = ?
-		`, status, finalSummary, resultJSON, blobHash, blobMIME, errText, in.DurationMS, eventID)
-	} else {
-		_, err = s.db.Exec(`
-			UPDATE events
-			SET status = ?, result_json = ?, image_blob = ?, image_mime = ?, error_text = ?, duration_ms = ?
-			WHERE id = ?
-		`, status, resultJSON, blobHash, blobMIME, errText, in.DurationMS, eventID)
+
+	s.inFlightMu.Lock()
+	meta, hasMeta := s.inFlight[eventID]
+	if hasMeta {
+		delete(s.inFlight, eventID)
 	}
-	if err != nil {
-		return
-	}
+	s.inFlightMu.Unlock()
+
 	incErr := 0
 	sessStatus := "active"
 	if status == "error" {
 		incErr = 1
 		sessStatus = "error"
 	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return
+	}
+	if finalSummary != "" {
+		_, err = tx.Exec(`
+			UPDATE events
+			SET status = ?, summary = ?, result_json = ?, image_blob = ?, image_mime = ?, error_text = ?, duration_ms = ?
+			WHERE id = ?
+		`, status, finalSummary, resultJSON, blobHash, blobMIME, errText, in.DurationMS, eventID)
+	} else {
+		_, err = tx.Exec(`
+			UPDATE events
+			SET status = ?, result_json = ?, image_blob = ?, image_mime = ?, error_text = ?, duration_ms = ?
+			WHERE id = ?
+		`, status, resultJSON, blobHash, blobMIME, errText, in.DurationMS, eventID)
+	}
+	if err != nil {
+		_ = tx.Rollback()
+		return
+	}
 	if sessionID != "" {
-		_, _ = s.db.Exec(`
+		_, _ = tx.Exec(`
 			UPDATE sessions
-			SET status = ?, error_count = error_count + ?, last_seen_at = ?
+			SET status = CASE WHEN status IN ('done', 'closed') THEN status ELSE ? END,
+				error_count = error_count + ?,
+				last_seen_at = ?
 			WHERE id = ?
 		`, sessStatus, incErr, now, sessionID)
 	}
-	ev, err := s.getEvent(eventID)
-	if err != nil {
+	if hasMeta {
+		summary := meta.summary
+		if finalSummary != "" {
+			summary = finalSummary
+		}
+		insertFTSEntry(tx, eventID, summary, meta.toolName, meta.argsJSON, resultJSON, errText, meta.agentID)
+	}
+	if err := tx.Commit(); err != nil {
 		return
+	}
+	if !hasMeta {
+		if ev, err := s.getEvent(eventID); err == nil {
+			insertFTSEntry(s.db, ev.ID, ev.Summary, ev.ToolName, ev.ArgsJSON, ev.ResultJSON, ev.ErrorText, ev.AgentID)
+			if s.hasSubscribers() {
+				var sessPtr *Session
+				if sess, err := s.getSession(ev.SessionID); err == nil {
+					sessPtr = &sess
+				}
+				s.broadcast(LivePacket{Type: "event", Event: &ev, Session: sessPtr})
+			}
+		}
+		return
+	}
+	if !s.hasSubscribers() {
+		return
+	}
+	summary := meta.summary
+	if finalSummary != "" {
+		summary = finalSummary
+	}
+	ev := Event{
+		ID:         eventID,
+		SessionID:  meta.sessionID,
+		AgentID:    meta.agentID,
+		Wire:       meta.wire,
+		Kind:       meta.kind,
+		ToolName:   meta.toolName,
+		Summary:    summary,
+		ArgsJSON:   meta.argsJSON,
+		ResultJSON: resultJSON,
+		ImageBlob:  blobHash,
+		ImageMIME:  blobMIME,
+		Status:     status,
+		ErrorText:  errText,
+		DurationMS: in.DurationMS,
+		CreatedAt:  meta.createdAt,
 	}
 	var sessPtr *Session
 	if sess, err := s.getSession(ev.SessionID); err == nil {
@@ -445,35 +663,43 @@ func (s *Store) RecordNote(in NoteInput) (Event, error) {
 	sid, aid, wire := normalizeIDs(in.SessionID, in.AgentID, in.ClientName, in.Wire)
 	msg := strings.TrimSpace(in.Message)
 	if len(msg) > 4000 {
-		msg = msg[:4000] + "…"
+		msg = truncateUTF8(msg, 4000) + "…"
 	}
 	title := strings.TrimSpace(in.Title)
 	if len(title) > 160 {
-		title = title[:160]
+		title = truncateUTF8(title, 160)
 	}
 	st := strings.TrimSpace(in.Status)
 	if st == "" {
 		st = "working"
 	}
-	sess, err := s.upsertSession(sid, aid, in.ClientName, wire, title, st, now, 0, 0)
+	argsJSON := RedactAny(map[string]any{"title": title, "status": st, "message": msg})
+
+	tx, err := s.db.Begin()
 	if err != nil {
 		return Event{}, err
 	}
-	argsJSON := RedactAny(map[string]any{"title": title, "status": st, "message": msg})
-	res, err := s.db.Exec(`
+	if err := upsertSessionExec(tx, sid, aid, in.ClientName, wire, title, st, now, 0, 0); err != nil {
+		_ = tx.Rollback()
+		return Event{}, err
+	}
+	res, err := tx.Exec(`
 		INSERT INTO events (session_id, agent_id, wire, kind, tool_name, summary, args_json, result_json, status, created_at)
 		VALUES (?, ?, ?, 'note', 'session', ?, ?, '{}', ?, ?)
 	`, sid, aid, wire, msg, argsJSON, st, now)
 	if err != nil {
+		_ = tx.Rollback()
 		return Event{}, err
 	}
 	if st == "done" || st == "closed" {
-		_, _ = s.db.Exec(`UPDATE sessions SET ended_at = ? WHERE id = ?`, now, sid)
-		if updated, err := s.getSession(sid); err == nil {
-			sess = updated
-		}
+		_, _ = tx.Exec(`UPDATE sessions SET ended_at = ? WHERE id = ?`, now, sid)
 	}
 	id, _ := res.LastInsertId()
+	insertFTSEntry(tx, id, msg, "session", argsJSON, "{}", "", aid)
+	if err := tx.Commit(); err != nil {
+		return Event{}, err
+	}
+
 	ev := Event{
 		ID:        id,
 		SessionID: sid,
@@ -486,7 +712,13 @@ func (s *Store) RecordNote(in NoteInput) (Event, error) {
 		Status:    st,
 		CreatedAt: now,
 	}
-	s.broadcast(LivePacket{Type: "event", Event: &ev, Session: &sess})
+	if s.hasSubscribers() {
+		var sessPtr *Session
+		if sess, err := s.getSession(sid); err == nil {
+			sessPtr = &sess
+		}
+		s.broadcast(LivePacket{Type: "event", Event: &ev, Session: sessPtr})
+	}
 	return ev, nil
 }
 
@@ -500,31 +732,47 @@ func (s *Store) RecordSystem(kind, summary string, detail any) {
 	}
 	now := time.Now().UnixMilli()
 	sid := "system:daemon"
-	sess, err := s.upsertSession(sid, "lrmcp-daemon", "lrmcp", "system", "System Events", "active", now, 0, 0)
+	argsJSON := RedactAny(detail)
+
+	tx, err := s.db.Begin()
 	if err != nil {
 		return
 	}
-	argsJSON := RedactAny(detail)
-	res, err := s.db.Exec(`
+	if err := upsertSessionExec(tx, sid, "lrmcp-daemon", "lrmcp", "system", "System Events", "active", now, 0, 0); err != nil {
+		_ = tx.Rollback()
+		return
+	}
+	res, err := tx.Exec(`
 		INSERT INTO events (session_id, agent_id, wire, kind, tool_name, summary, args_json, result_json, status, created_at)
 		VALUES (?, 'lrmcp-daemon', 'system', ?, '', ?, ?, '{}', 'info', ?)
 	`, sid, kind, summary, argsJSON, now)
 	if err != nil {
+		_ = tx.Rollback()
 		return
 	}
 	id, _ := res.LastInsertId()
-	ev := Event{
-		ID:        id,
-		SessionID: sid,
-		AgentID:   "lrmcp-daemon",
-		Wire:      "system",
-		Kind:      kind,
-		Summary:   summary,
-		ArgsJSON:  argsJSON,
-		Status:    "info",
-		CreatedAt: now,
+	insertFTSEntry(tx, id, summary, "", argsJSON, "{}", "", "lrmcp-daemon")
+	if err := tx.Commit(); err != nil {
+		return
 	}
-	s.broadcast(LivePacket{Type: "event", Event: &ev, Session: &sess})
+	if s.hasSubscribers() {
+		ev := Event{
+			ID:        id,
+			SessionID: sid,
+			AgentID:   "lrmcp-daemon",
+			Wire:      "system",
+			Kind:      kind,
+			Summary:   summary,
+			ArgsJSON:  argsJSON,
+			Status:    "info",
+			CreatedAt: now,
+		}
+		var sessPtr *Session
+		if sess, err := s.getSession(sid); err == nil {
+			sessPtr = &sess
+		}
+		s.broadcast(LivePacket{Type: "event", Event: &ev, Session: sessPtr})
+	}
 }
 
 // GetEvent retrieves one complete audit event by its numeric ID.
@@ -749,8 +997,10 @@ func (s *Store) Stats() (Stats, error) {
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM events`).Scan(&st.Events)
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM events WHERE status = 'error'`).Scan(&st.Errors)
 	if s.dbPath != "" {
-		if info, err := os.Stat(s.dbPath); err == nil {
-			st.DBBytes = info.Size()
+		for _, suffix := range []string{"", "-wal", "-shm"} {
+			if info, err := os.Stat(s.dbPath + suffix); err == nil {
+				st.DBBytes += info.Size()
+			}
 		}
 	}
 	return st, nil
@@ -871,12 +1121,105 @@ func (s *Store) broadcast(pkt LivePacket) {
 	s.subMu.Unlock()
 }
 
-// Close closes subscribers and flushes SQLite cleanly.
+func (s *Store) pruneLoop() {
+	defer close(s.pruneDone)
+	// Run one quick pass shortly after startup to reap old events & orphan blobs.
+	select {
+	case <-time.After(2 * time.Second):
+		_, _, _ = s.Prune()
+	case <-s.stopPrune:
+		return
+	}
+	ticker := time.NewTicker(6 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			_, _, _ = s.Prune()
+		case <-s.stopPrune:
+			return
+		}
+	}
+}
+
+// Prune enforces event retention limits, compacts FTS5/freelist pages, and
+// garbage-collects unreferenced image blobs older than orphanBlobGrace.
+func (s *Store) Prune() (deletedEvents int64, deletedBlobs int, err error) {
+	if s == nil || s.db == nil {
+		return 0, 0, nil
+	}
+	cutoff := time.Now().Add(-maxEventAge).UnixMilli()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	res1, err := tx.Exec(`DELETE FROM events WHERE created_at < ?`, cutoff)
+	if err != nil {
+		_ = tx.Rollback()
+		return 0, 0, err
+	}
+	n1, _ := res1.RowsAffected()
+	res2, err := tx.Exec(`DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT ?)`, maxRetainedEvents)
+	if err != nil {
+		_ = tx.Rollback()
+		return 0, 0, err
+	}
+	n2, _ := res2.RowsAffected()
+	deletedEvents = n1 + n2
+	if deletedEvents > 0 {
+		_, _ = tx.Exec(`DELETE FROM events_fts WHERE rowid NOT IN (SELECT id FROM events)`)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	if deletedEvents > 0 && s.dbPath != "" {
+		_, _ = s.db.Exec(`PRAGMA incremental_vacuum(200);`)
+	}
+
+	// Garbage-collect orphaned image blobs on disk.
+	if s.blobDir != "" {
+		entries, readErr := os.ReadDir(s.blobDir)
+		if readErr == nil && len(entries) > 0 {
+			referenced := map[string]bool{}
+			rows, qErr := s.db.Query(`SELECT DISTINCT image_blob FROM events WHERE image_blob != ''`)
+			if qErr == nil {
+				for rows.Next() {
+					var h string
+					if rows.Scan(&h) == nil && h != "" {
+						referenced[h] = true
+					}
+				}
+				_ = rows.Close()
+				now := time.Now()
+				for _, entry := range entries {
+					if entry.IsDir() {
+						continue
+					}
+					name := entry.Name()
+					if !validBlobHash.MatchString(name) || referenced[name] {
+						continue
+					}
+					info, statErr := entry.Info()
+					if statErr == nil && now.Sub(info.ModTime()) < orphanBlobGrace {
+						continue
+					}
+					if os.Remove(filepath.Join(s.blobDir, name)) == nil {
+						deletedBlobs++
+					}
+				}
+			}
+		}
+	}
+	return deletedEvents, deletedBlobs, nil
+}
+
+// Close closes subscribers, stops background pruning, checkpoints WAL, and closes SQLite cleanly.
 func (s *Store) Close() error {
 	if s == nil {
 		return nil
 	}
 	s.subMu.Lock()
+	alreadyClosed := s.closed
 	if !s.closed {
 		s.closed = true
 		for ch := range s.subscribers {
@@ -885,7 +1228,15 @@ func (s *Store) Close() error {
 		}
 	}
 	s.subMu.Unlock()
+	if !alreadyClosed && s.stopPrune != nil {
+		close(s.stopPrune)
+		<-s.pruneDone
+	}
 	if s.db != nil {
+		if s.dbPath != "" {
+			_, _ = s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE);`)
+			_, _ = s.db.Exec(`PRAGMA optimize;`)
+		}
 		return s.db.Close()
 	}
 	return nil

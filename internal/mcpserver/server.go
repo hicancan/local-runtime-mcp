@@ -29,23 +29,23 @@ const instructions = `Local Runtime MCP (lrmcp) exposes this machine via 4 ortho
 const runToolDescription = `Execute async JavaScript in this session's persistent VM (top-level let/const/var/function persist across turns; bare final expressions auto-return in cell.value; parallelize with await Promise.allSettled([...]); call help(topic?) anytime for full docs). All SDK options use strict snake_case and fail fast on unknown fields.
 
 SDK signatures (all async unless noted):
-- proc.run(program, args?, { cwd?, env?, stdin?, keep_stdin_open?, timeout_seconds?, max_output_tokens?, yield_time_ms?, io_mode? })
-  or proc.run({ cmd, shell?: "pwsh"|"cmd"|"bash"|"sh", cwd?, env?, stdin?, timeout_seconds?, max_output_tokens?, yield_time_ms?, io_mode? })
-  -> { session_id?, program, cwd, exit_code, running, timed_out, duration_ms, stdout, stderr, output_cursor }
-- proc.continue({ session_id, output_cursor?, stdin?, close_stdin?, terminate?, yield_time_ms? }); proc.kill(session_id)
+- proc.run(program, args?, { cwd?, env?, stdin?, keep_stdin_open?, timeout_seconds?, max_output_bytes?, max_output_tokens?, yield_time_ms?, io_mode?, columns?, rows? })
+  or proc.run({ cmd, shell?: "pwsh"|"cmd"|"bash"|"sh", cwd?, env?, stdin?, keep_stdin_open?, timeout_seconds?, max_output_bytes?, max_output_tokens?, yield_time_ms?, io_mode?, columns?, rows? })
+  -> { session_id?, program, directory, exit_code, running, timed_out, duration_ms, stdout, stderr, output_cursor: { stdout, stderr } }
+- proc.continue({ session_id, output_cursor?, stdin?, close_stdin?, terminate?, yield_time_ms?, columns?, rows? }); proc.kill(session_id)
 - fs.list(path, { max_depth?, include_hidden?, max_entries? }?) -> { entries: [{ path, type, size?, modified_at }], truncated, skipped }
-- fs.stat(path, { with_sha256? }?) -> { path, type, size, modified_at, mime_type?, sha256? }
+- fs.stat(path, { with_sha256? }? | bool?) -> { path, type, size, modified_at, mime_type?, symlink_target?, sha256? }
 - fs.read(path, { start_line?, end_line?, line_count?, max_bytes?, with_sha256? }?) -> { path, content, size, start_line, end_line, next_line?, truncated, sha256? }
 - fs.write(path, content, { mode?: "create"|"replace", expected_sha256?, create_parents? }?) -> { path, bytes, created, sha256 }
 - fs.patch(path, [{ before?, old, new, after? }], expected_sha256) -> { path, bytes, hunks, sha256 }
-- fs.search(path, query, { regex?, case_sensitive?, include_hidden?, max_results? }?) -> { matches: [{ path, line, column, text }], truncated }
+- fs.search(path, query, { regex?, case_sensitive?, include_hidden?, max_results? }?) -> { matches: [{ path, line, column, text }], truncated, skipped }
 - browser.status() -> { connected, extension_connected, instances: [{ browser_id, label, state, cdp_url, connected, extension_version }] }
 - browser.connect(browser_id?); browser.tabs(browser_id? | { browser_id?, include_workers? }?) -> TabHandle[]
-- browser.open(url, { browser_id?, active?, session_name? }?) -> TabHandle; browser.tab(id) (sync); browser.cleanup()
-- browser.cdp(method, params?, browser_id?); browser.traceStart({ browser_id?, tab_id?, reload?, ignore_cache?, categories? }?); browser.traceStop(file_path?, browser_id?)
-- TabHandle (.id/.title/.url/.browser_id): .goto(url) | .reload() | .back() | .forward() | .close() | .markHandoff() (sync) | .snapshot({ diff?, max_elements?, max_text? }?) | .screenshot({ full_page?, clip_x?, clip_y?, clip_width?, clip_height? }?) | .eval(jsOrFn, ...args) | .cdp(method, params?) | .getByRole(role, nameOrOpts?)/.getByText/.getByLabel/.getByPlaceholder/.locator(css) -> .click()/.fill(t)/.type(t)/.press(k)/.select(o)/.check(b)/.uploadFiles(paths)/.waitFor({ timeout_ms? })/.nth(i) | .network({ resource_types?, url_contains?, failed_only?, limit? }?) | .networkBody(req_id) | .console({ levels?, limit? }?) | .emulate({ width?, height?, mobile?, cpu_throttling_rate?, network_preset?, color_scheme?, ... }) | .css(selectorOrLoc) | .heapSnapshot(path?) | .logpoint(url, line, expr, col?) | .screencastStart(opts?) | .screencastStop()
-- desktop.targets({ pid?, title?, process? }?) -> { displays, windows }; desktop.state(opts?); desktop.wait(opts); desktop.action(act); desktop.control("status"|"acquire"|"release", { control_id?, label? }?)
-- img.read(path, { max_width?, max_height?, crop_x?, crop_y?, crop_width?, crop_height? }?); emitImage(imgOrShotOrPath, label?) (sync)
+- browser.open(url, { browser_id?, active?, control_id?, session_name?, group? }?) -> TabHandle; browser.tab(id) (sync); browser.cleanup()
+- browser.cdp(method, params?, browser_id?); browser.traceStart({ browser_id?, tab_id?, reload?, ignore_cache?, categories? }?); browser.traceStop(file_path? | { file_path?, browser_id? }?, browser_id?)
+- TabHandle (.id/.title/.url/.browser_id): .goto(url) | .reload() | .back() | .forward() | .close() | .markHandoff() (sync) | .snapshot({ diff?, max_elements?, max_text? }?) | .screenshot({ full_page?, clip_x?, clip_y?, clip_width?, clip_height? }?) | .eval(jsOrFn, ...args) | .cdp(method, params?) | .getByRole(role, nameOrOpts?)/.getByText/.getByLabel/.getByPlaceholder/.locator(css) -> .click()/.fill(t)/.type(t)/.press(k)/.select(o)/.check(b)/.uploadFiles(paths)/.waitFor({ timeout_ms? })/.nth(i) | .network({ resource_types?, url_contains?, include_preserved?, failed_only?, limit? }?) | .networkBody(req_id) | .console({ levels?, limit? }?) | .emulate({ width?, height?, mobile?, cpu_throttling_rate?, network_preset?, color_scheme?, ... }) | .css(selectorOrLoc) | .heapSnapshot(path?) | .logpoint(url, line1Based, expr, col0Based?) | .screencastStart(opts?) | .screencastStop()
+- desktop.targets({ pid?, title?, process? }?) -> { displays, windows: [{ target_id, pid, process, title, bounds, state, active }] }; desktop.state({ target_id?, display_id?, control_id?, image?, elements?: "all"|"interactive"|"none", max_elements?, offset?, max_width?, max_height? }?); desktop.wait({ target_id, name?, role?, automation_id?, until?: "present"|"absent", timeout_ms?, image? }); desktop.action({ kind, control_id?, target_id?, state_id?, element_ref?, ... }); desktop.control("status"|"acquire"|"release", { control_id?, label? }?)
+- img.read(path, { max_bytes?, max_pixels?, max_width?, max_height?, crop_x?, crop_y?, crop_width?, crop_height? }?); emitImage(imgOrShotOrPath, label?) (sync)
 - caps.list() -> Capability[]; caps.call(name, args?, browser_id?, tab_id?); help(topic?) (sync); print(...); sleep(ms)`
 
 // ToolFilter reports whether a tool with the given name and side-effect hints
@@ -72,17 +72,19 @@ type Dependencies struct {
 type Managed struct {
 	Server *mcp.Server
 
-	mu         sync.Mutex
-	wire       string
-	readOnly   bool
-	filter     ToolFilter
-	registered map[string]string
-	static     []toolSpec
-	registry   *capability.Registry
-	runtime    *jsrt.Engine
+	mu          sync.Mutex
+	wire        string
+	readOnly    bool
+	filter      ToolFilter
+	registered  map[string]string
+	static      []toolSpec
+	registry    *capability.Registry
+	runtime     *jsrt.Engine
+	ownsRuntime bool
 
 	taskMu      sync.RWMutex
 	activeTasks map[string]string
+	taskOrder   []string
 }
 
 type toolSpec struct {
@@ -103,7 +105,9 @@ func NewManaged(deps Dependencies) *Managed {
 	)
 
 	engine := deps.Runtime
+	ownsRuntime := false
 	if engine == nil {
+		ownsRuntime = true
 		engine = jsrt.NewEngine(context.Background(), jsrt.Dependencies{
 			Process:      deps.Process,
 			Filesystem:   deps.Filesystem,
@@ -122,12 +126,13 @@ func NewManaged(deps Dependencies) *Managed {
 		registered:  map[string]string{},
 		registry:    deps.Capabilities,
 		runtime:     engine,
+		ownsRuntime: ownsRuntime,
 		activeTasks: map[string]string{},
 	}
 
 	static := []toolSpec{
 		runToolSpec(managed, deps.Wire),
-		waitToolSpec(managed),
+		waitToolSpec(managed, deps.Wire),
 		sessionToolSpec(managed, deps.Audit, deps.Wire),
 	}
 	if deps.Capabilities.Proposes() {
@@ -225,6 +230,7 @@ type runInput struct {
 	Title          string `json:"title" jsonschema:"required concise 4-16 word description of what this step is doing (shown live in lrmcp ui)"`
 	DoneTitle      string `json:"done_title,omitempty" jsonschema:"optional completed past-tense summary replacing title once finished"`
 	Code           string `json:"code" jsonschema:"async JavaScript executed in this session's persistent VM with proc, fs, browser, desktop, img, caps, emitImage, print, sleep"`
+	SessionID      string `json:"session_id,omitempty" jsonschema:"optional explicit task session_id returned by session(action='start')"`
 	YieldMS        int    `json:"yield_ms,omitempty" jsonschema:"milliseconds to wait before returning a running cell_id (1-60000; default 15000)"`
 	MaxOutputBytes int    `json:"max_output_bytes,omitempty" jsonschema:"maximum retained print/console output bytes (default 262144)"`
 }
@@ -258,7 +264,14 @@ func runToolSpec(m *Managed, defaultWire string) toolSpec {
 				if strings.TrimSpace(in.Code) == "" {
 					return nil, jsrt.CellResult{}, errors.New("code is required")
 				}
-				sid, _, _, _, _ := resolveCaller(ctx, m, req.Session, defaultWire, "")
+				sid, _, _, wire, _ := resolveCaller(ctx, m, req.Session, defaultWire, "")
+				if explicit := audit.SanitizeID(in.SessionID); explicit != "" {
+					if strings.Contains(explicit, ":") {
+						sid = explicit
+					} else {
+						sid = wire + ":" + explicit
+					}
+				}
 				res, err := m.runtime.Run(ctx, jsrt.RunOptions{
 					SessionID:      sid,
 					Title:          strings.TrimSpace(in.Title),
@@ -277,7 +290,14 @@ func runToolSpec(m *Managed, defaultWire string) toolSpec {
 	}
 }
 
-func waitToolSpec(m *Managed) toolSpec {
+// Close releases any JS runtime engine owned directly by this Managed server.
+func (m *Managed) Close() {
+	if m != nil && m.ownsRuntime && m.runtime != nil {
+		m.runtime.Close()
+	}
+}
+
+func waitToolSpec(m *Managed, defaultWire string) toolSpec {
 	waitTool := inputTool[waitInput](
 		tool(
 			"wait",
@@ -293,11 +313,16 @@ func waitToolSpec(m *Managed) toolSpec {
 		name:     "wait",
 		readOnly: true,
 		register: func(s *mcp.Server) {
-			mcp.AddTool(s, waitTool, func(ctx context.Context, _ *mcp.CallToolRequest, in waitInput) (*mcp.CallToolResult, jsrt.CellResult, error) {
+			mcp.AddTool(s, waitTool, func(ctx context.Context, req *mcp.CallToolRequest, in waitInput) (*mcp.CallToolResult, jsrt.CellResult, error) {
+				sid, _, _, _, _ := resolveCaller(ctx, m, req.Session, defaultWire, "")
+				meta := audit.CallMetaFromContext(ctx)
+				enforce := meta.Policy != nil || meta.ReadOnly
 				res, err := m.runtime.Wait(ctx, jsrt.WaitOptions{
-					CellID:    strings.TrimSpace(in.CellID),
-					YieldMS:   in.YieldMS,
-					Terminate: in.Terminate,
+					CellID:         strings.TrimSpace(in.CellID),
+					YieldMS:        in.YieldMS,
+					Terminate:      in.Terminate,
+					SessionID:      sid,
+					EnforceSession: enforce,
 				})
 				if err != nil {
 					return nil, res, err

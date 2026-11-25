@@ -119,8 +119,19 @@ func (s *Studio) MintBootstrapURL(localAddr string) (string, error) {
 			delete(s.codes, k)
 		}
 	}
-	if len(s.codes) >= maxActiveCodes {
-		s.codes = map[string]time.Time{}
+	for len(s.codes) >= maxActiveCodes {
+		var oldestKey string
+		var oldestExp time.Time
+		for k, exp := range s.codes {
+			if oldestKey == "" || exp.Before(oldestExp) {
+				oldestKey = k
+				oldestExp = exp
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		delete(s.codes, oldestKey)
 	}
 	s.codes[code] = now.Add(bootstrapTTL)
 	s.codeMu.Unlock()
@@ -167,7 +178,7 @@ func (s *Studio) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
 		(r.URL.Path == "/ui/favicon.svg" || r.URL.Path == "/favicon.svg" || r.URL.Path == "/favicon.ico") {
-		s.serveAsset(w, "favicon.svg")
+		s.serveAsset(w, r, "favicon.svg")
 		return
 	}
 
@@ -220,10 +231,10 @@ func (s *Studio) registerRoutes() {
 	})
 	s.mux.HandleFunc("GET /ui/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/ui/" {
-			s.serveAsset(w, strings.TrimPrefix(r.URL.Path, "/ui/"))
+			s.serveAsset(w, r, strings.TrimPrefix(r.URL.Path, "/ui/"))
 			return
 		}
-		s.serveAsset(w, "index.html")
+		s.serveAsset(w, r, "index.html")
 	})
 
 	s.mux.HandleFunc("GET /ui/api/status", func(w http.ResponseWriter, r *http.Request) {
@@ -429,9 +440,9 @@ func (s *Studio) registerRoutes() {
 	})
 }
 
-func (s *Studio) serveAsset(w http.ResponseWriter, name string) {
+func (s *Studio) serveAsset(w http.ResponseWriter, r *http.Request, name string) {
 	if strings.Contains(name, "..") || strings.ContainsAny(name, "\\\x00") {
-		http.NotFound(w, nil)
+		http.NotFound(w, r)
 		return
 	}
 	data, err := fs.ReadFile(s.assets, name)
@@ -467,7 +478,9 @@ func ServeSSE(w http.ResponseWriter, r *http.Request, store *audit.Store) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
-	_, _ = io.WriteString(w, ": connected\n\n")
+	if _, err := io.WriteString(w, ": connected\n\n"); err != nil {
+		return
+	}
 	flusher.Flush()
 
 	ch, unsub := store.Subscribe()
@@ -481,7 +494,9 @@ func ServeSSE(w http.ResponseWriter, r *http.Request, store *audit.Store) {
 		case <-r.Context().Done():
 			return
 		case <-ticker.C:
-			_, _ = io.WriteString(w, ": keepalive\n\n")
+			if _, err := io.WriteString(w, ": keepalive\n\n"); err != nil {
+				return
+			}
 			flusher.Flush()
 		case pkt, open := <-ch:
 			if !open {
@@ -491,7 +506,9 @@ func ServeSSE(w http.ResponseWriter, r *http.Request, store *audit.Store) {
 			if err != nil {
 				continue
 			}
-			_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", pkt.Type, b)
+			if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", pkt.Type, b); err != nil {
+				return
+			}
 			flusher.Flush()
 		}
 	}

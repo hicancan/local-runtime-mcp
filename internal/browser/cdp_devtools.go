@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -830,6 +831,14 @@ func (c *cdpClient) heapSnapshotTab(ctx context.Context, targetID, filePath stri
 	var total int64
 	var writeErr error
 
+	var unregisterOnce sync.Once
+	unregisterSink := func() {
+		unregisterOnce.Do(func() {
+			c.heapMu.Lock()
+			delete(c.heapSinks, ts.sessionID)
+			c.heapMu.Unlock()
+		})
+	}
 	c.heapMu.Lock()
 	c.heapSinks[ts.sessionID] = func(chunk string) {
 		if writeErr != nil {
@@ -842,17 +851,16 @@ func (c *cdpClient) heapSnapshotTab(ctx context.Context, targetID, filePath stri
 		}
 	}
 	c.heapMu.Unlock()
-	defer func() {
-		c.heapMu.Lock()
-		delete(c.heapSinks, ts.sessionID)
-		c.heapMu.Unlock()
-	}()
+	defer unregisterSink()
 
 	start := time.Now()
 	_ = c.Send(ctx, ts.sessionID, "HeapProfiler.enable", nil, nil)
-	if err := c.Send(ctx, ts.sessionID, "HeapProfiler.takeHeapSnapshot", map[string]any{"reportProgress": false}, nil); err != nil {
+	takeErr := c.Send(ctx, ts.sessionID, "HeapProfiler.takeHeapSnapshot", map[string]any{"reportProgress": false}, nil)
+	// Detach sink BEFORE flushing or closing the file so readLoop cannot concurrently write.
+	unregisterSink()
+	if takeErr != nil {
 		_ = f.Close()
-		return HeapSnapshotResult{}, err
+		return HeapSnapshotResult{}, takeErr
 	}
 	if writeErr != nil {
 		_ = f.Close()

@@ -827,7 +827,13 @@ func findExecutable(path string, environment []string) (string, error) {
 	}
 	for _, candidate := range candidates {
 		info, err := os.Stat(candidate)
-		if err == nil && info.Mode().IsRegular() && (runtime.GOOS == "windows" || info.Mode()&0o111 != 0) {
+		if err != nil || info.IsDir() {
+			continue
+		}
+		// On Windows, MSIX App Execution Aliases (e.g. wt.exe, winget.exe, python.exe)
+		// are reparse points where Mode().IsRegular() is false; match exec.LookPath by
+		// accepting any non-directory executable file.
+		if runtime.GOOS == "windows" || (info.Mode().IsRegular() && info.Mode()&0o111 != 0) {
 			return filepath.Abs(candidate)
 		}
 	}
@@ -842,31 +848,82 @@ func newSessionID() string {
 	return fmt.Sprintf("%d", time.Now().UnixNano())
 }
 
+// streamBuffer is a mutex-protected O(1) circular ring buffer retaining the
+// bounded tail of a process stream while preserving exact original byte offsets.
 type streamBuffer struct {
 	mu    sync.Mutex
-	data  []byte
+	buf   []byte
+	start int
+	size  int
 	limit int
 	total int64
 }
 
 func newStreamBuffer(limit int) *streamBuffer {
-	return &streamBuffer{data: make([]byte, 0, min(limit, 64*1024)), limit: limit}
+	initCap := min(limit, 64*1024)
+	if initCap < 0 {
+		initCap = 0
+	}
+	return &streamBuffer{buf: make([]byte, initCap), limit: limit}
 }
 
 func (b *streamBuffer) Write(data []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.total += int64(len(data))
-	if len(data) >= b.limit {
-		b.data = append(b.data[:0], data[len(data)-b.limit:]...)
-		return len(data), nil
+	n := len(data)
+	b.total += int64(n)
+	if n == 0 || b.limit <= 0 {
+		return n, nil
 	}
-	if overflow := len(b.data) + len(data) - b.limit; overflow > 0 {
-		copy(b.data, b.data[overflow:])
-		b.data = b.data[:len(b.data)-overflow]
+	if n >= b.limit {
+		if len(b.buf) < b.limit {
+			b.buf = make([]byte, b.limit)
+		}
+		copy(b.buf, data[n-b.limit:])
+		b.start = 0
+		b.size = b.limit
+		return n, nil
 	}
-	b.data = append(b.data, data...)
-	return len(data), nil
+	if b.size+n > len(b.buf) && len(b.buf) < b.limit {
+		newCap := min(b.limit, max(b.size+n, max(len(b.buf)*2, 4096)))
+		nb := make([]byte, newCap)
+		b.copyTo(nb, 0, b.size)
+		b.buf = nb
+		b.start = 0
+	}
+	capLen := len(b.buf)
+	wpos := (b.start + b.size) % capLen
+	first := min(n, capLen-wpos)
+	copy(b.buf[wpos:wpos+first], data[:first])
+	if first < n {
+		copy(b.buf[:n-first], data[first:])
+	}
+	if b.size+n > b.limit {
+		overflow := b.size + n - b.limit
+		b.start = (b.start + overflow) % capLen
+		b.size = b.limit
+	} else {
+		b.size += n
+	}
+	return n, nil
+}
+
+func (b *streamBuffer) byteAt(i int) byte {
+	return b.buf[(b.start+i)%len(b.buf)]
+}
+
+func (b *streamBuffer) copyTo(dst []byte, from, to int) {
+	count := to - from
+	if count <= 0 {
+		return
+	}
+	capLen := len(b.buf)
+	pos := (b.start + from) % capLen
+	first := min(count, capLen-pos)
+	copy(dst[:first], b.buf[pos:pos+first])
+	if first < count {
+		copy(dst[first:count], b.buf[:count-first])
+	}
 }
 
 func (b *streamBuffer) validateCursor(cursor int64) error {
@@ -893,25 +950,28 @@ func (b *streamBuffer) Read(cursor int64, complete bool) (value string, start, n
 	if err = b.checkCursor(cursor); err != nil {
 		return
 	}
-	head := b.total - int64(len(b.data))
+	head := b.total - int64(b.size)
 	index := int(max(cursor, head) - head)
 	// A bounded tail may begin in a rune whose leading byte was discarded.
 	// Explicit cursors can also point inside an otherwise retained rune.
-	if index < len(b.data) && !utf8.RuneStart(b.data[index]) {
+	if index < b.size && !utf8.RuneStart(b.byteAt(index)) {
 		leading := 0
 		if head > 0 {
-			for leading < len(b.data) && !utf8.RuneStart(b.data[leading]) {
+			for leading < b.size && !utf8.RuneStart(b.byteAt(leading)) {
 				leading++
 			}
 		}
 		if index < leading {
 			index = leading
 		} else {
+			var tmp [utf8.UTFMax]byte
 			for previous := max(0, index-utf8.UTFMax+1); previous < index; previous++ {
-				if !utf8.RuneStart(b.data[previous]) {
+				if !utf8.RuneStart(b.byteAt(previous)) {
 					continue
 				}
-				_, width := utf8.DecodeRune(b.data[previous:])
+				avail := min(utf8.UTFMax, b.size-previous)
+				b.copyTo(tmp[:avail], previous, previous+avail)
+				_, width := utf8.DecodeRune(tmp[:avail])
 				if width > 1 && previous+width > index {
 					index = previous + width
 					break
@@ -919,20 +979,29 @@ func (b *streamBuffer) Read(cursor int64, complete bool) (value string, start, n
 			}
 		}
 	}
-	end := len(b.data)
+	end := b.size
 	if !complete {
 		// FullRune distinguishes a valid unfinished prefix from invalid bytes,
 		// which keep the usual JSON replacement behavior instead of waiting.
+		var tmp [utf8.UTFMax]byte
 		for last := max(0, end-utf8.UTFMax+1); last < end; last++ {
-			if utf8.RuneStart(b.data[last]) && !utf8.FullRune(b.data[last:]) {
-				end = max(index, last)
-				break
+			if utf8.RuneStart(b.byteAt(last)) {
+				avail := end - last
+				b.copyTo(tmp[:avail], last, end)
+				if !utf8.FullRune(tmp[:avail]) {
+					end = max(index, last)
+					break
+				}
 			}
 		}
 	}
 	start, next = head+int64(index), head+int64(end)
 	truncated = cursor < start
-	value = string(b.data[index:end])
+	if end > index {
+		out := make([]byte, end-index)
+		b.copyTo(out, index, end)
+		value = string(out)
+	}
 	return
 }
 

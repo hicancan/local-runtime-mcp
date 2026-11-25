@@ -29,7 +29,7 @@ var helpTopics = map[string]string{
 - proc.run({ cmd, shell?, cwd?, env?, stdin?, keep_stdin_open?, timeout_seconds?, max_output_bytes?, max_output_tokens?, yield_time_ms?, io_mode?, columns?, rows? })
     cmd:     string (shell command line)
     shell?:  "pwsh" | "powershell" | "cmd" | "bash" | "sh" (default: pwsh on Windows, bash elsewhere)
-  Returns: { session_id?, program, cwd, exit_code, running, timed_out, duration_ms, stdout, stderr, stdout_truncated, stderr_truncated, output_cursor }
+  Returns: { session_id?, program, args, directory, exit_code, running, timed_out, duration_ms, stdout, stderr, stdout_truncated, stderr_truncated, output_cursor: { stdout, stderr } }
 - proc.continue({ session_id, output_cursor?, stdin?, close_stdin?, terminate?, yield_time_ms?, columns?, rows? })
 - proc.kill(session_id)
 
@@ -67,7 +67,7 @@ Example:
 - browser.tab(tab_id) -> synchronous TabHandle wrapper for a known tab ID
 - browser.cdp(method, params?, browser_id?) -> raw browser-root CDP command
 - browser.traceStart({ browser_id?, tab_id?, reload?, ignore_cache?, categories? }?) -> browser-process-level Tracing.start
-- browser.traceStop(file_path? | { file_path?, browser_id? }?, browser_id?) -> { file_path, bytes, duration_ms, event_count, web_vitals, long_tasks }
+- browser.traceStop(file_path? | { file_path?, browser_id? }?, browser_id?) -> { file_path, bytes, duration_ms, event_count, long_task_count, max_task_ms, ttfb_ms, fcp_ms, lcp_ms, dcl_ms, load_ms, cls, data_loss_occurred, metrics_source, top_categories }
 - browser.cleanup() -> closes all non-handed-off tabs opened in this session`,
 
 	"tab": `TabHandle methods (returned by browser.tabs() / browser.open() / browser.tab(id)):
@@ -93,8 +93,8 @@ DevTools:
 - tab.networkBody(request_id) -> { request_id, body, base64_encoded? }
 - tab.console({ levels?, limit? }?)
 - tab.emulate({ width?, height?, device_scale_factor?, mobile?, touch?, landscape?, clear_viewport?, cpu_throttling_rate?, network_preset?, color_scheme?, reduced_motion?, forced_colors?, user_agent?, geolocation?, extra_headers? })
-- tab.css(cssSelector | locatorObj) -> { selector, computed, matched_rules }
-- tab.heapSnapshot(file_path?) | tab.logpoint(url, line, expr, col?) | tab.screencastStart({ max_width?, max_height?, quality? }?) | tab.screencastStop()`,
+- tab.css(cssSelector | locatorObj) -> { selector, inline, matched, computed }
+- tab.heapSnapshot(file_path?) | tab.logpoint(url, line1Based, expr, col0Based?) | tab.screencastStart({ max_width?, max_height?, quality? }?) | tab.screencastStop()`,
 
 	"locator": `LocatorHandle methods (returned by tab.locator / getByRole / getByText / getByLabel / getByPlaceholder):
 - loc.click() | loc.doubleClick() | loc.hover()
@@ -104,19 +104,21 @@ DevTools:
 - loc.nth(index) -> returns narrowed LocatorHandle`,
 
 	"desktop": `desktop SDK (native Windows Rust WGC + UI Automation):
-- desktop.targets({ pid?, title?, process? }?) -> { displays, windows }
-- desktop.state({ control_id?, target_id?, display_id?, region?, image?, cursor?, elements?, name?, role?, automation_id?, max_elements?, max_width?, max_height? }?) -> pass to emitImage()
-- desktop.wait({ target_id?, display_id?, name?, role?, automation_id?, timeout_seconds?, image? })
-- desktop.action({ kind, control_id?, target_id?, element_ref?, x?, y?, to_x?, to_y?, button?, text?, key?, keys?, scroll_x?, scroll_y? })
+- desktop.targets({ pid?, title?, process? }?) -> { displays, windows: [{ target_id, pid, process, title, bounds, state, active }] }
+- desktop.state({ control_id?, target_id?, display_id?, region?, image?, cursor?, elements?: "all"|"interactive"|"none", name?, role?, automation_id?, max_elements?, offset?, max_width?, max_height? }?) -> pass to emitImage()
+- desktop.wait({ target_id, name?, automation_id?, role?, until?: "present"|"absent", timeout_ms?, image? })
+- desktop.action({ kind, control_id?, target_id?, state_id?, element_ref?, x?, y?, to_x?, to_y?, duration_ms?, button?, text?, key?, scroll_x?, scroll_y?, bounds?, show? })
+  Semantic kinds (no control_id): invoke, toggle, select, expand, collapse, set_value, scroll_into_view, scroll_by, place
+  Physical kinds (require control_id + state_id): click, double_click, move, drag, type_text, press_key, scroll (activate needs control_id + target_id)
 - desktop.control("status" | "acquire" | "release", { control_id?, label? }?)`,
 
 	"img": `img & emitImage:
 - img.read(path, { max_bytes?, max_pixels?, crop_x?, crop_y?, crop_width?, crop_height?, max_width?, max_height? }?)
-- emitImage(imgOrShotOrPath, label?) -> attaches native MCP ImageContent to this cell's result`,
+- emitImage(imgOrShotOrPath, label?) -> attaches native MCP ImageContent (returns { emitted: bool, ... })`,
 
 	"caps": `caps SDK (owner-approved site/app capabilities):
 - caps.list() -> Promise<CapabilityDefinition[]>
-- caps.call(name, args?, browser_id?, tab_id?) -> Promise<any>`,
+- caps.call(name, args?, browser_id?, tab_id?) -> Promise<any> (browser_id & tab_id required for webpage capabilities)`,
 
 	"utils": `Built-in helpers & Web globals:
 - print(...args) / console.log(...args) -> appends line to cell.output

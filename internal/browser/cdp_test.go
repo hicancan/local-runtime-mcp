@@ -399,3 +399,16 @@ func TestBrowserLevelCDPEngineFullSuite(t *testing.T) {
 	}
 	_ = http.StatusOK
 }
+
+func TestMyersLineDiffDetectsReorderAndNoOp(t *testing.T) {
+	// Identical lines -> no changes.
+	diff, added, removed := computeLineDiff([]string{"a", "b", "c"}, []string{"a", "b", "c"})
+	if added != 0 || removed != 0 || !strings.Contains(diff, "no AX text changes") {
+		t.Fatalf("expected no-op diff, got +%d/-%d %q", added, removed, diff)
+	}
+	// Pure reordering MUST be detected by Myers O(ND) diff (multiset bag diff would miss it).
+	diff, added, removed = computeLineDiff([]string{"a", "b", "c"}, []string{"c", "b", "a"})
+	if added == 0 || removed == 0 || !strings.Contains(diff, "[AX diff:") {
+		t.Fatalf("Myers diff missed line reordering: +%d/-%d %q", added, removed, diff)
+	}
+}

@@ -29,12 +29,13 @@ const (
 // it serves same-computer MCP clients (including stdio thin proxies), the
 // authenticated local admin control plane, and scoped local capability APIs.
 type LocalConfig struct {
-	Listen       string
-	Token        string
-	Version      string
-	Capabilities http.Handler
-	Admin        http.Handler
-	UI           http.Handler
+	Listen         string
+	Token          string
+	Version        string
+	Capabilities   http.Handler
+	Admin          http.Handler
+	UI             http.Handler
+	OnSessionClose func(sessionID string)
 }
 
 // LocalServer wraps the local-only loopback listener and exposes live attached
@@ -213,6 +214,9 @@ func NewLocalHTTP(localServer *mcp.Server, cfg LocalConfig) (*LocalServer, error
 				delete(attachConns, attachSID)
 				attachMu.Unlock()
 				_ = conn.Close()
+				if cfg.OnSessionClose != nil {
+					cfg.OnSessionClose(attachSID)
+				}
 			}()
 			sessionCtx := audit.WithCallMeta(attachCtx, audit.CallMeta{
 				Wire:      "local",
@@ -248,7 +252,7 @@ func NewLocalHTTP(localServer *mcp.Server, cfg LocalConfig) (*LocalServer, error
 		cancelAttach()
 		return nil, err
 	}
-	server.server.RegisterOnShutdown(func() {
+	closeAttach := func() {
 		cancelAttach()
 		attachMu.Lock()
 		for id, conn := range attachConns {
@@ -256,7 +260,9 @@ func NewLocalHTTP(localServer *mcp.Server, cfg LocalConfig) (*LocalServer, error
 			delete(attachConns, id)
 		}
 		attachMu.Unlock()
-	})
+	}
+	server.OnClose(closeAttach)
+	server.server.RegisterOnShutdown(closeAttach)
 	kickAttach := func(sessionID string) bool {
 		attachMu.Lock()
 		defer attachMu.Unlock()

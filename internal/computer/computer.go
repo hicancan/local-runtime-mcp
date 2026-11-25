@@ -62,9 +62,9 @@ type TargetsResult struct {
 }
 
 type StateOptions struct {
-	ControlID    string     `json:"control_id,omitempty" jsonschema:"control ID from computer_control acquire; only physical input needs it"`
-	TargetID     string     `json:"target_id,omitempty" jsonschema:"opaque window target ID from computer_targets; UI Automation elements are read only for a window"`
-	DisplayID    string     `json:"display_id,omitempty" jsonschema:"one display from computer_targets; omit both IDs for every display"`
+	ControlID    string     `json:"control_id,omitempty" jsonschema:"control ID from desktop.control('acquire'); only physical input needs it"`
+	TargetID     string     `json:"target_id,omitempty" jsonschema:"opaque window target ID from desktop.targets(); UI Automation elements are read only for a window"`
+	DisplayID    string     `json:"display_id,omitempty" jsonschema:"one display from desktop.targets(); omit both IDs for every display"`
 	Region       *Rectangle `json:"region,omitempty" jsonschema:"crop of the observed area, relative to its origin"`
 	Image        *bool      `json:"image,omitempty" jsonschema:"return pixels; defaults to true, false observes elements only"`
 	Cursor       bool       `json:"cursor,omitempty" jsonschema:"draw the pointer into the image; defaults to false"`
@@ -74,6 +74,8 @@ type StateOptions struct {
 	Role         string     `json:"role,omitempty" jsonschema:"only elements of this role, such as button, text, textbox, listitem"`
 	MaxElements  int        `json:"max_elements,omitempty" jsonschema:"elements per page from 1 to 5000; defaults to 300"`
 	Offset       int        `json:"offset,omitempty" jsonschema:"matching elements to skip, for the next page"`
+	MaxWidth     int        `json:"max_width,omitempty" jsonschema:"optional max encoded image width in pixels; preserves aspect ratio while keeping logical coordinates"`
+	MaxHeight    int        `json:"max_height,omitempty" jsonschema:"optional max encoded image height in pixels; preserves aspect ratio while keeping logical coordinates"`
 }
 
 type Element struct {
@@ -167,7 +169,7 @@ func Validate(action Action) error {
 		return validateSemantic(action)
 	}
 	if action.ControlID == "" {
-		return errors.New("control_id is required; acquire computer_control first")
+		return errors.New("control_id is required; acquire desktop.control(\"acquire\") first")
 	}
 	if action.Kind == "activate" {
 		if action.TargetID == "" {
@@ -179,7 +181,7 @@ func Validate(action Action) error {
 		return nil
 	}
 	if action.StateID == "" {
-		return errors.New("state_id is required; call computer_state immediately before acting")
+		return errors.New("state_id is required; call desktop.state({ control_id, ... }) immediately before acting")
 	}
 	switch action.Kind {
 	case "move":

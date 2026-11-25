@@ -2,25 +2,32 @@ package jsrt
 
 import (
 	"encoding/base64"
-	"fmt"
 	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf16"
 
 	"github.com/dop251/goja"
 )
 
 // installWebGlobals installs lightweight, zero-dependency standard JS/Web globals
-// (atob, btoa, setTimeout, clearTimeout, URL, URLSearchParams) onto the session VM.
+// (atob, btoa, setTimeout, clearTimeout, URL, URLSearchParams, Intl.DateTimeFormat) onto the session VM.
 func (v *sessionVM) installWebGlobals() {
-	// atob / btoa
+	// atob / btoa (WebIDL Latin-1 0x00..0xFF byte semantics)
 	_ = v.vm.Set("atob", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) == 0 {
 			panic(v.vm.NewTypeError("atob requires a base64 string"))
 		}
-		raw := strings.TrimSpace(call.Arguments[0].String())
+		raw := strings.Map(func(r rune) rune {
+			switch r {
+			case ' ', '\t', '\n', '\r', '\f':
+				return -1
+			default:
+				return r
+			}
+		}, call.Arguments[0].String())
 		b, err := base64.StdEncoding.DecodeString(raw)
 		if err != nil {
 			b, err = base64.RawStdEncoding.DecodeString(raw)
@@ -28,19 +35,41 @@ func (v *sessionVM) installWebGlobals() {
 				panic(v.vm.NewTypeError("atob: invalid base64 input: " + err.Error()))
 			}
 		}
-		return v.vm.ToValue(string(b))
+		runes := make([]rune, len(b))
+		for i, c := range b {
+			runes[i] = rune(c)
+		}
+		return v.vm.ToValue(string(runes))
 	})
 	_ = v.vm.Set("btoa", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) == 0 {
 			panic(v.vm.NewTypeError("btoa requires a string"))
 		}
-		return v.vm.ToValue(base64.StdEncoding.EncodeToString([]byte(call.Arguments[0].String())))
+		units := utf16.Encode([]rune(call.Arguments[0].String()))
+		raw := make([]byte, len(units))
+		for i, u := range units {
+			if u > 0xFF {
+				panic(v.vm.NewTypeError("btoa: string contains characters outside the Latin1 range (0x00-0xFF)"))
+			}
+			raw[i] = byte(u)
+		}
+		return v.vm.ToValue(base64.StdEncoding.EncodeToString(raw))
 	})
 
-	// setTimeout / clearTimeout bound to VM event loop & active cell lifetime.
+	// setTimeout / clearTimeout bound to VM event loop, active cell lifetime, and VM close().
 	var timerSeq atomic.Int64
 	var timerMu sync.Mutex
 	timers := map[int64]*time.Timer{}
+	v.mu.Lock()
+	v.stopTimersFn = func() {
+		timerMu.Lock()
+		for id, t := range timers {
+			t.Stop()
+			delete(timers, id)
+		}
+		timerMu.Unlock()
+	}
+	v.mu.Unlock()
 
 	_ = v.vm.Set("setTimeout", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) == 0 {
@@ -70,14 +99,16 @@ func (v *sessionVM) installWebGlobals() {
 			timerMu.Lock()
 			delete(timers, id)
 			timerMu.Unlock()
-			if cell != nil && cell.ctx.Err() != nil {
+			if v.ctx.Err() != nil || (cell != nil && cell.ctx.Err() != nil) {
 				return
 			}
 			v.post(func() {
 				prev := v.activeCell
 				v.activeCell = cell
 				defer func() { v.activeCell = prev }()
-				_, _ = fn(goja.Undefined(), extraArgs...)
+				if _, err := fn(goja.Undefined(), extraArgs...); err != nil && cell != nil {
+					cell.appendOutput("[setTimeout error] " + err.Error() + "\n")
+				}
 			})
 		})
 		timerMu.Lock()
@@ -124,12 +155,20 @@ func (v *sessionVM) installWebGlobals() {
 			}
 		}
 		proto := parsed.Scheme + ":"
-		origin := ""
-		if parsed.Host != "" {
+		hierarchical := parsed.Opaque == "" && (parsed.Host != "" || strings.HasPrefix(strings.ToLower(raw), parsed.Scheme+"://") || strings.EqualFold(parsed.Scheme, "file"))
+		origin := "null"
+		if hierarchical && parsed.Host != "" && (strings.EqualFold(parsed.Scheme, "http") || strings.EqualFold(parsed.Scheme, "https") || strings.EqualFold(parsed.Scheme, "ws") || strings.EqualFold(parsed.Scheme, "wss") || strings.EqualFold(parsed.Scheme, "ftp")) {
 			origin = proto + "//" + parsed.Host
 		}
+		username, password := "", ""
+		if parsed.User != nil {
+			username = parsed.User.Username()
+			password, _ = parsed.User.Password()
+		}
 		pathname := parsed.Path
-		if pathname == "" && parsed.Host != "" {
+		if parsed.Opaque != "" {
+			pathname = parsed.Opaque
+		} else if pathname == "" && hierarchical && parsed.Host != "" {
 			pathname = "/"
 		}
 		search := ""
@@ -141,15 +180,18 @@ func (v *sessionVM) installWebGlobals() {
 			hash = "#" + parsed.Fragment
 		}
 		return v.vm.ToValue(map[string]any{
-			"href":     fmt.Sprintf("%s//%s%s%s%s", proto, parsed.Host, pathname, search, hash),
-			"protocol": proto,
-			"origin":   origin,
-			"host":     parsed.Host,
-			"hostname": parsed.Hostname(),
-			"port":     parsed.Port(),
-			"pathname": pathname,
-			"search":   search,
-			"hash":     hash,
+			"href":         parsed.String(),
+			"protocol":     proto,
+			"origin":       origin,
+			"username":     username,
+			"password":     password,
+			"host":         parsed.Host,
+			"hostname":     parsed.Hostname(),
+			"port":         parsed.Port(),
+			"pathname":     pathname,
+			"search":       search,
+			"hash":         hash,
+			"hierarchical": hierarchical,
 		})
 	})
 
@@ -161,7 +203,9 @@ class URLSearchParams {
   constructor(init) {
     this._entries = [];
     if (!init) return;
-    if (typeof init === 'string') {
+    if (init instanceof URLSearchParams) {
+      for (const [k, val] of init._entries) this._entries.push([k, val]);
+    } else if (typeof init === 'string') {
       const s = init.startsWith('?') ? init.slice(1) : init;
       if (!s) return;
       for (const part of s.split('&')) {
@@ -212,11 +256,14 @@ class URL {
     const p = _parseURL(String(input), base === undefined ? undefined : String(base));
     this.protocol = p.protocol;
     this.origin = p.origin;
+    this.username = p.username;
+    this.password = p.password;
     this.host = p.host;
     this.hostname = p.hostname;
     this.port = p.port;
     this.pathname = p.pathname;
     this.hash = p.hash;
+    this._hierarchical = p.hierarchical;
     this.searchParams = new URLSearchParams(p.search);
   }
   get search() {
@@ -227,7 +274,11 @@ class URL {
     this.searchParams = new URLSearchParams(String(val || ''));
   }
   get href() {
-    return this.protocol + '//' + this.host + this.pathname + this.search + this.hash;
+    if (!this._hierarchical) {
+      return this.protocol + this.pathname + this.search + this.hash;
+    }
+    const auth = this.username ? (this.password ? encodeURIComponent(this.username) + ':' + encodeURIComponent(this.password) + '@' : encodeURIComponent(this.username) + '@') : '';
+    return this.protocol + '//' + auth + this.host + this.pathname + this.search + this.hash;
   }
   toString() { return this.href; }
   toJSON() { return this.href; }

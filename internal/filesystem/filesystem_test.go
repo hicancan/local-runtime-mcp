@@ -121,3 +121,46 @@ func TestListAndSearchAreBounded(t *testing.T) {
 		t.Fatalf("bounded search = %+v, %v", searched, err)
 	}
 }
+
+func TestListSkipDirSearchExactLimitMinifiedCapAndContext(t *testing.T) {
+	root := t.TempDir()
+	deepDir := filepath.Join(root, "sub", "deep")
+	if err := os.MkdirAll(deepDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(deepDir, "leaf.txt"), []byte("deep-needle\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// max_depth=1 lists immediate subdir "sub" without descending into "sub/deep".
+	listed, err := List(root, 1, false, 100)
+	if err != nil || len(listed.Entries) != 1 || listed.Entries[0].Type != "directory" {
+		t.Fatalf("List(max_depth=1) = %+v, %v", listed, err)
+	}
+
+	// Exact match count == maxResults must report Truncated=false.
+	exactFile := filepath.Join(root, "exact.txt")
+	if err := os.WriteFile(exactFile, []byte("Alpha one\nalpha two\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resExact, err := SearchText(exactFile, "alpha", false, false, false, 2)
+	if err != nil || len(resExact.Matches) != 2 || resExact.Truncated {
+		t.Fatalf("exact-limit search reported wrong truncation: %+v, %v", resExact, err)
+	}
+
+	// Minified single line must be truncated cleanly to maxMatchLineBytes (+ ellipsis).
+	minified := filepath.Join(root, "bundle.min.js")
+	if err := os.WriteFile(minified, []byte("var x=1;"+strings.Repeat("a", 10_000)+"targetToken"+strings.Repeat("b", 10_000)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resMin, err := SearchText(minified, "targetToken", false, true, false, 5)
+	if err != nil || len(resMin.Matches) != 1 || len(resMin.Matches[0].Text) > maxMatchLineBytes+8 {
+		t.Fatalf("minified match line was not capped: len=%d err=%v", len(resMin.Matches[0].Text), err)
+	}
+
+	// Canceled context must abort SearchTextContext immediately.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := SearchTextContext(ctx, root, "alpha", false, false, false, 10); err == nil {
+		t.Fatal("SearchTextContext ignored canceled context")
+	}
+}

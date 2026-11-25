@@ -5,9 +5,11 @@ package computer
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"embed"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -255,7 +257,10 @@ func (c *workerController) write(request workerRequest) error {
 	if stdin == nil {
 		return errors.New("Rust computer worker disconnected")
 	}
-	_, err = stdin.Write(append(header[:], data...))
+	if _, err = stdin.Write(header[:]); err != nil {
+		return err
+	}
+	_, err = stdin.Write(data)
 	return err
 }
 func (c *workerController) start(ctx context.Context) error {
@@ -266,40 +271,27 @@ func (c *workerController) start(ctx context.Context) error {
 			c.lifecycleMu.Unlock()
 		}
 	}()
-	directory, err := os.MkdirTemp("", "local-runtime-mcp-computer-")
+	path, err := ensureCachedWorkerBinary()
 	if err != nil {
-		return err
-	}
-	data, err := workerExecutable.ReadFile("worker_windows_amd64.exe")
-	if err != nil {
-		_ = os.RemoveAll(directory)
-		return err
-	}
-	path := filepath.Join(directory, "computer-worker.exe")
-	if err := os.WriteFile(path, data, 0o700); err != nil {
-		_ = os.RemoveAll(directory)
 		return err
 	}
 	cmd := exec.CommandContext(c.ctx, path)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windows.CREATE_NO_WINDOW}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		_ = os.RemoveAll(directory)
 		return err
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		_ = stdin.Close()
-		_ = os.RemoveAll(directory)
 		return err
 	}
 	if err := cmd.Start(); err != nil {
-		_ = os.RemoveAll(directory)
 		return err
 	}
 	done := make(chan struct{})
 	c.mu.Lock()
-	c.cmd, c.stdin, c.directory, c.done = cmd, stdin, directory, done
+	c.cmd, c.stdin, c.directory, c.done = cmd, stdin, "", done
 	c.mu.Unlock()
 	c.lifecycleMu.Unlock()
 	locked = false
@@ -319,6 +311,46 @@ func (c *workerController) start(ctx context.Context) error {
 		return fmt.Errorf("Rust computer worker identity mismatch: version=%q backend=%q", hello.Version, hello.Backend)
 	}
 	return nil
+}
+
+// ensureCachedWorkerBinary materializes the embedded Rust worker once per content hash
+// instead of creating a fresh random temp directory (and triggering antivirus rescans) on every start.
+func ensureCachedWorkerBinary() (string, error) {
+	data, err := workerExecutable.ReadFile("worker_windows_amd64.exe")
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	cacheDir := filepath.Join(os.TempDir(), "local-runtime-mcp-worker")
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		return "", err
+	}
+	target := filepath.Join(cacheDir, "computer-worker-"+hex.EncodeToString(sum[:8])+".exe")
+	if info, err := os.Stat(target); err == nil && info.Size() == int64(len(data)) {
+		return target, nil
+	}
+	tmp, err := os.CreateTemp(cacheDir, "worker-*.tmp")
+	if err != nil {
+		return "", err
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", err
+	}
+	if err := os.Rename(tmpPath, target); err != nil {
+		_ = os.Remove(tmpPath)
+		if info, statErr := os.Stat(target); statErr == nil && info.Size() == int64(len(data)) {
+			return target, nil
+		}
+		return "", err
+	}
+	return target, nil
 }
 func (c *workerController) read(reader *bufio.Reader, cmd *exec.Cmd) {
 	for {

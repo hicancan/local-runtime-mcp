@@ -649,3 +649,89 @@ func TestTabEvalScriptOrFunctionSerialization(t *testing.T) {
 		}
 	}
 }
+
+func TestClosureSyncHoistingArrowNewWebGlobalsAndInterrupt(t *testing.T) {
+	eng := NewEngine(context.Background(), Dependencies{})
+	defer eng.Close()
+
+	// Turn 1: let mutated in try/catch + early return + hoisted function + nested var + arrow `() => new Date()`
+	r1, err := eng.Run(context.Background(), RunOptions{
+		SessionID: "v184-sync",
+		Title:     "turn1 closure sync",
+		Code: `
+			let flag = false;
+			if (true) { var blockVar = "hoisted-ok"; }
+			try { throw new Error("boom"); } catch { flag = true; }
+			const mkDate = () => new Date(1700000000000);
+			if (flag) { return { early: true, ms: mkDate().getTime(), fnRes: laterFn(21) }; }
+			function laterFn(x) { return x * 2; }
+		`,
+	})
+	if err != nil || r1.Status != "done" {
+		t.Fatalf("turn1 failed: status=%s err=%s goErr=%v", r1.Status, r1.Error, err)
+	}
+	m1, _ := r1.Value.(map[string]any)
+	if m1["early"] != true || m1["ms"] != float64(1700000000000) || m1["fnRes"] != float64(42) {
+		t.Fatalf("turn1 unexpected value: %#v", m1)
+	}
+
+	// Turn 2: verify flag (mutated before early return), blockVar, mkDate, laterFn ALL persisted!
+	r2, err := eng.Run(context.Background(), RunOptions{
+		SessionID: "v184-sync",
+		Title:     "turn2 verify persistence and web globals",
+		Code: `
+			const mail = new URL("mailto:user@example.com");
+			const auth = new URL("https://alice:pw@example.com:8443/p?a=1");
+			const usp1 = new URLSearchParams("x=1&y=2");
+			const usp2 = new URLSearchParams(usp1);
+			const b64 = btoa("\u00e9");
+			const dec = atob(b64);
+			({
+				flag,
+				blockVar,
+				fnRes: laterFn(5),
+				mkMs: mkDate().getTime(),
+				mailProto: mail.protocol,
+				mailPath: mail.pathname,
+				authUser: auth.username,
+				authPass: auth.password,
+				usp2: usp2.toString(),
+				latin1OK: dec === "\u00e9" && b64 === "6Q==",
+			})
+		`,
+	})
+	if err != nil || r2.Status != "done" {
+		t.Fatalf("turn2 failed: status=%s err=%s goErr=%v", r2.Status, r2.Error, err)
+	}
+	m2, _ := r2.Value.(map[string]any)
+	if m2["flag"] != true || m2["blockVar"] != "hoisted-ok" || m2["fnRes"] != float64(10) ||
+		m2["mkMs"] != float64(1700000000000) || m2["mailProto"] != "mailto:" || m2["mailPath"] != "user@example.com" ||
+		m2["authUser"] != "alice" || m2["authPass"] != "pw" || m2["usp2"] != "x=1&y=2" || m2["latin1OK"] != true {
+		t.Fatalf("turn2 persistence/webglobals mismatch: %#v", m2)
+	}
+
+	// Turn 3: synchronous infinite loop MUST be interruptible by Wait(Terminate: true) without hanging VM.
+	r3, err := eng.Run(context.Background(), RunOptions{
+		SessionID: "v184-sync",
+		Title:     "infinite loop",
+		YieldMS:   50,
+		Code:      `while (true) {}`,
+	})
+	if err != nil || r3.Status != "running" {
+		t.Fatalf("expected running infinite loop cell, got %+v err=%v", r3, err)
+	}
+	term, err := eng.Wait(context.Background(), WaitOptions{CellID: r3.CellID, Terminate: true})
+	if err != nil || term.Status != "canceled" {
+		t.Fatalf("expected canceled infinite loop, got %+v err=%v", term, err)
+	}
+	// VM MUST still execute Turn 4 cleanly after ClearInterrupt!
+	r4, err := eng.Run(context.Background(), RunOptions{
+		SessionID: "v184-sync",
+		Title:     "post-interrupt recovery",
+		YieldMS:   2000,
+		Code:      `flag ? "recovered" : "lost"`,
+	})
+	if err != nil || r4.Status != "done" || r4.Value != "recovered" {
+		t.Fatalf("VM did not recover cleanly after interrupt: %+v err=%v", r4, err)
+	}
+}

@@ -5,11 +5,14 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	_ "time/tzdata"
 
 	"github.com/dop251/goja"
 )
+
+var tzLocationCache sync.Map // map[string]*time.Location
 
 type intlDateTimeConfig struct {
 	Locale                 string
@@ -490,10 +493,14 @@ func resolveTimeZone(tz string) (*time.Location, string, error) {
 	if loc, canon, ok := parseFixedOffsetZone(tz); ok {
 		return loc, canon, nil
 	}
+	if cached, ok := tzLocationCache.Load(tz); ok {
+		return cached.(*time.Location), tz, nil
+	}
 	loc, err := time.LoadLocation(tz)
 	if err != nil {
 		return nil, "", fmt.Errorf("Invalid time zone specified: %s", tz)
 	}
+	tzLocationCache.Store(tz, loc)
 	return loc, tz, nil
 }
 

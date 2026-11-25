@@ -14,19 +14,23 @@ import (
 	"github.com/hicancan/local-runtime-mcp/internal/audit"
 )
 
+var sharedLoopbackTransport = &http.Transport{
+	Proxy: nil,
+	DialContext: (&net.Dialer{
+		Timeout:   2 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+	MaxIdleConns:        16,
+	MaxIdleConnsPerHost: 16,
+	IdleConnTimeout:     60 * time.Second,
+}
+
 // loopbackClient returns an HTTP client that connects directly to loopback
-// without inheriting any system HTTP proxy.
+// without inheriting any system HTTP proxy, reusing pooled loopback sockets.
 func loopbackClient(token string, timeout time.Duration) *http.Client {
-	base := &http.Transport{
-		Proxy: nil,
-		DialContext: (&net.Dialer{
-			Timeout:   2 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-	}
 	return &http.Client{
 		Timeout:   timeout,
-		Transport: localBearerRoundTripper{base: base, token: token},
+		Transport: localBearerRoundTripper{base: sharedLoopbackTransport, token: token},
 	}
 }
 

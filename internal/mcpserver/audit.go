@@ -63,10 +63,17 @@ func (m *Managed) setActiveTask(baseKey, taskSID string) {
 	if m.activeTasks == nil {
 		m.activeTasks = map[string]string{}
 	}
-	if len(m.activeTasks) > 256 {
-		m.activeTasks = map[string]string{}
+	if _, exists := m.activeTasks[baseKey]; !exists {
+		m.taskOrder = append(m.taskOrder, baseKey)
 	}
 	m.activeTasks[baseKey] = taskSID
+	for len(m.activeTasks) > 256 && len(m.taskOrder) > 0 {
+		oldest := m.taskOrder[0]
+		m.taskOrder = m.taskOrder[1:]
+		if oldest != baseKey {
+			delete(m.activeTasks, oldest)
+		}
+	}
 	m.taskMu.Unlock()
 }
 
@@ -80,6 +87,15 @@ func (m *Managed) clearActiveTask(keyOrTaskSID string) {
 		if v == keyOrTaskSID {
 			delete(m.activeTasks, k)
 		}
+	}
+	if len(m.taskOrder) > 0 {
+		kept := m.taskOrder[:0]
+		for _, k := range m.taskOrder {
+			if _, ok := m.activeTasks[k]; ok {
+				kept = append(kept, k)
+			}
+		}
+		m.taskOrder = kept
 	}
 	m.taskMu.Unlock()
 }
@@ -119,7 +135,7 @@ func sessionToolSpec(m *Managed, store *audit.Store, defaultWire string) toolSpe
 					} else {
 						sid = wire + ":" + explicitSID
 					}
-					if baseKey != "" {
+					if baseKey != "" && action != "done" {
 						m.setActiveTask(baseKey, sid)
 					}
 				} else if action == "start" {
@@ -149,6 +165,10 @@ func sessionToolSpec(m *Managed, store *audit.Store, defaultWire string) toolSpe
 
 				var closedTabs *int
 				if action == "done" {
+					m.clearActiveTask(sid)
+					if baseKey != "" {
+						m.clearActiveTask(baseKey)
+					}
 					n := 0
 					if m.runtime != nil {
 						n = m.runtime.CloseSession(ctx, sid)
@@ -310,14 +330,22 @@ func (m *Managed) installMiddleware(store *audit.Store, defaultWire string) {
 				return next(ctx, method, req)
 			}
 
-			// Extract optional done_title for dual-state doing -> done summary flipping on `run`.
+			// Extract optional done_title and explicit session_id for accurate audit attribution on `run`.
 			var doneTitle string
 			if toolName == "run" && len(rawParams.Arguments) > 0 {
 				var peek struct {
 					DoneTitle string `json:"done_title"`
+					SessionID string `json:"session_id"`
 				}
 				if json.Unmarshal(rawParams.Arguments, &peek) == nil {
 					doneTitle = strings.TrimSpace(peek.DoneTitle)
+					if explicit := audit.SanitizeID(peek.SessionID); explicit != "" {
+						if strings.Contains(explicit, ":") {
+							sid = explicit
+						} else {
+							sid = wire + ":" + explicit
+						}
+					}
 				}
 			}
 
@@ -437,6 +465,22 @@ func (m *Managed) ActiveSessions() []ActiveMCPSession {
 		out = append(out, ActiveMCPSession{ID: id, ClientName: clientName, Wire: m.wire})
 	}
 	return out
+}
+
+// CleanupSession releases the JS VM, temporary browser tabs, and active task mapping
+// associated with sessionID when a local client disconnects (without kicking other peers).
+func (m *Managed) CleanupSession(sessionID string) {
+	if m == nil || sessionID == "" {
+		return
+	}
+	taskSID := m.getActiveTask(sessionID)
+	m.clearActiveTask(sessionID)
+	if m.runtime != nil {
+		m.runtime.CloseSession(context.Background(), sessionID)
+		if taskSID != "" && taskSID != sessionID {
+			m.runtime.CloseSession(context.Background(), taskSID)
+		}
+	}
 }
 
 // CloseSession closes an active MCP session matching sessionID and releases its stateful JS VM.

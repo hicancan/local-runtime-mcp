@@ -148,10 +148,14 @@ func (e *Engine) getOrCreateVM(sessionID string) (*sessionVM, error) {
 		return vm, nil
 	}
 	if len(e.sessions) >= maxLiveSessions {
-		// Evict oldest idle session.
+		// Evict oldest IDLE session only; never kill an active running cell mid-flight.
+		now := time.Now()
 		var oldestID string
 		var oldestTime time.Time
 		for sid, vm := range e.sessions {
+			if !vm.isIdle(now, 0) {
+				continue
+			}
 			t := vm.lastUsedTime()
 			if oldestID == "" || t.Before(oldestTime) {
 				oldestID = sid
@@ -222,7 +226,7 @@ func (e *Engine) Wait(ctx context.Context, opts WaitOptions) (CellResult, error)
 	e.mu.Lock()
 	entry := e.cells[opts.CellID]
 	e.mu.Unlock()
-	if entry == nil {
+	if entry == nil || (opts.EnforceSession && opts.SessionID != "" && entry.cell.sessionID != opts.SessionID) {
 		return CellResult{}, fmt.Errorf("cell %q was not found or has expired", opts.CellID)
 	}
 	cell := entry.cell
@@ -230,6 +234,7 @@ func (e *Engine) Wait(ctx context.Context, opts WaitOptions) (CellResult, error)
 
 	if opts.Terminate {
 		cell.finish("canceled", nil, "terminated by caller")
+		entry.vm.interruptIfRunning(cell)
 		return cell.snapshot(true), nil
 	}
 
@@ -275,10 +280,12 @@ type sessionVM struct {
 	tasks  chan func()
 	done   chan struct{}
 
-	mu          sync.Mutex
-	closed      bool
-	lastUsed    time.Time
-	activeCells int
+	mu           sync.Mutex
+	closed       bool
+	lastUsed     time.Time
+	activeCells  int
+	runningCell  *cellRun
+	stopTimersFn func()
 }
 
 func newSessionVM(parent context.Context, sessionID string, deps Dependencies) *sessionVM {
@@ -329,10 +336,23 @@ func (v *sessionVM) close() {
 		return
 	}
 	v.closed = true
+	stopTimers := v.stopTimersFn
 	v.mu.Unlock()
+	if stopTimers != nil {
+		stopTimers()
+	}
 	v.cancel()
 	v.vm.Interrupt("session closed")
 	<-v.done
+}
+
+func (v *sessionVM) interruptIfRunning(cell *cellRun) {
+	v.mu.Lock()
+	running := !v.closed && v.runningCell == cell
+	v.mu.Unlock()
+	if running {
+		v.vm.Interrupt("cell terminated")
+	}
 }
 
 func (v *sessionVM) post(fn func()) bool {
@@ -351,7 +371,14 @@ func (v *sessionVM) loop() {
 		case fn := <-v.tasks:
 			if fn != nil {
 				func() {
-					defer func() { _ = recover() }()
+					defer func() {
+						if r := recover(); r != nil {
+							v.vm.ClearInterrupt()
+							if c := v.activeCell; c != nil {
+								c.finish("error", nil, fmt.Sprintf("runtime panic: %v", r))
+							}
+						}
+					}()
 					fn()
 				}()
 			}
@@ -376,24 +403,48 @@ func (v *sessionVM) startCell(cell *cellRun, code string) error {
 	v.lastUsed = time.Now()
 	v.mu.Unlock()
 
+	var decOnce sync.Once
 	decActive := func() {
-		v.mu.Lock()
-		if v.activeCells > 0 {
-			v.activeCells--
-		}
-		v.lastUsed = time.Now()
-		v.mu.Unlock()
+		decOnce.Do(func() {
+			v.mu.Lock()
+			if v.activeCells > 0 {
+				v.activeCells--
+			}
+			v.lastUsed = time.Now()
+			v.mu.Unlock()
+		})
 	}
+	// Guarantee activeCells decrements even when a cell is terminated while awaiting
+	// a never-resolving Promise, so idle VMs can always be reaped cleanly.
+	go func() {
+		<-cell.done
+		decActive()
+	}()
 
 	ok := v.post(func() {
 		prev := v.activeCell
 		v.activeCell = cell
-		defer func() { v.activeCell = prev }()
+		v.mu.Lock()
+		v.runningCell = cell
+		v.mu.Unlock()
+		defer func() {
+			v.activeCell = prev
+			v.mu.Lock()
+			if v.runningCell == cell {
+				v.runningCell = nil
+			}
+			v.mu.Unlock()
+			v.vm.ClearInterrupt()
+		}()
 
 		val, runErr := v.vm.RunProgram(prog)
 		if runErr != nil {
 			decActive()
-			cell.finish("error", nil, runErr.Error())
+			if cell.ctx.Err() != nil {
+				cell.finish("canceled", nil, "terminated by caller")
+			} else {
+				cell.finish("error", nil, runErr.Error())
+			}
 			return
 		}
 		fn, callable := goja.AssertFunction(val)
@@ -405,7 +456,11 @@ func (v *sessionVM) startCell(cell *cellRun, code string) error {
 		res, callErr := fn(goja.Undefined())
 		if callErr != nil {
 			decActive()
-			cell.finish("error", nil, callErr.Error())
+			if cell.ctx.Err() != nil {
+				cell.finish("canceled", nil, "terminated by caller")
+			} else {
+				cell.finish("error", nil, callErr.Error())
+			}
 			return
 		}
 

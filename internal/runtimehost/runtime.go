@@ -62,6 +62,7 @@ type Host struct {
 	processes         *runtimeprocess.Manager
 	registry          *capability.Registry
 	grants            *grantStore
+	machine           *machineTools
 	localCapabilities http.Handler
 	startedAt         time.Time
 	cancel            context.CancelFunc
@@ -183,12 +184,18 @@ func Start(ctx context.Context, cfg *config.Config) (*Host, error) {
 	machineDeps.LocalApps = false
 	machineServer := mcpserver.New(machineDeps)
 	machine, err := connectMachineTools(ctx, machineServer)
-	if err != nil {
+	cleanupOnErr := func() {
 		cancel()
+		machine.close()
 		remoteRT.Close()
 		localRT.Close()
 		_ = bridge.Close(context.Background())
+		_ = controller.Close()
+		_ = processes.Close()
 		_ = auditStore.Close()
+	}
+	if err != nil {
+		cleanupOnErr()
 		return nil, err
 	}
 	grants := newGrantStore(cfg.Grants.Web, cfg.Grants.Remote, cfg.Path, registry, machine, controller, auditStore, func(target string, rg config.RemoteGrant) {
@@ -200,28 +207,20 @@ func Start(ctx context.Context, cfg *config.Config) (*Host, error) {
 		}
 	})
 	if err := grants.checkAll(grants.bySite); err != nil {
-		cancel()
-		_ = bridge.Close(context.Background())
-		_ = auditStore.Close()
+		cleanupOnErr()
 		return nil, err
 	}
 	if err := grants.checkRemote(cfg.Grants.Remote.OpenAI); err != nil {
-		cancel()
-		_ = bridge.Close(context.Background())
-		_ = auditStore.Close()
+		cleanupOnErr()
 		return nil, err
 	}
 	if err := grants.checkRemote(cfg.Grants.Remote.HTTP); err != nil {
-		cancel()
-		_ = bridge.Close(context.Background())
-		_ = auditStore.Close()
+		cleanupOnErr()
 		return nil, err
 	}
 	for _, rt := range cfg.Grants.Remote.Tokens {
 		if err := grants.checkRemote(config.RemoteGrant{ReadOnly: rt.ReadOnly, Tools: rt.Tools}); err != nil {
-			cancel()
-			_ = bridge.Close(context.Background())
-			_ = auditStore.Close()
+			cleanupOnErr()
 			return nil, err
 		}
 	}
@@ -239,6 +238,7 @@ func Start(ctx context.Context, cfg *config.Config) (*Host, error) {
 		processes:         processes,
 		registry:          registry,
 		grants:            grants,
+		machine:           machine,
 		localCapabilities: localCapabilities,
 		startedAt:         time.Now(),
 		cancel:            cancel,
@@ -370,9 +370,18 @@ func (h *Host) ConnectBrowser(ctx context.Context, browserID string) (browser.In
 	return h.bridge.Connect(ctx, browserID)
 }
 
+// CleanupLocalSession releases a disconnected local stdio session's VM,
+// temporary browser tabs, and active task mapping cleanly.
+func (h *Host) CleanupLocalSession(sessionID string) {
+	if h != nil && h.localServer != nil {
+		h.localServer.CleanupSession(sessionID)
+	}
+}
+
 func (h *Host) Close(ctx context.Context) error {
 	h.closeOnce.Do(func() {
 		h.cancel()
+		h.machine.close()
 		if h.remoteRuntime != nil {
 			h.remoteRuntime.Close()
 		}

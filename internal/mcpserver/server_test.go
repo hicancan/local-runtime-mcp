@@ -209,6 +209,54 @@ func TestRunDualStateSummaryImagesAndAudit(t *testing.T) {
 	if err != nil || len(sessions) == 0 || sessions[0].Status != "done" {
 		t.Fatalf("expected session status=done, got %+v err=%v", sessions, err)
 	}
+
+	// Follow-up ad-hoc `run` MUST NOT resurrect the completed task session.
+	callOK(t, sess, "run", map[string]any{
+		"title": "后续独立查询",
+		"code":  `1 + 1`,
+	})
+	sessionsAfter, err := store.ListSessions(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundDone := false
+	for _, s := range sessionsAfter {
+		if s.ID == sOut.SessionID {
+			foundDone = true
+			if s.Status != "done" {
+				t.Fatalf("completed session %s was resurrected to status=%q", s.ID, s.Status)
+			}
+		}
+	}
+	if !foundDone {
+		t.Fatalf("completed session %s missing after follow-up run", sOut.SessionID)
+	}
+
+	// `run` accepts optional explicit session_id matching session(start).
+	sRes2 := callOK(t, sess, "session", map[string]any{
+		"action": "start",
+		"title":  "显式会话绑定测试",
+	})
+	var sOut2 sessionOutput
+	decodeStructured(t, sRes2, &sOut2)
+	callOK(t, sess, "run", map[string]any{
+		"title":      "带显式 session_id 执行",
+		"session_id": sOut2.SessionID,
+		"code":       `40 + 2`,
+	})
+	ev2, err := store.ListEvents(audit.EventFilter{SessionID: sOut2.SessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	matchedRun := false
+	for _, e := range ev2 {
+		if e.ToolName == "run" && e.Summary == "带显式 session_id 执行" {
+			matchedRun = true
+		}
+	}
+	if !matchedRun {
+		t.Fatalf("explicit run session_id %s was not audited under target session: %+v", sOut2.SessionID, ev2)
+	}
 }
 
 func TestRunWaitAndReadOnlyGuard(t *testing.T) {

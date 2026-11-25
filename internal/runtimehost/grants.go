@@ -424,25 +424,42 @@ func (s *grantStore) handle(method, origin string, body json.RawMessage) (any, e
 // machineTools lends built-in tools to websites through an in-process MCP session to the Host's own Server, so a
 // web call runs exactly what a local MCP client would, with the same validation and locks.
 type machineTools struct {
-	session *mcp.ClientSession
-	tools   []capability.Definition
+	session       *mcp.ClientSession
+	serverSession *mcp.ServerSession
+	tools         []capability.Definition
+}
+
+func (m *machineTools) close() {
+	if m == nil {
+		return
+	}
+	if m.session != nil {
+		_ = m.session.Close()
+	}
+	if m.serverSession != nil {
+		_ = m.serverSession.Close()
+	}
 }
 
 func connectMachineTools(ctx context.Context, server *mcp.Server) (*machineTools, error) {
 	clientSide, serverSide := mcp.NewInMemoryTransports()
-	if _, err := server.Connect(ctx, serverSide, nil); err != nil {
+	serverSession, err := server.Connect(ctx, serverSide, nil)
+	if err != nil {
 		return nil, err
 	}
 	client := mcp.NewClient(&mcp.Implementation{Name: "web-grants", Version: "1"}, nil)
 	session, err := client.Connect(ctx, clientSide, nil)
 	if err != nil {
+		_ = serverSession.Close()
 		return nil, err
 	}
 	listed, err := session.ListTools(ctx, nil)
 	if err != nil {
+		_ = session.Close()
+		_ = serverSession.Close()
 		return nil, err
 	}
-	m := &machineTools{session: session}
+	m := &machineTools{session: session, serverSession: serverSession}
 	for _, t := range listed.Tools {
 		// Namespaced tools are page and app tools, granted by their own rules.
 		if strings.Contains(t.Name, ".") {

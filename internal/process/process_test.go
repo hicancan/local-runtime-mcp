@@ -415,7 +415,7 @@ func TestStreamBufferCursorReadsAndBoundedTail(t *testing.T) {
 	}
 	_, _ = buffer.Write([]byte("123456789"))
 	value, start, next, truncated, err := buffer.Read(7, false)
-	if err != nil || value != "56789" || start != 11 || next != 16 || !truncated || len(buffer.data) != 5 {
+	if err != nil || value != "56789" || start != 11 || next != 16 || !truncated || buffer.size != 5 {
 		t.Fatalf("large write: %q %d..%d truncated=%v err=%v", value, start, next, truncated, err)
 	}
 	// Exactly filling a fresh buffer loses no bytes.
@@ -823,5 +823,30 @@ func TestSeparateSessionsRunConcurrently(t *testing.T) {
 	manager.mu.Unlock()
 	if count != 2 {
 		t.Fatalf("parallel sessions retained %d processes", count)
+	}
+}
+
+func TestStreamBufferCircularWrapAround(t *testing.T) {
+	buf := newStreamBuffer(32)
+	var full strings.Builder
+	for i := range 40 {
+		chunk := fmt.Sprintf("[%02d:中文]", i)
+		_, _ = buf.Write([]byte(chunk))
+		full.WriteString(chunk)
+	}
+	wantAll := full.String()
+	wantTail := wantAll[len(wantAll)-32:]
+	val, start, next, truncated, err := buf.Read(0, true)
+	if err != nil || !truncated || next != int64(len(wantAll)) {
+		t.Fatalf("wrap read failed: val=%q %d..%d trunc=%v err=%v", val, start, next, truncated, err)
+	}
+	// start must align to a UTF-8 rune boundary inside the last 32 bytes.
+	if !strings.HasSuffix(wantTail, val) || len(val) < 29 || len(val) > 32 {
+		t.Fatalf("unexpected wrapped UTF-8 tail: got %q (len=%d) want suffix of %q", val, len(val), wantTail)
+	}
+	// Reading from `next` returns empty and not truncated.
+	val2, s2, n2, trunc2, err2 := buf.Read(next, true)
+	if err2 != nil || val2 != "" || s2 != next || n2 != next || trunc2 {
+		t.Fatalf("tail cursor read failed: %q %d..%d trunc=%v err=%v", val2, s2, n2, trunc2, err2)
 	}
 }

@@ -51,9 +51,11 @@ type RunOptions struct {
 
 // WaitOptions configures awaiting, polling, or terminating a running cell.
 type WaitOptions struct {
-	CellID    string
-	YieldMS   int
-	Terminate bool
+	CellID         string
+	YieldMS        int
+	Terminate      bool
+	SessionID      string
+	EnforceSession bool
 }
 
 // CellResult is the structured outcome of a run or wait call.
@@ -139,23 +141,24 @@ func (c *cellRun) appendOutput(s string) {
 		return
 	}
 	if len(s) > rem {
-		c.output.WriteString(s[:rem])
+		c.output.WriteString(truncateUTF8Bytes(s, rem))
 		c.truncated = true
 		return
 	}
 	c.output.WriteString(s)
 }
 
-func (c *cellRun) addImage(img ImagePayload) {
+func (c *cellRun) addImage(img ImagePayload) bool {
 	if len(img.Data) == 0 || img.MIMEType == "" {
-		return
+		return false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.images) >= maxImagesPerCell {
-		return
+		return false
 	}
 	c.images = append(c.images, img)
+	return true
 }
 
 func (c *cellRun) recordSubOp(op, target string, durMS int64, err error) {
@@ -174,11 +177,25 @@ func (c *cellRun) recordSubOp(op, target string, durMS int64, err error) {
 		item.Status = "error"
 		msg := err.Error()
 		if len(msg) > 240 {
-			msg = msg[:240] + "…"
+			msg = truncateUTF8Bytes(msg, 240) + "…"
 		}
 		item.Error = msg
 	}
 	c.subOps = append(c.subOps, item)
+}
+
+func truncateUTF8Bytes(s string, maxBytes int) string {
+	if maxBytes <= 0 || len(s) == 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && (s[cut]&0xC0) == 0x80 {
+		cut--
+	}
+	return s[:cut]
 }
 
 func (c *cellRun) finish(status string, val any, errText string) {

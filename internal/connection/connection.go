@@ -213,7 +213,8 @@ func Run(ctx context.Context, cfg *config.Config, options Options, stdin io.Read
 				}
 				host.SetUIBootstrap(func() (string, error) { return studio.MintBootstrapURL(localSrv.Address()) })
 			}
-			localSrv, localErr := newLocalHTTP(host, cfg, newAdminHandler(func() string { return localSrv.Address() }, host, ingress, studio, kick, stopDaemon), studio)
+			var localErr error
+			localSrv, localErr = newLocalHTTP(host, cfg, newAdminHandler(func() string { return localSrv.Address() }, host, ingress, studio, kick, stopDaemon), studio)
 			if localErr != nil {
 				ingress.Close()
 				if cfg.Local.Token != "" && transport.ProbeLocal(ctx, cfg.Local.Listen, cfg.Local.Token) {
@@ -292,12 +293,13 @@ func newLocalHTTP(host *runtimehost.Host, cfg *config.Config, admin, studio http
 		address = config.DefaultLocal
 	}
 	return transport.NewLocalHTTP(host.LocalServer(), transport.LocalConfig{
-		Listen:       address,
-		Token:        cfg.Local.Token,
-		Version:      mcpserver.Version,
-		Capabilities: host.LocalCapabilitiesHandler(),
-		Admin:        admin,
-		UI:           studio,
+		Listen:         address,
+		Token:          cfg.Local.Token,
+		Version:        mcpserver.Version,
+		Capabilities:   host.LocalCapabilitiesHandler(),
+		Admin:          admin,
+		UI:             studio,
+		OnSessionClose: host.CleanupLocalSession,
 	})
 }
 

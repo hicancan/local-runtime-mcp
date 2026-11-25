@@ -49,6 +49,7 @@ type coordinator struct {
 	now               func() time.Time
 	operationCancel   context.CancelFunc
 	states            map[string]string
+	stateOrder        []string
 	closed            bool
 	closeDone         chan struct{}
 	watchDone         chan struct{}
@@ -151,7 +152,7 @@ func (c *coordinator) Control(ctx context.Context, options ControlOptions) (Cont
 		c.mu.Lock()
 		if c.closed || c.status != "free" {
 			c.mu.Unlock()
-			return ControlStatus{}, errors.New("desktop busy; inspect computer_control status")
+			return ControlStatus{}, errors.New("desktop busy; inspect desktop.control(\"status\")")
 		}
 		var bytes [24]byte
 		if _, err := rand.Read(bytes[:]); err != nil {
@@ -191,6 +192,7 @@ func (c *coordinator) Control(ctx context.Context, options ControlOptions) (Cont
 		}
 		c.status, c.id = "stopping", ""
 		clear(c.states)
+		c.stateOrder = nil
 		if c.operationCancel != nil {
 			c.operationCancel()
 		}
@@ -233,6 +235,7 @@ func (c *coordinator) finishStop() {
 	}
 	c.operationCancel = nil
 	clear(c.states)
+	c.stateOrder = nil
 }
 
 func (c *coordinator) LocalStop() {
@@ -308,6 +311,7 @@ func (c *coordinator) BeginDesktopOperation(ctx context.Context, id string) (con
 	}
 	c.mu.Lock()
 	clear(c.states)
+	c.stateOrder = nil
 	c.mu.Unlock()
 	return operation, end, nil
 }
@@ -337,10 +341,13 @@ func (c *coordinator) State(ctx context.Context, options StateOptions) ([]byte, 
 		return nil, State{}, errors.New("desktop control was revoked during observation")
 	}
 	state.Actionable = true
-	if len(c.states) >= 64 {
-		clear(c.states)
+	for len(c.states) >= 64 && len(c.stateOrder) > 0 {
+		oldest := c.stateOrder[0]
+		c.stateOrder = c.stateOrder[1:]
+		delete(c.states, oldest)
 	}
 	c.states[state.StateID] = options.ControlID
+	c.stateOrder = append(c.stateOrder, state.StateID)
 	return image, state, nil
 }
 

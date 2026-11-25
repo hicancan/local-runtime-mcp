@@ -261,7 +261,7 @@
       const childrenWrap = el('div', { class: 'agent-children' });
       for (const s of visible) {
         const isActive = state.view === 'session' && state.sessionId === s.id;
-        const dotClass = s.status === 'working' ? 'working' : (s.status === 'error' ? 'error' : (Date.now() - s.last_seen_at < 300000 && s.status !== 'closed' ? 'active' : ''));
+        const dotClass = s.status === 'working' ? 'working' : (s.status === 'error' ? 'error' : (Date.now() - s.last_seen_at < 300000 && s.status !== 'closed' && s.status !== 'done' && s.status !== 'idle' ? 'active' : ''));
         childrenWrap.append(el('button', {
           type: 'button',
           class: `session-item${isActive ? ' active' : ''}`,

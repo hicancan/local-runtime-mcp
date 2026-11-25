@@ -592,7 +592,9 @@ func (c *cdpClient) resolveViaDOM(ctx context.Context, ts *tabSession, loc Locat
 		return axTargetRef{}, fmt.Errorf("DOM locator did not match any element (css=%q text=%q placeholder=%q)", loc.CSS, loc.Text, loc.Placeholder)
 	}
 	defer func() {
-		_ = c.Send(ctx, ts.sessionID, "Runtime.releaseObject", map[string]any{"objectId": evalRes.Result.ObjectID}, nil)
+		relCtx, relCancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		defer relCancel()
+		_ = c.Send(relCtx, ts.sessionID, "Runtime.releaseObject", map[string]any{"objectId": evalRes.Result.ObjectID}, nil)
 	}()
 
 	var desc struct {
@@ -626,7 +628,9 @@ func (c *cdpClient) callOnBackendNode(ctx context.Context, ts *tabSession, targe
 		return nil, errors.New("target element did not produce a remote object")
 	}
 	defer func() {
-		_ = c.Send(ctx, target.SessionID, "Runtime.releaseObject", map[string]any{"objectId": resolved.Object.ObjectID}, nil)
+		relCtx, relCancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		defer relCancel()
+		_ = c.Send(relCtx, target.SessionID, "Runtime.releaseObject", map[string]any{"objectId": resolved.Object.ObjectID}, nil)
 	}()
 
 	callArgs := make([]map[string]any, len(args))

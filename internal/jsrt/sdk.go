@@ -70,8 +70,12 @@ func (v *sessionVM) installGlobals() {
 			if err != nil {
 				panic(v.vm.NewGoError(err))
 			}
-			cell.addImage(ImagePayload{Data: data, MIMEType: meta.MIMEType, Label: label, Width: meta.Width, Height: meta.Height})
-			return v.vm.ToValue(map[string]any{"emitted": true, "mime_type": meta.MIMEType, "width": meta.Width, "height": meta.Height, "bytes": len(data)})
+			emitted := cell.addImage(ImagePayload{Data: data, MIMEType: meta.MIMEType, Label: label, Width: meta.Width, Height: meta.Height})
+			res := map[string]any{"emitted": emitted, "mime_type": meta.MIMEType, "width": meta.Width, "height": meta.Height, "bytes": len(data)}
+			if !emitted {
+				res["reason"] = "max_images_per_cell_reached"
+			}
+			return v.vm.ToValue(res)
 		}
 		if obj := arg.ToObject(v.vm); obj != nil {
 			if raw := obj.Get("__image_bytes"); raw != nil && !goja.IsUndefined(raw) {
@@ -87,8 +91,12 @@ func (v *sessionVM) installGlobals() {
 					if hv := obj.Get("height"); hv != nil && !goja.IsUndefined(hv) {
 						h = int(hv.ToInteger())
 					}
-					cell.addImage(ImagePayload{Data: data, MIMEType: mime, Label: label, Width: w, Height: h})
-					return v.vm.ToValue(map[string]any{"emitted": true, "mime_type": mime, "width": w, "height": h, "bytes": len(data)})
+					emitted := cell.addImage(ImagePayload{Data: data, MIMEType: mime, Label: label, Width: w, Height: h})
+					res := map[string]any{"emitted": emitted, "mime_type": mime, "width": w, "height": h, "bytes": len(data)}
+					if !emitted {
+						res["reason"] = "max_images_per_cell_reached"
+					}
+					return v.vm.ToValue(res)
 				}
 			}
 		}
@@ -350,9 +358,11 @@ func parseProcRunArgs(call goja.FunctionCall) (runtimeprocess.Options, string, e
 		case "sh":
 			opts.Program = "sh"
 			opts.Args = []string{"-c", cmdStr}
-		default:
+		case "bash":
 			opts.Program = "bash"
 			opts.Args = []string{"-lc", cmdStr}
+		default:
+			return runtimeprocess.Options{}, "", fmt.Errorf("unsupported shell %q; expected pwsh, powershell, cmd, bash, or sh", shellName)
 		}
 	}
 	if opts.Program == "" {
@@ -391,8 +401,8 @@ func (v *sessionVM) buildFSSDK() goja.Value {
 				return v.rejected(err)
 			}
 		}
-		return v.spawnAsync("fs.list", path, func(_ context.Context) (any, error) {
-			res, err := filesystem.List(path, opts.MaxDepth, opts.IncludeHidden, opts.MaxEntries)
+		return v.spawnAsync("fs.list", path, func(ctx context.Context) (any, error) {
+			res, err := filesystem.ListContext(ctx, path, opts.MaxDepth, opts.IncludeHidden, opts.MaxEntries)
 			return toPlain(res), err
 		})
 	})
@@ -419,8 +429,8 @@ func (v *sessionVM) buildFSSDK() goja.Value {
 				withSHA = opts.WithSHA256
 			}
 		}
-		return v.spawnAsync("fs.stat", path, func(_ context.Context) (any, error) {
-			res, err := filesystem.Stat(path, withSHA)
+		return v.spawnAsync("fs.stat", path, func(ctx context.Context) (any, error) {
+			res, err := filesystem.StatContext(ctx, path, withSHA)
 			return toPlain(res), err
 		})
 	})
@@ -468,8 +478,8 @@ func (v *sessionVM) buildFSSDK() goja.Value {
 			opts.StartLine = start
 			opts.LineCount = raw.EndLine - start + 1
 		}
-		return v.spawnAsync("fs.read", path, func(_ context.Context) (any, error) {
-			res, err := filesystem.ReadText(path, opts)
+		return v.spawnAsync("fs.read", path, func(ctx context.Context) (any, error) {
+			res, err := filesystem.ReadTextContext(ctx, path, opts)
 			return toPlain(res), err
 		})
 	})
@@ -558,8 +568,8 @@ func (v *sessionVM) buildFSSDK() goja.Value {
 				return v.rejected(err)
 			}
 		}
-		return v.spawnAsync("fs.search", query+" in "+path, func(_ context.Context) (any, error) {
-			res, err := filesystem.SearchText(path, query, opts.Regex, opts.CaseSensitive, opts.IncludeHidden, opts.MaxResults)
+		return v.spawnAsync("fs.search", query+" in "+path, func(ctx context.Context) (any, error) {
+			res, err := filesystem.SearchTextContext(ctx, path, query, opts.Regex, opts.CaseSensitive, opts.IncludeHidden, opts.MaxResults)
 			return toPlain(res), err
 		})
 	})
@@ -691,6 +701,12 @@ func (v *sessionVM) buildBrowserSDK() goja.Value {
 	})
 	_ = obj.Set("tab", func(call goja.FunctionCall) goja.Value {
 		const sig = `browser.tab(tab_id)`
+		if b == nil {
+			panic(v.vm.NewGoError(errors.New("browser engine unavailable")))
+		}
+		if err := rejectExtraArgs(call, 1, sig); err != nil {
+			panic(v.vm.NewTypeError(err.Error()))
+		}
 		id, err := requireNonEmptyStringArg(call, 0, "tab_id", sig)
 		if err != nil {
 			panic(v.vm.NewTypeError(err.Error()))
@@ -1490,7 +1506,7 @@ func (v *sessionVM) buildDesktopSDK() goja.Value {
 		})
 	})
 	_ = obj.Set("state", func(call goja.FunctionCall) goja.Value {
-		const sig = `desktop.state({ control_id?, target_id?, display_id?, region?, image?, cursor?, elements?, name?, role?, automation_id?, max_elements?, max_width?, max_height? }?)`
+		const sig = `desktop.state({ control_id?, target_id?, display_id?, region?, image?, cursor?, elements?: "all"|"interactive"|"none", name?, role?, automation_id?, max_elements?, offset?, max_width?, max_height? }?)`
 		if ctrl == nil {
 			return v.rejected(errors.New("desktop controller unavailable"))
 		}
@@ -1517,7 +1533,7 @@ func (v *sessionVM) buildDesktopSDK() goja.Value {
 		})
 	})
 	_ = obj.Set("wait", func(call goja.FunctionCall) goja.Value {
-		const sig = `desktop.wait({ target_id?, display_id?, name?, role?, automation_id?, timeout_seconds?, image? })`
+		const sig = `desktop.wait({ target_id, name?, automation_id?, role?, until?: "present"|"absent", timeout_ms?, image? })`
 		if ctrl == nil {
 			return v.rejected(errors.New("desktop controller unavailable"))
 		}
@@ -1538,12 +1554,13 @@ func (v *sessionVM) buildDesktopSDK() goja.Value {
 			m := toPlainMap(st)
 			if len(data) > 0 {
 				m["__image_bytes"] = data
+				m["bytes"] = len(data)
 			}
 			return m, nil
 		})
 	})
 	_ = obj.Set("action", func(call goja.FunctionCall) goja.Value {
-		const sig = `desktop.action({ kind, control_id?, target_id?, element_ref?, x?, y?, to_x?, to_y?, button?, text?, key?, keys?, scroll_x?, scroll_y? })`
+		const sig = `desktop.action({ kind, control_id?, target_id?, state_id?, element_ref?, x?, y?, to_x?, to_y?, duration_ms?, button?, text?, key?, scroll_x?, scroll_y?, bounds?, show? })`
 		if v.isReadOnly() {
 			return v.rejected(errors.New("read-only grant forbids desktop.action"))
 		}
@@ -1683,6 +1700,13 @@ func (v *sessionVM) buildCapsSDK() goja.Value {
 			for _, d := range reg.List() {
 				if d.Name == name && d.Annotations.ReadOnlyHint && !d.Annotations.DestructiveHint {
 					allowed = true
+				}
+			}
+			if !allowed && v.deps.LocalApps {
+				for _, d := range reg.AppDefinitions() {
+					if d.Name == name && d.Annotations.ReadOnlyHint && !d.Annotations.DestructiveHint {
+						allowed = true
+					}
 				}
 			}
 			if !allowed {

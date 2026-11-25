@@ -110,11 +110,23 @@ func commitIdentity(path string) (string, error) {
 }
 
 const (
-	defaultTextBytes = 1 << 20
-	maxTextBytes     = 8 << 20
-	defaultResults   = 200
-	defaultEntries   = 1_000
+	defaultTextBytes  = 1 << 20
+	maxTextBytes      = 8 << 20
+	defaultResults    = 200
+	defaultEntries    = 1_000
+	maxMatchLineBytes = 4096
 )
+
+func truncateUTF8Bytes(data []byte, maxBytes int) string {
+	if len(data) <= maxBytes {
+		return string(data)
+	}
+	i := maxBytes
+	for i > 0 && !utf8.RuneStart(data[i]) {
+		i--
+	}
+	return string(data[:i]) + "…"
+}
 
 func resolve(path string) (string, error) {
 	if strings.TrimSpace(path) == "" {
@@ -128,6 +140,13 @@ func resolve(path string) (string, error) {
 }
 
 func List(path string, maxDepth int, includeHidden bool, maxEntries int) (ListResult, error) {
+	return ListContext(context.Background(), path, maxDepth, includeHidden, maxEntries)
+}
+
+func ListContext(ctx context.Context, path string, maxDepth int, includeHidden bool, maxEntries int) (ListResult, error) {
+	if err := ctx.Err(); err != nil {
+		return ListResult{}, err
+	}
 	start, err := resolve(path)
 	if err != nil {
 		return ListResult{}, err
@@ -153,6 +172,9 @@ func List(path string, maxDepth int, includeHidden bool, maxEntries int) (ListRe
 	}
 	result := ListResult{Entries: make([]FileEntry, 0, min(maxEntries, defaultEntries))}
 	err = filepath.WalkDir(start, func(current string, entry os.DirEntry, walkErr error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if walkErr != nil {
 			result.Skipped++
 			if entry != nil && entry.IsDir() {
@@ -190,12 +212,22 @@ func List(path string, maxDepth int, includeHidden bool, maxEntries int) (ListRe
 			return filepath.SkipAll
 		}
 		result.Entries = append(result.Entries, FileEntry{Path: filepath.Clean(current), Type: fileType(info), Size: info.Size(), ModTime: info.ModTime()})
+		if entry.IsDir() && currentDepth >= maxDepth {
+			return filepath.SkipDir
+		}
 		return nil
 	})
 	return result, err
 }
 
 func Stat(path string, withSHA256 bool) (FileInfo, error) {
+	return StatContext(context.Background(), path, withSHA256)
+}
+
+func StatContext(ctx context.Context, path string, withSHA256 bool) (FileInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return FileInfo{}, err
+	}
 	resolved, err := resolve(path)
 	if err != nil {
 		return FileInfo{}, err
@@ -211,6 +243,12 @@ func Stat(path string, withSHA256 bool) (FileInfo, error) {
 	}
 	if !info.Mode().IsRegular() {
 		return result, nil
+	}
+	if !withSHA256 {
+		if value := mime.TypeByExtension(strings.ToLower(filepath.Ext(resolved))); value != "" {
+			result.MIMEType = value
+			return result, nil
+		}
 	}
 	file, err := os.Open(resolved)
 	if err != nil {
@@ -236,6 +274,13 @@ func Stat(path string, withSHA256 bool) (FileInfo, error) {
 }
 
 func ReadText(path string, options ReadTextOptions) (TextReadResult, error) {
+	return ReadTextContext(context.Background(), path, options)
+}
+
+func ReadTextContext(ctx context.Context, path string, options ReadTextOptions) (TextReadResult, error) {
+	if err := ctx.Err(); err != nil {
+		return TextReadResult{}, err
+	}
 	resolved, err := resolve(path)
 	if err != nil {
 		return TextReadResult{}, err
@@ -272,6 +317,11 @@ func ReadText(path string, options ReadTextOptions) (TextReadResult, error) {
 	line, endLine, nextLine := 0, 0, 0
 	truncated := false
 	for {
+		if line&63 == 0 {
+			if err := ctx.Err(); err != nil {
+				return TextReadResult{}, err
+			}
+		}
 		part, present, readErr := readTextLine(reader, options.MaxBytes-len(data), line+1 >= options.StartLine)
 		if present {
 			line++
@@ -472,7 +522,6 @@ func (s *Service) PatchText(ctx context.Context, path string, options PatchTextO
 		new        string
 		index      int
 	}
-	original := string(data)
 	located := make([]locatedHunk, 0, len(options.Hunks))
 	for index, hunk := range options.Hunks {
 		if len(hunk.Before)+len(hunk.Old)+len(hunk.After) > maxTextBytes || len(hunk.New) > maxTextBytes {
@@ -484,8 +533,8 @@ func (s *Service) PatchText(ctx context.Context, path string, options PatchTextO
 		if hunk.Old == "" && hunk.Before == "" && hunk.After == "" {
 			return TextPatchResult{}, fmt.Errorf("hunks[%d] insertion requires before or after context", index)
 		}
-		anchor := hunk.Before + hunk.Old + hunk.After
-		matches := allExactMatches(original, anchor)
+		anchor := []byte(hunk.Before + hunk.Old + hunk.After)
+		matches := exactByteMatches(data, anchor, 10)
 		if len(matches) == 0 {
 			return TextPatchResult{}, fmt.Errorf("hunks[%d] context was not found in the original file", index)
 		}
@@ -525,24 +574,136 @@ func (s *Service) PatchText(ctx context.Context, path string, options PatchTextO
 	return TextPatchResult{Path: resolved, Bytes: len(updatedBytes), Hunks: len(located), SHA256: hashBytes(updatedBytes)}, nil
 }
 
-func allExactMatches(value, pattern string) []int {
-	if pattern == "" {
+func exactByteMatches(value, pattern []byte, maxReport int) []int {
+	if len(pattern) == 0 {
 		return nil
 	}
 	var matches []int
 	for offset := 0; offset <= len(value)-len(pattern); {
-		index := strings.Index(value[offset:], pattern)
+		index := bytes.Index(value[offset:], pattern)
 		if index < 0 {
 			break
 		}
 		absolute := offset + index
 		matches = append(matches, absolute)
+		if maxReport > 0 && len(matches) >= maxReport {
+			break
+		}
 		offset = absolute + 1
 	}
 	return matches
 }
 
+type lineMatcher struct {
+	re            *regexp.Regexp
+	literal       []byte
+	caseSensitive bool
+	asciiFold     bool
+}
+
+func newLineMatcher(query string, regex, caseSensitive bool) (*lineMatcher, error) {
+	if !regex {
+		if caseSensitive {
+			return &lineMatcher{literal: []byte(query), caseSensitive: true}, nil
+		}
+		ascii := true
+		for i := 0; i < len(query); i++ {
+			if query[i] >= 0x80 {
+				ascii = false
+				break
+			}
+		}
+		if ascii {
+			return &lineMatcher{literal: []byte(strings.ToLower(query)), asciiFold: true}, nil
+		}
+	}
+	pattern := query
+	if !regex {
+		pattern = regexp.QuoteMeta(pattern)
+	}
+	if !caseSensitive {
+		pattern = "(?i)" + pattern
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("compile query: %w", err)
+	}
+	return &lineMatcher{re: re}, nil
+}
+
+// forEachMatch invokes fn(startByteOffset) for each non-overlapping match in line.
+// Returning false from fn stops scanning immediately.
+func (m *lineMatcher) forEachMatch(line []byte, fn func(start int) bool) {
+	if m.re != nil {
+		for _, loc := range m.re.FindAllIndex(line, -1) {
+			if !fn(loc[0]) {
+				return
+			}
+		}
+		return
+	}
+	needle := m.literal
+	nLen := len(needle)
+	if nLen == 0 || len(line) < nLen {
+		return
+	}
+	if m.caseSensitive {
+		for off := 0; off <= len(line)-nLen; {
+			idx := bytes.Index(line[off:], needle)
+			if idx < 0 {
+				return
+			}
+			pos := off + idx
+			if !fn(pos) {
+				return
+			}
+			off = pos + nLen
+		}
+		return
+	}
+	// Zero-allocation ASCII case-insensitive scan (safe on UTF-8 since ASCII bytes < 0x80
+	// never collide with multi-byte continuation bytes >= 0x80).
+	firstLo := needle[0]
+	firstHi := firstLo
+	if firstLo >= 'a' && firstLo <= 'z' {
+		firstHi = firstLo - ('a' - 'A')
+	}
+	for off := 0; off <= len(line)-nLen; {
+		b := line[off]
+		if b != firstLo && b != firstHi {
+			off++
+			continue
+		}
+		matched := true
+		for j := 1; j < nLen; j++ {
+			c := line[off+j]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			if c != needle[j] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			if !fn(off) {
+				return
+			}
+			off += nLen
+		} else {
+			off++
+		}
+	}
+}
+
 func SearchText(path, query string, regex, caseSensitive, includeHidden bool, maxResults int) (SearchResult, error) {
+	return SearchTextContext(context.Background(), path, query, regex, caseSensitive, includeHidden, maxResults)
+}
+
+func SearchTextContext(ctx context.Context, path, query string, regex, caseSensitive, includeHidden bool, maxResults int) (SearchResult, error) {
+	if err := ctx.Err(); err != nil {
+		return SearchResult{}, err
+	}
 	start, err := resolve(path)
 	if err != nil {
 		return SearchResult{}, err
@@ -556,19 +717,16 @@ func SearchText(path, query string, regex, caseSensitive, includeHidden bool, ma
 	if maxResults < 1 || maxResults > 10_000 {
 		return SearchResult{}, errors.New("max_results must be between 1 and 10000")
 	}
-	pattern := query
-	if !regex {
-		pattern = regexp.QuoteMeta(pattern)
-	}
-	if !caseSensitive {
-		pattern = "(?i)" + pattern
-	}
-	re, err := regexp.Compile(pattern)
+	matcher, err := newLineMatcher(query, regex, caseSensitive)
 	if err != nil {
-		return SearchResult{}, fmt.Errorf("compile query: %w", err)
+		return SearchResult{}, err
 	}
+	scanBuf := make([]byte, 64*1024)
 	result := SearchResult{Matches: make([]SearchMatch, 0)}
 	err = filepath.WalkDir(start, func(current string, entry os.DirEntry, walkErr error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if walkErr != nil {
 			result.Skipped++
 			if entry != nil && entry.IsDir() {
@@ -582,56 +740,78 @@ func SearchText(path, query string, regex, caseSensitive, includeHidden bool, ma
 			}
 			return nil
 		}
-		if len(result.Matches) >= maxResults {
-			result.Truncated = true
-			return filepath.SkipAll
-		}
 		if entry.Type()&os.ModeSymlink != 0 || (!includeHidden && isHiddenName(entry.Name())) {
 			return nil
 		}
-		skipped, err := searchFile(current, re, maxResults, &result.Matches)
+		info, infoErr := entry.Info()
+		if infoErr != nil || !info.Mode().IsRegular() || info.Size() > maxTextBytes {
+			result.Skipped++
+			return nil
+		}
+		skipped, truncated, scanErr := searchFile(ctx, current, matcher, scanBuf, maxResults, &result.Matches)
+		if scanErr != nil {
+			return scanErr
+		}
 		if skipped {
 			result.Skipped++
 		}
-		if len(result.Matches) >= maxResults {
+		if truncated {
 			result.Truncated = true
 			return filepath.SkipAll
 		}
-		return err
+		return nil
 	})
 	return result, err
 }
 
-func searchFile(path string, re *regexp.Regexp, limit int, matches *[]SearchMatch) (bool, error) {
-	info, err := os.Stat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Size() > maxTextBytes {
-		return true, nil
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return true, nil
+func searchFile(ctx context.Context, path string, matcher *lineMatcher, scanBuf []byte, limit int, matches *[]SearchMatch) (skipped, truncated bool, err error) {
+	file, openErr := os.Open(path)
+	if openErr != nil {
+		return true, false, nil
 	}
 	defer file.Close()
 	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64*1024), 1<<20)
+	scanner.Buffer(scanBuf, 1<<20)
 	line := 0
 	for scanner.Scan() {
 		line++
-		data := scanner.Bytes()
-		if !utf8.Valid(data) || bytes.IndexByte(data, 0) >= 0 {
-			return true, nil
-		}
-		for _, location := range re.FindAllIndex(data, -1) {
-			*matches = append(*matches, SearchMatch{Path: path, Line: line, Column: utf8.RuneCount(data[:location[0]]) + 1, Text: scanner.Text()})
-			if len(*matches) >= limit {
-				return false, nil
+		if line&255 == 0 {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return false, false, ctxErr
 			}
 		}
+		data := scanner.Bytes()
+		if !utf8.Valid(data) || bytes.IndexByte(data, 0) >= 0 {
+			return true, false, nil
+		}
+		var lineText string
+		lineTextReady := false
+		hitOverflow := false
+		matcher.forEachMatch(data, func(start int) bool {
+			if len(*matches) >= limit {
+				hitOverflow = true
+				return false
+			}
+			if !lineTextReady {
+				lineText = truncateUTF8Bytes(data, maxMatchLineBytes)
+				lineTextReady = true
+			}
+			*matches = append(*matches, SearchMatch{
+				Path:   path,
+				Line:   line,
+				Column: utf8.RuneCount(data[:start]) + 1,
+				Text:   lineText,
+			})
+			return true
+		})
+		if hitOverflow {
+			return false, true, nil
+		}
 	}
-	if err := scanner.Err(); err != nil {
-		return true, nil
+	if scanner.Err() != nil {
+		return true, false, nil
 	}
-	return false, nil
+	return false, false, nil
 }
 
 func isHiddenName(name string) bool { return strings.HasPrefix(name, ".") }

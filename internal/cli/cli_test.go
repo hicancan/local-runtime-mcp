@@ -56,10 +56,6 @@ func TestRemovedCommandsAreUnknown(t *testing.T) {
 		{"connect", "openai"},
 		{"expose", "cloudflare"},
 		{"browser-setup"},
-		{"--version"},
-		{"-v"},
-		{"--help"},
-		{"-h"},
 		{"tunnel", "openai"},
 		{"tunnel", "cloudflare"},
 		{"serve", "stdio"},
@@ -72,6 +68,19 @@ func TestRemovedCommandsAreUnknown(t *testing.T) {
 		err := run(context.Background(), args, strings.NewReader(""), &output, &errors, executable)
 		if err == nil {
 			t.Fatalf("removed command %q was accepted", args)
+		}
+	}
+	// Standard --version / -v / --help / -h aliases are supported alongside version / help.
+	for _, args := range [][]string{{"version"}, {"--version"}, {"-v"}} {
+		var out, errBuf bytes.Buffer
+		if err := run(context.Background(), args, strings.NewReader(""), &out, &errBuf, executable); err != nil || !strings.Contains(out.String(), version.Version) {
+			t.Fatalf("version alias %q failed: out=%q err=%v", args, out.String(), err)
+		}
+	}
+	for _, args := range [][]string{{"help"}, {"--help"}, {"-h"}} {
+		var out, errBuf bytes.Buffer
+		if err := run(context.Background(), args, strings.NewReader(""), &out, &errBuf, executable); err != nil || out.Len() == 0 {
+			t.Fatalf("help alias %q failed: out=%q err=%v", args, out.String(), err)
 		}
 	}
 }

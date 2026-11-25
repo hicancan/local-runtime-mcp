@@ -122,7 +122,6 @@ func (m *IngressManager) Status() []runtimehost.TunnelStatus {
 }
 
 func (m *IngressManager) statusLocked() []runtimehost.TunnelStatus {
-	now := time.Now()
 	order := []string{"openai", "cloudflare", "http"}
 	out := make([]runtimehost.TunnelStatus, 0, len(order))
 	for _, name := range order {
@@ -147,7 +146,6 @@ func (m *IngressManager) statusLocked() []runtimehost.TunnelStatus {
 			}
 			item.TTLRemainingSeconds = rem
 		}
-		_ = now
 		out = append(out, item)
 	}
 	return out
@@ -305,6 +303,8 @@ func (m *IngressManager) startWire(name, address string, ttl time.Duration, run 
 	go func() {
 		defer close(done)
 		err := normalizeCancellation(run(wireCtx))
+		var auditSummary string
+		var auditDetail map[string]any
 		m.mu.Lock()
 		if w.gen == gen {
 			if w.timer != nil {
@@ -318,16 +318,14 @@ func (m *IngressManager) startWire(name, address string, ttl time.Duration, run 
 				w.state = "error"
 				w.lastError = err.Error()
 				fmt.Fprintf(m.log, "[%s] remote wire stopped with error: %v\n", name, err)
-				if m.host != nil && m.host.Audit() != nil {
-					m.host.Audit().RecordSystem("system", fmt.Sprintf("Remote wire %s error: %v", name, err), map[string]any{"wire": name, "error": err.Error()})
-				}
+				auditSummary = fmt.Sprintf("Remote wire %s error: %v", name, err)
+				auditDetail = map[string]any{"wire": name, "error": err.Error()}
 			} else {
 				w.state = "stopped"
 				w.lastError = ""
 				fmt.Fprintf(m.log, "[%s] remote wire detached\n", name)
-				if m.host != nil && m.host.Audit() != nil {
-					m.host.Audit().RecordSystem("system", fmt.Sprintf("Detached remote wire %s", name), map[string]any{"wire": name})
-				}
+				auditSummary = fmt.Sprintf("Detached remote wire %s", name)
+				auditDetail = map[string]any{"wire": name}
 			}
 			w.address = ""
 			w.startedAt = nil
@@ -337,6 +335,9 @@ func (m *IngressManager) startWire(name, address string, ttl time.Duration, run 
 			}
 		}
 		m.mu.Unlock()
+		if auditSummary != "" && m.host != nil && m.host.Audit() != nil {
+			m.host.Audit().RecordSystem("system", auditSummary, auditDetail)
+		}
 	}()
 
 	return st, nil

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 )
 
 var interactiveAXRoles = map[string]bool{
@@ -19,7 +20,7 @@ var interactiveAXRoles = map[string]bool{
 type SnapshotOptions struct {
 	MaxElements int
 	MaxText     int
-	Diff        bool // when true and a prior snapshot exists in the same navigation, emit compact line diff
+	Diff        bool // when true and a prior snapshot exists in the same navigation, emit compact ordered line diff
 }
 
 type axValue struct {
@@ -78,40 +79,76 @@ func (c *cdpClient) snapshotTab(ctx context.Context, tabID, targetID string, opt
 		sessions = append(sessions, child)
 	}
 	prevLines := append([]string(nil), ts.lastAXLines...)
-	snapNum := len(ts.snapshotOrder) + 1
+	ts.snapshotSeq++
+	snapNum := ts.snapshotSeq
 	ts.mu.Unlock()
+
+	// Fetch AX trees concurrently across main frame and OOPIF child frames while preserving frame order.
+	type frameTree struct {
+		sessID string
+		nodes  []axNode
+	}
+	trees := make([]frameTree, len(sessions))
+	if len(sessions) == 1 {
+		var resp struct {
+			Nodes []axNode `json:"nodes"`
+		}
+		if err := c.Send(ctx, sessions[0], "Accessibility.getFullAXTree", nil, &resp); err == nil {
+			trees[0] = frameTree{sessID: sessions[0], nodes: resp.Nodes}
+		}
+	} else {
+		var wg sync.WaitGroup
+		for i, sid := range sessions {
+			wg.Add(1)
+			go func(idx int, sessID string) {
+				defer wg.Done()
+				var resp struct {
+					Nodes []axNode `json:"nodes"`
+				}
+				if err := c.Send(ctx, sessID, "Accessibility.getFullAXTree", nil, &resp); err == nil {
+					trees[idx] = frameTree{sessID: sessID, nodes: resp.Nodes}
+				}
+			}(i, sid)
+		}
+		wg.Wait()
+	}
 
 	snapshotID := fmt.Sprintf("%s:q%d", epoch, snapNum)
 	elements := make([]SnapshotElement, 0, 64)
 	refs := make(map[string]axTargetRef, 64)
 	textLines := make([]string, 0, 128)
 	elementsTruncated := false
+	lastEmittedText := ""
 
-	for _, sessID := range sessions {
-		var tree struct {
-			Nodes []axNode `json:"nodes"`
-		}
-		if err := c.Send(ctx, sessID, "Accessibility.getFullAXTree", nil, &tree); err != nil {
-			continue
-		}
-		for _, node := range tree.Nodes {
+	for _, ft := range trees {
+		for _, node := range ft.nodes {
 			if node.Ignored {
 				continue
 			}
 			role := axString(node.Role)
+			// Chromium always emits word/line-level InlineTextBox children duplicating StaticText.
+			if role == "InlineTextBox" {
+				continue
+			}
 			name := strings.TrimSpace(axString(node.Name))
 			val := strings.TrimSpace(axString(node.Value))
+			isInteractive := interactiveAXRoles[role]
 			if name != "" {
-				if interactiveAXRoles[role] {
+				// Prune redundant StaticText child duplicating its immediately preceding parent label
+				// (e.g. "[button] Submit" followed by StaticText "Submit" or heading followed by StaticText).
+				if isInteractive {
 					textLines = append(textLines, fmt.Sprintf("[%s] %s", role, name))
-				} else {
+					lastEmittedText = name
+				} else if role != "StaticText" || name != lastEmittedText {
 					textLines = append(textLines, name)
+					lastEmittedText = name
 				}
 			}
 			if val != "" && val != name {
 				textLines = append(textLines, val)
+				lastEmittedText = val
 			}
-			if node.BackendDOMNodeID == 0 || !interactiveAXRoles[role] {
+			if node.BackendDOMNodeID == 0 || !isInteractive {
 				continue
 			}
 			if len(elements) >= opts.MaxElements {
@@ -127,7 +164,7 @@ func (c *cdpClient) snapshotTab(ctx context.Context, tabID, targetID string, opt
 				}
 			}
 			ref := fmt.Sprintf("%s:e%d", snapshotID, len(elements)+1)
-			refs[ref] = axTargetRef{SessionID: sessID, BackendNodeID: node.BackendDOMNodeID}
+			refs[ref] = axTargetRef{SessionID: ft.sessID, BackendNodeID: node.BackendDOMNodeID}
 			elements = append(elements, SnapshotElement{
 				Ref:      ref,
 				Role:     role,
@@ -167,7 +204,7 @@ func (c *cdpClient) snapshotTab(ctx context.Context, tabID, targetID string, opt
 	}
 	textTruncated := false
 	if len(text) > opts.MaxText {
-		text = text[:opts.MaxText]
+		text = truncateUTF8Bytes(text, opts.MaxText)
 		textTruncated = true
 	}
 
@@ -187,9 +224,113 @@ func (c *cdpClient) snapshotTab(ctx context.Context, tabID, targetID string, opt
 	}, nil
 }
 
-// computeLineDiff produces a compact Codex-style line diff between previous and
-// current AX snapshots without pulling in heavy external diff dependencies.
+// computeLineDiff produces an order-aware Myers O(ND) shortest edit script diff
+// between previous and current AX snapshots (with common prefix/suffix trimming
+// and an O(N) fallback when edit distance exceeds 512 lines).
 func computeLineDiff(prev, curr []string) (string, int, int) {
+	prefix := 0
+	for prefix < len(prev) && prefix < len(curr) && prev[prefix] == curr[prefix] {
+		prefix++
+	}
+	pEnd := len(prev)
+	cEnd := len(curr)
+	for pEnd > prefix && cEnd > prefix && prev[pEnd-1] == curr[cEnd-1] {
+		pEnd--
+		cEnd--
+	}
+	a := prev[prefix:pEnd]
+	b := curr[prefix:cEnd]
+	if len(a) == 0 && len(b) == 0 {
+		return fmt.Sprintf("(no AX text changes; %d lines unchanged)", len(curr)), 0, 0
+	}
+
+	out, added, removed, ok := myersLineDiff(a, b, 512)
+	if !ok {
+		out, added, removed = bagLineDiff(a, b)
+	}
+	if added == 0 && removed == 0 {
+		return fmt.Sprintf("(no AX text changes; %d lines unchanged)", len(curr)), 0, 0
+	}
+	header := fmt.Sprintf("[AX diff: +%d / -%d lines, total %d]", added, removed, len(curr))
+	return header + "\n" + strings.Join(out, "\n"), added, removed
+}
+
+func myersLineDiff(a, b []string, maxD int) ([]string, int, int, bool) {
+	n, m := len(a), len(b)
+	limit := n + m
+	if limit > maxD {
+		limit = maxD
+	}
+	offset := limit
+	v := make([]int, 2*limit+1)
+	trace := make([][]int, 0, min(limit+1, 64))
+
+	foundD := -1
+	for d := 0; d <= limit; d++ {
+		snap := make([]int, len(v))
+		copy(snap, v)
+		trace = append(trace, snap)
+		for k := -d; k <= d; k += 2 {
+			var x int
+			if k == -d || (k != d && v[k-1+offset] < v[k+1+offset]) {
+				x = v[k+1+offset]
+			} else {
+				x = v[k-1+offset] + 1
+			}
+			y := x - k
+			for x < n && y < m && a[x] == b[y] {
+				x++
+				y++
+			}
+			v[k+offset] = x
+			if x >= n && y >= m {
+				foundD = d
+				break
+			}
+		}
+		if foundD >= 0 {
+			break
+		}
+	}
+	if foundD < 0 {
+		return nil, 0, 0, false
+	}
+
+	// Backtrack shortest edit script in reverse, emitting only inserts & deletes in exact order.
+	rev := make([]string, 0, foundD)
+	x, y := n, m
+	added, removed := 0, 0
+	for d := foundD; d > 0; d-- {
+		prevV := trace[d]
+		k := x - y
+		var prevK int
+		if k == -d || (k != d && prevV[k-1+offset] < prevV[k+1+offset]) {
+			prevK = k + 1
+		} else {
+			prevK = k - 1
+		}
+		prevX := prevV[prevK+offset]
+		prevY := prevX - prevK
+		for x > prevX && y > prevY {
+			x--
+			y--
+		}
+		if x == prevX {
+			rev = append(rev, "+ "+b[prevY])
+			added++
+		} else {
+			rev = append(rev, "- "+a[prevX])
+			removed++
+		}
+		x, y = prevX, prevY
+	}
+	for i, j := 0, len(rev)-1; i < j; i, j = i+1, j-1 {
+		rev[i], rev[j] = rev[j], rev[i]
+	}
+	return rev, added, removed, true
+}
+
+func bagLineDiff(prev, curr []string) ([]string, int, int) {
 	prevCounts := make(map[string]int, len(prev))
 	for _, l := range prev {
 		prevCounts[l]++
@@ -198,7 +339,6 @@ func computeLineDiff(prev, curr []string) (string, int, int) {
 	for _, l := range curr {
 		currCounts[l]++
 	}
-
 	var out []string
 	removed := 0
 	remSeen := make(map[string]int, len(prev))
@@ -218,11 +358,7 @@ func computeLineDiff(prev, curr []string) (string, int, int) {
 			added++
 		}
 	}
-	if added == 0 && removed == 0 {
-		return fmt.Sprintf("(no AX text changes; %d lines unchanged)", len(curr)), 0, 0
-	}
-	header := fmt.Sprintf("[AX diff: +%d / -%d lines, total %d]", added, removed, len(curr))
-	return header + "\n" + strings.Join(out, "\n"), added, removed
+	return out, added, removed
 }
 
 func truncateRunes(s string, max int) string {
@@ -231,4 +367,18 @@ func truncateRunes(s string, max int) string {
 		return s
 	}
 	return string(r[:max])
+}
+
+func truncateUTF8Bytes(s string, maxBytes int) string {
+	if maxBytes <= 0 || len(s) == 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && (s[cut]&0xC0) == 0x80 {
+		cut--
+	}
+	return s[:cut]
 }
