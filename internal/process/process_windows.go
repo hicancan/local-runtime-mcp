@@ -5,6 +5,7 @@ package process
 import (
 	"os"
 	"os/exec"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -16,7 +17,19 @@ type windowsProcessControl struct {
 	job windows.Handle
 }
 
+func configureManagedCommand(command *exec.Cmd) {
+	if command.SysProcAttr == nil {
+		command.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	// CREATE_NO_WINDOW prevents Windows (and Windows 11 Windows Terminal) from
+	// allocating a flashing conhost/terminal window when the headless daemon
+	// spawns CLI tools like powershell.exe, pwsh.exe, git.exe, or python.exe,
+	// while still allowing intentional GUI windows (e.g. WinForms/apps) to show.
+	command.SysProcAttr.CreationFlags |= windows.CREATE_NO_WINDOW
+}
+
 func startManaged(command *exec.Cmd) (processControl, error) {
+	configureManagedCommand(command)
 	job, err := newWindowsJob()
 	if err != nil {
 		return nil, err

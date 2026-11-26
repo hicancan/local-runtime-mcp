@@ -188,8 +188,11 @@ func (r *Registry) commit(name, path string) {
 	defer cancel()
 	relative, _ := filepath.Rel(r.root, path)
 	add := exec.CommandContext(ctx, "git", "-C", r.root, "add", "--", relative+".json", relative+".js")
+	configureCommand(add)
 	if add.Run() != nil {
 		return
 	}
-	_ = exec.CommandContext(ctx, "git", "-C", r.root, "commit", "-q", "-m", "feat("+strings.SplitN(name, ".", 2)[0]+"): approve "+name, "--", relative+".json", relative+".js").Run()
+	commit := exec.CommandContext(ctx, "git", "-C", r.root, "commit", "-q", "-m", "feat("+strings.SplitN(name, ".", 2)[0]+"): approve "+name, "--", relative+".json", relative+".js")
+	configureCommand(commit)
+	_ = commit.Run()
 }

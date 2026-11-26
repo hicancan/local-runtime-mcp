@@ -90,6 +90,7 @@ func (r *Registry) CallApp(ctx context.Context, name string, args map[string]any
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, path, e.command.Args...)
+	configureCommand(command)
 	command.Dir = filepath.Dir(path)
 	command.WaitDelay = 250 * time.Millisecond
 	command.Stderr = io.Discard
