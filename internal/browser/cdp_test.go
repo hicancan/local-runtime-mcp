@@ -412,3 +412,113 @@ func TestMyersLineDiffDetectsReorderAndNoOp(t *testing.T) {
 		t.Fatalf("Myers diff missed line reordering: +%d/-%d %q", added, removed, diff)
 	}
 }
+
+func TestHiddenTabScopedFocusAndScreenshotEmulation(t *testing.T) {
+	var mu sync.Mutex
+	var calls []string
+	var focusStates []bool
+
+	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		sendJSON := func(v any) {
+			b, _ := json.Marshal(v)
+			_ = websocket.Message.Send(ws, string(b))
+		}
+		for {
+			var raw string
+			if err := websocket.Message.Receive(ws, &raw); err != nil {
+				return
+			}
+			var req struct {
+				ID        int64           `json:"id"`
+				Method    string          `json:"method"`
+				Params    json.RawMessage `json:"params"`
+				SessionID string          `json:"sessionId"`
+			}
+			if json.Unmarshal([]byte(raw), &req) != nil {
+				continue
+			}
+			var params map[string]any
+			_ = json.Unmarshal(req.Params, &params)
+
+			mu.Lock()
+			calls = append(calls, req.Method)
+			mu.Unlock()
+
+			switch req.Method {
+			case "Browser.getVersion":
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"product": "Edge/158"}})
+			case "Target.attachToTarget":
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"sessionId": "S_HIDDEN"}})
+			case "Target.getTargets":
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{
+					"targetInfos": []map[string]any{{"targetId": "T_BG", "type": "page", "title": "BG", "url": "https://bg.test"}},
+				}})
+			case "Runtime.evaluate":
+				expr, _ := params["expression"].(string)
+				if expr == "document.hidden === true" {
+					sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"result": map[string]any{"value": true}}})
+				} else {
+					sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"result": map[string]any{"value": "ok"}}})
+				}
+			case "Emulation.setFocusEmulationEnabled":
+				en, _ := params["enabled"].(bool)
+				mu.Lock()
+				focusStates = append(focusStates, en)
+				mu.Unlock()
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{}})
+			case "Page.getLayoutMetrics":
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"visualViewport": map[string]any{"clientWidth": 1200, "clientHeight": 800}}})
+			case "Page.captureScreenshot":
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"data": base64.StdEncoding.EncodeToString([]byte("bgpng"))}})
+			case "DOM.getBoxModel":
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"model": map[string]any{"content": []float64{10, 10, 50, 10, 50, 30, 10, 30}}}})
+			case "Accessibility.getFullAXTree":
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"nodes": []map[string]any{
+					{"role": map[string]any{"value": "button"}, "name": map[string]any{"value": "Go"}, "backendDOMNodeId": 7},
+				}}})
+			default:
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{}})
+			}
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	bridge, err := Start(ctx, config.Browser{DisableAutoCDP: true, CDPEndpoints: []string{wsURL}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bridge.Close(context.Background())
+
+	tabID := "cdp-1:T_BG"
+	if _, err := bridge.Act(ctx, Action{TabID: tabID, Kind: "click", Locator: Locator{Role: "button", Name: "Go"}}); err != nil {
+		t.Fatalf("hidden tab click failed: %v", err)
+	}
+	data, info, err := bridge.Screenshot(ctx, ScreenshotOptions{TabID: tabID})
+	if err != nil || string(data) != "bgpng" || info.Width != 1200 || info.Height != 800 {
+		t.Fatalf("hidden tab screenshot failed: len=%d info=%+v err=%v", len(data), info, err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(focusStates) != 2 || !focusStates[0] || focusStates[1] {
+		t.Fatalf("expected scoped focus emulation [true, false], got %v", focusStates)
+	}
+	setIdx, capIdx, clrIdx := -1, -1, -1
+	for i, m := range calls {
+		switch m {
+		case "Emulation.setDeviceMetricsOverride":
+			setIdx = i
+		case "Page.captureScreenshot":
+			capIdx = i
+		case "Emulation.clearDeviceMetricsOverride":
+			clrIdx = i
+		}
+	}
+	if setIdx < 0 || capIdx <= setIdx || clrIdx <= capIdx {
+		t.Fatalf("expected setDeviceMetricsOverride -> captureScreenshot -> clearDeviceMetricsOverride order, got indices %d/%d/%d in %v", setIdx, capIdx, clrIdx, calls)
+	}
+}

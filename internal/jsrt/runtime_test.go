@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
+	"github.com/hicancan/local-runtime-mcp/internal/browser"
 	"github.com/hicancan/local-runtime-mcp/internal/filesystem"
 	runtimeprocess "github.com/hicancan/local-runtime-mcp/internal/process"
 )
@@ -733,5 +734,25 @@ func TestClosureSyncHoistingArrowNewWebGlobalsAndInterrupt(t *testing.T) {
 	})
 	if err != nil || r4.Status != "done" || r4.Value != "recovered" {
 		t.Fatalf("VM did not recover cleanly after interrupt: %+v err=%v", r4, err)
+	}
+}
+
+func TestFormatLocatorTarget(t *testing.T) {
+	cases := []struct {
+		loc  browser.Locator
+		want string
+	}{
+		{browser.Locator{CSS: "#btn"}, "#btn"},
+		{browser.Locator{Role: "button", Name: "Run"}, "button:Run"},
+		{browser.Locator{Role: "textbox"}, "textbox"},
+		{browser.Locator{Placeholder: "type here"}, "placeholder=type here"},
+		{browser.Locator{Label: "Email"}, "label=Email"},
+		{browser.Locator{Text: "Submit"}, "text=Submit"},
+		{browser.Locator{Ref: "e1:q1:e3"}, "e1:q1:e3"},
+	}
+	for _, tc := range cases {
+		if got := formatLocatorTarget(tc.loc); got != tc.want {
+			t.Fatalf("formatLocatorTarget(%+v) = %q, want %q", tc.loc, got, tc.want)
+		}
 	}
 }

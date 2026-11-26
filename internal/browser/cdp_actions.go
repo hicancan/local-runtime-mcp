@@ -34,6 +34,44 @@ type resolvedPoint struct {
 	Y         float64
 }
 
+func (c *cdpClient) isTabHidden(ctx context.Context, sessionID string) bool {
+	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	var res struct {
+		Result struct {
+			Value any `json:"value"`
+		} `json:"result"`
+	}
+	if err := c.Send(checkCtx, sessionID, "Runtime.evaluate", map[string]any{
+		"expression":    "document.hidden === true",
+		"returnByValue": true,
+	}, &res); err != nil {
+		return false
+	}
+	hidden, _ := res.Result.Value.(bool)
+	return hidden
+}
+
+// ensureActiveForInput temporarily enables Chromium focus emulation when dispatching
+// mouse/keyboard input to a hidden background tab so Blink does not stall coalesced
+// mouseMoved ACKs for 5 seconds waiting on a throttled BeginMainFrame.
+func (c *cdpClient) ensureActiveForInput(ctx context.Context, sessionID string) func() {
+	if !c.isTabHidden(ctx, sessionID) {
+		return func() {}
+	}
+	enCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	err := c.Send(enCtx, sessionID, "Emulation.setFocusEmulationEnabled", map[string]any{"enabled": true}, nil)
+	cancel()
+	if err != nil {
+		return func() {}
+	}
+	return func() {
+		relCtx, relCancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		defer relCancel()
+		_ = c.Send(relCtx, sessionID, "Emulation.setFocusEmulationEnabled", map[string]any{"enabled": false}, nil)
+	}
+}
+
 func (c *cdpClient) screenshotTab(ctx context.Context, tabID, targetID string, options ScreenshotOptions) ([]byte, ScreenshotInfo, error) {
 	if options.FullPage && (options.ClipW != 0 || options.ClipH != 0 || options.ClipX != 0 || options.ClipY != 0) {
 		return nil, ScreenshotInfo{}, errors.New("full_page and clip fields are mutually exclusive")
@@ -50,6 +88,7 @@ func (c *cdpClient) screenshotTab(ctx context.Context, tabID, targetID string, o
 	ts.mu.Lock()
 	epoch := ts.epoch
 	sessID := ts.sessionID
+	emulationActive := ts.emulationActive
 	ts.mu.Unlock()
 
 	var metrics struct {
@@ -120,10 +159,42 @@ func (c *cdpClient) screenshotTab(ctx context.Context, tabID, targetID string, o
 	}
 	params["captureBeyondViewport"] = captureBeyond
 
+	// On headful Chromium, Page.captureScreenshot(fromSurface: true) on an occluded
+	// background tab waits indefinitely for a live compositor surface unless device
+	// metrics emulation triggers an offscreen frame commit. Enable a scoped override
+	// strictly for hidden tabs that do not already have caller emulation active.
+	if !emulationActive && c.isTabHidden(ctx, sessID) {
+		ovW := int(math.Round(vp.ClientWidth))
+		ovH := int(math.Round(vp.ClientHeight))
+		if ovW < 1 {
+			ovW = 1280
+		}
+		if ovH < 1 {
+			ovH = 720
+		}
+		ovCtx, ovCancel := context.WithTimeout(ctx, 2*time.Second)
+		ovErr := c.Send(ovCtx, sessID, "Emulation.setDeviceMetricsOverride", map[string]any{
+			"width":             ovW,
+			"height":            ovH,
+			"deviceScaleFactor": 1,
+			"mobile":            false,
+		}, nil)
+		ovCancel()
+		if ovErr == nil {
+			defer func() {
+				clrCtx, clrCancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+				defer clrCancel()
+				_ = c.Send(clrCtx, sessID, "Emulation.clearDeviceMetricsOverride", nil, nil)
+			}()
+		}
+	}
+
+	shotCtx, shotCancel := context.WithTimeout(ctx, 20*time.Second)
+	defer shotCancel()
 	var capture struct {
 		Data string `json:"data"`
 	}
-	if err := c.Send(ctx, sessID, "Page.captureScreenshot", params, &capture); err != nil {
+	if err := c.Send(shotCtx, sessID, "Page.captureScreenshot", params, &capture); err != nil {
 		return nil, ScreenshotInfo{}, err
 	}
 	raw, err := decodeBase64(capture.Data)
@@ -173,6 +244,12 @@ func (c *cdpClient) actTab(ctx context.Context, tabID, targetID string, action A
 	}
 
 	var value any
+	switch action.Kind {
+	case "click", "double_click", "hover", "drag", "type_text", "set_value", "fill", "press_key", "scroll":
+		releaseFocus := c.ensureActiveForInput(ctx, ts.sessionID)
+		defer releaseFocus()
+	}
+
 	switch action.Kind {
 	case "click", "double_click":
 		pt, err := c.resolveActionPoint(ctx, ts, action, loc)

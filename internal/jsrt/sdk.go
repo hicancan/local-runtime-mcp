@@ -1124,7 +1124,7 @@ func (v *sessionVM) makeTabHandle(tab browser.Tab) goja.Value {
 				act.Kind = "click"
 			}
 		}
-		return v.spawnAsync("tab.click", firstNonEmpty(act.Ref, act.Locator.CSS, act.Locator.Name), func(ctx context.Context) (any, error) {
+		return v.spawnAsync("tab.click", firstNonEmpty(act.Ref, formatLocatorTarget(act.Locator)), func(ctx context.Context) (any, error) {
 			res, err := b.Act(ctx, act)
 			return toPlain(res), err
 		})
@@ -1282,7 +1282,7 @@ func (v *sessionVM) makeTabHandle(tab browser.Tab) goja.Value {
 		} else if err := decodeStrictObj(call.Arguments[0], &loc, sig); err != nil {
 			return v.rejected(err)
 		}
-		return v.spawnAsync("tab.css", firstNonEmpty(loc.CSS, loc.Ref, loc.Name), func(ctx context.Context) (any, error) {
+		return v.spawnAsync("tab.css", formatLocatorTarget(loc), func(ctx context.Context) (any, error) {
 			res, err := b.CSS(ctx, tabID, loc)
 			return toPlain(res), err
 		})
@@ -1382,10 +1382,31 @@ func (v *sessionVM) makeTabHandle(tab browser.Tab) goja.Value {
 	return obj
 }
 
+func formatLocatorTarget(loc browser.Locator) string {
+	switch {
+	case loc.CSS != "":
+		return loc.CSS
+	case loc.Role != "" && loc.Name != "":
+		return loc.Role + ":" + loc.Name
+	case loc.Role != "":
+		return loc.Role
+	case loc.Label != "":
+		return "label=" + loc.Label
+	case loc.Placeholder != "":
+		return "placeholder=" + loc.Placeholder
+	case loc.Text != "":
+		return "text=" + loc.Text
+	case loc.Ref != "":
+		return loc.Ref
+	default:
+		return loc.Name
+	}
+}
+
 func (v *sessionVM) makeLocatorHandle(tabID string, loc browser.Locator) goja.Value {
 	b := v.deps.Browser
 	obj := v.vm.NewObject()
-	desc := firstNonEmpty(loc.CSS, loc.Role+":"+loc.Name, loc.Text, loc.Label, loc.Placeholder, loc.Ref)
+	desc := formatLocatorTarget(loc)
 
 	act := func(kind string, mut func(*browser.Action)) goja.Value {
 		if v.isReadOnly() && kind != "wait_for" {
