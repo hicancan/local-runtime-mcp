@@ -520,7 +520,19 @@ func (m *machineTools) call(ctx context.Context, name string, input map[string]a
 	if result.StructuredContent != nil {
 		return result.StructuredContent, nil
 	}
-	out := map[string]any{"text": strings.Join(text, "\n")}
+	joined := strings.Join(text, "\n")
+	if strings.HasPrefix(strings.TrimSpace(joined), "{") {
+		var parsed map[string]any
+		if json.Unmarshal([]byte(joined), &parsed) == nil && parsed != nil {
+			if images > 0 {
+				if _, exists := parsed["images"]; !exists {
+					parsed["images"] = images
+				}
+			}
+			return parsed, nil
+		}
+	}
+	out := map[string]any{"text": joined}
 	if images > 0 {
 		out["images"] = images
 	}

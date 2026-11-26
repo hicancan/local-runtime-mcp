@@ -115,11 +115,7 @@ func TestExecutableStdio(t *testing.T) {
 			t.Fatalf("%s: %v; tool error: %s", name, err, message)
 		}
 		if output != nil {
-			data, err := json.Marshal(result.StructuredContent)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := json.Unmarshal(data, output); err != nil {
+			if err := decodeToolJSON(result, output); err != nil {
 				t.Fatal(err)
 			}
 		}
