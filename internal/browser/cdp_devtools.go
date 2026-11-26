@@ -915,15 +915,25 @@ func (c *cdpClient) screencastStartTab(ctx context.Context, targetID string, max
 	if quality <= 0 || quality > 100 {
 		quality = 75
 	}
+	ts.bgMu.Lock()
 	ts.mu.Lock()
 	if ts.bgCapturerTimer != nil {
 		ts.bgCapturerTimer.Stop()
 		ts.bgCapturerTimer = nil
 	}
+	disableFocus := ts.bgFocusOn
 	ts.bgCapturerOn = false
+	ts.bgFocusOn = false
 	ts.screencastOn = true
 	ts.screencastFrames = nil
+	sessID := ts.sessionID
 	ts.mu.Unlock()
+	if disableFocus && c.Alive() {
+		fCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		_ = c.Send(fCtx, sessID, "Emulation.setFocusEmulationEnabled", map[string]any{"enabled": false}, nil)
+		cancel()
+	}
+	ts.bgMu.Unlock()
 	params := map[string]any{"format": "jpeg", "quality": quality}
 	if maxWidth > 0 {
 		params["maxWidth"] = maxWidth
@@ -931,7 +941,7 @@ func (c *cdpClient) screencastStartTab(ctx context.Context, targetID string, max
 	if maxHeight > 0 {
 		params["maxHeight"] = maxHeight
 	}
-	return c.Send(ctx, ts.sessionID, "Page.startScreencast", params, nil)
+	return c.Send(ctx, sessID, "Page.startScreencast", params, nil)
 }
 
 func (c *cdpClient) screencastStopTab(ctx context.Context, targetID string) ([]ScreencastFrame, error) {
@@ -940,16 +950,26 @@ func (c *cdpClient) screencastStopTab(ctx context.Context, targetID string) ([]S
 		return nil, err
 	}
 	_ = c.Send(ctx, ts.sessionID, "Page.stopScreencast", nil, nil)
+	ts.bgMu.Lock()
 	ts.mu.Lock()
 	if ts.bgCapturerTimer != nil {
 		ts.bgCapturerTimer.Stop()
 		ts.bgCapturerTimer = nil
 	}
+	disableFocus := ts.bgFocusOn
 	ts.bgCapturerOn = false
+	ts.bgFocusOn = false
 	ts.screencastOn = false
 	frames := append([]ScreencastFrame(nil), ts.screencastFrames...)
 	ts.screencastFrames = nil
+	sessID := ts.sessionID
 	ts.mu.Unlock()
+	if disableFocus && c.Alive() {
+		fCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		_ = c.Send(fCtx, sessID, "Emulation.setFocusEmulationEnabled", map[string]any{"enabled": false}, nil)
+		cancel()
+	}
+	ts.bgMu.Unlock()
 	return frames, nil
 }
 

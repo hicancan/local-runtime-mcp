@@ -36,6 +36,20 @@ type resolvedPoint struct {
 
 const bgCapturerIdleTTL = 15 * time.Second
 
+type bgWakeMode uint8
+
+const (
+	// bgModeCapture keeps Chromium's Viz surface alive via Page.startScreencast
+	// with focus emulation OFF so repeated Page.captureScreenshot stays ~20ms
+	// without waiting for a new focused-renderer commit on static pages.
+	bgModeCapture bgWakeMode = iota + 1
+	// bgModeInput additionally enables Blink Emulation.setFocusEmulationEnabled
+	// so BeginMainFrame/rAF stays unthrottled for continuous rAF-aligned input
+	// events (mouseMoved / mouseWheel) that otherwise hit Chromium's 5s ACK
+	// timeout or hang on occluded background tabs.
+	bgModeInput
+)
+
 func (c *cdpClient) isTabHidden(ctx context.Context, sessionID string) bool {
 	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -54,53 +68,78 @@ func (c *cdpClient) isTabHidden(ctx context.Context, sessionID string) bool {
 	return hidden
 }
 
-// ensureBgCapturer wakes Chromium's occluded-tab compositor via Page.startScreencast
-// (WebContents::IncrementCapturerCount) when interacting with or screenshotting a
-// hidden background tab. This keeps BeginMainFrame and CopyFromSurface running at
-// full 60 FPS without switching the active tab, stealing OS focus, or mutating
-// viewport/DPR metrics, and automatically releases after bgCapturerIdleTTL of inactivity.
-func (c *cdpClient) ensureBgCapturer(ctx context.Context, ts *tabSession) {
+// ensureBgMode manages Chromium's two orthogonal background-tab throttling
+// subsystems under one idle-released lifecycle (zero active-tab switching,
+// zero OS focus stealing, zero viewport/DPR mutation):
+//   - Viz CopyFromSurface keep-alive: Page.startScreencast (16x16, q=1, every 60th frame)
+//   - Blink BeginMainFrame/rAF wake:  Emulation.setFocusEmulationEnabled (held across
+//     consecutive input operations, turned off before Page.captureScreenshot)
+func (c *cdpClient) ensureBgMode(ctx context.Context, ts *tabSession, mode bgWakeMode) {
+	ts.bgMu.Lock()
+	defer ts.bgMu.Unlock()
+
 	ts.mu.Lock()
-	if ts.screencastOn {
-		ts.mu.Unlock()
-		return
-	}
-	if ts.bgCapturerOn {
-		if ts.bgCapturerTimer != nil {
+	sessID := ts.sessionID
+	screencastOn := ts.screencastOn
+	capturerOn := ts.bgCapturerOn
+	focusOn := ts.bgFocusOn
+	ts.mu.Unlock()
+
+	wantFocus := mode == bgModeInput
+	if (capturerOn || screencastOn) && focusOn == wantFocus && (capturerOn || focusOn) {
+		ts.mu.Lock()
+		if (ts.bgCapturerOn || ts.bgFocusOn) && ts.bgCapturerTimer != nil {
 			ts.bgCapturerTimer.Reset(bgCapturerIdleTTL)
 		}
 		ts.mu.Unlock()
 		return
 	}
-	sessID := ts.sessionID
-	ts.mu.Unlock()
 
-	if !c.isTabHidden(ctx, sessID) {
-		return
+	if !capturerOn && !focusOn {
+		if !c.isTabHidden(ctx, sessID) {
+			return
+		}
 	}
 
-	startCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	err := c.Send(startCtx, sessID, "Page.startScreencast", map[string]any{
-		"format":        "jpeg",
-		"quality":       1,
-		"maxWidth":      16,
-		"maxHeight":     16,
-		"everyNthFrame": 60,
-	}, nil)
-	cancel()
-	if err != nil {
-		return
+	if !capturerOn && !screencastOn {
+		startCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		err := c.Send(startCtx, sessID, "Page.startScreencast", map[string]any{
+			"format":        "jpeg",
+			"quality":       1,
+			"maxWidth":      16,
+			"maxHeight":     16,
+			"everyNthFrame": 60,
+		}, nil)
+		cancel()
+		if err == nil {
+			capturerOn = true
+		}
+	}
+
+	if focusOn != wantFocus {
+		fCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		err := c.Send(fCtx, sessID, "Emulation.setFocusEmulationEnabled", map[string]any{"enabled": wantFocus}, nil)
+		cancel()
+		if err == nil {
+			focusOn = wantFocus
+		}
 	}
 
 	ts.mu.Lock()
-	if !ts.screencastOn && c.Alive() {
-		ts.bgCapturerOn = true
-		if ts.bgCapturerTimer != nil {
-			ts.bgCapturerTimer.Stop()
+	if c.Alive() {
+		if !ts.screencastOn {
+			ts.bgCapturerOn = capturerOn
 		}
-		ts.bgCapturerTimer = time.AfterFunc(bgCapturerIdleTTL, func() {
-			c.releaseBgCapturer(ts)
-		})
+		ts.bgFocusOn = focusOn
+		if ts.bgCapturerOn || ts.bgFocusOn {
+			if ts.bgCapturerTimer != nil {
+				ts.bgCapturerTimer.Reset(bgCapturerIdleTTL)
+			} else {
+				ts.bgCapturerTimer = time.AfterFunc(bgCapturerIdleTTL, func() {
+					c.releaseBgCapturer(ts)
+				})
+			}
+		}
 	}
 	ts.mu.Unlock()
 }
@@ -109,20 +148,33 @@ func (c *cdpClient) releaseBgCapturer(ts *tabSession) {
 	if ts == nil {
 		return
 	}
+	ts.bgMu.Lock()
+	defer ts.bgMu.Unlock()
+
 	ts.mu.Lock()
 	if ts.bgCapturerTimer != nil {
 		ts.bgCapturerTimer.Stop()
 		ts.bgCapturerTimer = nil
 	}
-	shouldStop := ts.bgCapturerOn && !ts.screencastOn
+	shouldStopSC := ts.bgCapturerOn && !ts.screencastOn
+	shouldDisableFocus := ts.bgFocusOn
 	ts.bgCapturerOn = false
+	ts.bgFocusOn = false
 	sessID := ts.sessionID
 	ts.mu.Unlock()
 
-	if shouldStop && c.Alive() {
+	if !c.Alive() {
+		return
+	}
+	if shouldDisableFocus {
+		fCtx, cancel := context.WithTimeout(c.ctx, 2*time.Second)
+		_ = c.Send(fCtx, sessID, "Emulation.setFocusEmulationEnabled", map[string]any{"enabled": false}, nil)
+		cancel()
+	}
+	if shouldStopSC {
 		stopCtx, cancel := context.WithTimeout(c.ctx, 2*time.Second)
-		defer cancel()
 		_ = c.Send(stopCtx, sessID, "Page.stopScreencast", nil, nil)
+		cancel()
 	}
 }
 
@@ -221,7 +273,7 @@ func (c *cdpClient) screenshotTab(ctx context.Context, tabID, targetID string, o
 	}
 	params["captureBeyondViewport"] = captureBeyond
 
-	c.ensureBgCapturer(ctx, ts)
+	c.ensureBgMode(ctx, ts, bgModeCapture)
 
 	shotCtx, shotCancel := context.WithTimeout(ctx, 20*time.Second)
 	defer shotCancel()
@@ -280,7 +332,7 @@ func (c *cdpClient) actTab(ctx context.Context, tabID, targetID string, action A
 	var value any
 	switch action.Kind {
 	case "click", "double_click", "hover", "drag", "type_text", "set_value", "fill", "press_key", "scroll":
-		c.ensureBgCapturer(ctx, ts)
+		c.ensureBgMode(ctx, ts, bgModeInput)
 	}
 
 	switch action.Kind {

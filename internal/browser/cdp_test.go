@@ -416,6 +416,9 @@ func TestMyersLineDiffDetectsReorderAndNoOp(t *testing.T) {
 func TestHiddenTabBackgroundCapturerLifecycle(t *testing.T) {
 	var mu sync.Mutex
 	var startCount, stopCount int
+	var focusStates []bool
+	var focusEnabled bool
+	var sawMouseWithoutFocus, sawShotWithFocus bool
 
 	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
 		sendJSON := func(v any) {
@@ -465,9 +468,28 @@ func TestHiddenTabBackgroundCapturerLifecycle(t *testing.T) {
 				stopCount++
 				mu.Unlock()
 				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{}})
+			case "Emulation.setFocusEmulationEnabled":
+				enabled, _ := params["enabled"].(bool)
+				mu.Lock()
+				focusEnabled = enabled
+				focusStates = append(focusStates, enabled)
+				mu.Unlock()
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{}})
+			case "Input.dispatchMouseEvent":
+				mu.Lock()
+				if !focusEnabled {
+					sawMouseWithoutFocus = true
+				}
+				mu.Unlock()
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{}})
 			case "Page.getLayoutMetrics":
 				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"visualViewport": map[string]any{"clientWidth": 1200, "clientHeight": 800}}})
 			case "Page.captureScreenshot":
+				mu.Lock()
+				if focusEnabled {
+					sawShotWithFocus = true
+				}
+				mu.Unlock()
 				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"data": base64.StdEncoding.EncodeToString([]byte("bgpng"))}})
 			case "DOM.getBoxModel":
 				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"model": map[string]any{"content": []float64{10, 10, 50, 10, 50, 30, 10, 30}}}})
@@ -493,16 +515,26 @@ func TestHiddenTabBackgroundCapturerLifecycle(t *testing.T) {
 	defer bridge.Close(context.Background())
 
 	tabID := "cdp-1:T_BG"
-	// Consecutive click + screenshot + click on hidden tab must start capturer ONCE and reuse it.
+	// Consecutive input ops (click -> click -> scroll) must keep focus emulation ON without re-toggling.
 	if _, err := bridge.Act(ctx, Action{TabID: tabID, Kind: "click", Locator: Locator{Role: "button", Name: "Go"}}); err != nil {
 		t.Fatalf("hidden tab click 1 failed: %v", err)
 	}
-	data, info, err := bridge.Screenshot(ctx, ScreenshotOptions{TabID: tabID})
-	if err != nil || string(data) != "bgpng" || info.Width != 1200 || info.Height != 800 {
-		t.Fatalf("hidden tab screenshot failed: len=%d info=%+v err=%v", len(data), info, err)
-	}
 	if _, err := bridge.Act(ctx, Action{TabID: tabID, Kind: "click", Locator: Locator{Role: "button", Name: "Go"}}); err != nil {
 		t.Fatalf("hidden tab click 2 failed: %v", err)
+	}
+	if _, err := bridge.Act(ctx, Action{TabID: tabID, Kind: "scroll", ScrollY: 120}); err != nil {
+		t.Fatalf("hidden tab scroll failed: %v", err)
+	}
+	// Consecutive screenshots must drop focus emulation ONCE before capture and keep capturer alive.
+	for i := 0; i < 2; i++ {
+		data, info, err := bridge.Screenshot(ctx, ScreenshotOptions{TabID: tabID})
+		if err != nil || string(data) != "bgpng" || info.Width != 1200 || info.Height != 800 {
+			t.Fatalf("hidden tab screenshot %d failed: len=%d info=%+v err=%v", i+1, len(data), info, err)
+		}
+	}
+	// Next input re-enters bgModeInput cleanly; MarkHandoff releases both focus and capturer.
+	if _, err := bridge.Act(ctx, Action{TabID: tabID, Kind: "click", Locator: Locator{Role: "button", Name: "Go"}}); err != nil {
+		t.Fatalf("hidden tab click 3 failed: %v", err)
 	}
 	if err := bridge.MarkHandoff(tabID); err != nil {
 		t.Fatalf("MarkHandoff failed: %v", err)
@@ -512,5 +544,20 @@ func TestHiddenTabBackgroundCapturerLifecycle(t *testing.T) {
 	defer mu.Unlock()
 	if startCount != 1 || stopCount != 1 {
 		t.Fatalf("expected exactly 1 startScreencast and 1 stopScreencast on handoff, got start=%d stop=%d", startCount, stopCount)
+	}
+	if sawMouseWithoutFocus {
+		t.Fatal("observed Input.dispatchMouseEvent while focus emulation was disabled")
+	}
+	if sawShotWithFocus {
+		t.Fatal("observed Page.captureScreenshot while focus emulation was enabled")
+	}
+	wantFocus := []bool{true, false, true, false}
+	if len(focusStates) != len(wantFocus) {
+		t.Fatalf("unexpected focus transitions: got %v want %v", focusStates, wantFocus)
+	}
+	for i := range wantFocus {
+		if focusStates[i] != wantFocus[i] {
+			t.Fatalf("focus transition[%d] = %v, want %v (all=%v)", i, focusStates[i], wantFocus[i], focusStates)
+		}
 	}
 }

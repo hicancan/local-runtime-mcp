@@ -134,7 +134,9 @@ type tabSession struct {
 	screencastOn     bool
 	screencastSeq    int64
 	screencastFrames []ScreencastFrame
+	bgMu             sync.Mutex
 	bgCapturerOn     bool
+	bgFocusOn        bool
 	bgCapturerTimer  *time.Timer
 	emulationActive  bool
 }
@@ -394,6 +396,7 @@ func (c *cdpClient) readLoop() {
 				ts.bgCapturerTimer = nil
 			}
 			ts.bgCapturerOn = false
+			ts.bgFocusOn = false
 			ts.mu.Unlock()
 		}
 		c.stateMu.Unlock()
@@ -496,6 +499,7 @@ func (c *cdpClient) handleEvent(env cdpEnvelope) {
 					ts.bgCapturerTimer = nil
 				}
 				ts.bgCapturerOn = false
+				ts.bgFocusOn = false
 				for child := range ts.childSessions {
 					delete(c.bySession, child)
 				}
@@ -526,6 +530,7 @@ func (c *cdpClient) handleEvent(env cdpEnvelope) {
 					ts.bgCapturerTimer = nil
 				}
 				ts.bgCapturerOn = false
+				ts.bgFocusOn = false
 				for child := range ts.childSessions {
 					delete(c.bySession, child)
 				}

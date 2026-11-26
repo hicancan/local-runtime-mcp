@@ -25,4 +25,7 @@
 
 ## 待正演条目
 
-（当前清空 — `v18.4.2` 已通过 Chromium `IncrementCapturerCount` 机制从根因彻底解决后台标签连续交互与连续截图问题，等待实战新信号。）
+### [2026-11-26] 中国大学 MOOC 新版课件页下 `icourse.outline` 误报「打开课件目录」
+- **现象 / 证据**：在 Edge 后台标签页打开 `icourse163.org/learn/...#/learn/content` 后，调用 `icourse.outline` 连续两次提示「打开课件目录」（审计 `#514–#515`）。
+- **根因判断**：`icourse.outline` 能力脚本对新版 MOOC 课件目录 DOM / 异步渲染就绪状态的判定条件未覆盖新版页面结构或展开状态。
+- **理想正演方案**：实查新版 MOOC 课件页真实 DOM 与接口结构，更新 `icourse.outline` 的目录提取与就绪判定逻辑。
