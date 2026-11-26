@@ -198,77 +198,95 @@ func (c *cdpClient) screenshotTab(ctx context.Context, tabID, targetID string, o
 	if err != nil {
 		return nil, ScreenshotInfo{}, err
 	}
-	title, pageURL := c.targetMeta(ctx, targetID)
 
 	ts.mu.Lock()
 	epoch := ts.epoch
 	sessID := ts.sessionID
 	ts.mu.Unlock()
 
-	var metrics struct {
-		CSSVisualViewport *struct {
-			PageX        float64 `json:"pageX"`
-			PageY        float64 `json:"pageY"`
-			ClientWidth  float64 `json:"clientWidth"`
-			ClientHeight float64 `json:"clientHeight"`
-		} `json:"cssVisualViewport"`
-		VisualViewport struct {
-			PageX        float64 `json:"pageX"`
-			PageY        float64 `json:"pageY"`
-			ClientWidth  float64 `json:"clientWidth"`
-			ClientHeight float64 `json:"clientHeight"`
-		} `json:"visualViewport"`
-		CSSContentSize *struct {
-			Width  float64 `json:"width"`
-			Height float64 `json:"height"`
-		} `json:"cssContentSize"`
-		ContentSize struct {
-			Width  float64 `json:"width"`
-			Height float64 `json:"height"`
-		} `json:"contentSize"`
+	// Fetch target metadata concurrently off the critical path.
+	type metaPair struct {
+		title   string
+		pageURL string
 	}
-	if err := c.Send(ctx, sessID, "Page.getLayoutMetrics", nil, &metrics); err != nil {
-		return nil, ScreenshotInfo{}, err
-	}
-	vp := metrics.VisualViewport
-	if metrics.CSSVisualViewport != nil && metrics.CSSVisualViewport.ClientWidth > 0 {
-		vp.PageX = metrics.CSSVisualViewport.PageX
-		vp.PageY = metrics.CSSVisualViewport.PageY
-		vp.ClientWidth = metrics.CSSVisualViewport.ClientWidth
-		vp.ClientHeight = metrics.CSSVisualViewport.ClientHeight
-	}
-	cs := metrics.ContentSize
-	if metrics.CSSContentSize != nil && metrics.CSSContentSize.Width > 0 {
-		cs.Width = metrics.CSSContentSize.Width
-		cs.Height = metrics.CSSContentSize.Height
-	}
+	metaCh := make(chan metaPair, 1)
+	go func() {
+		t, u := c.targetMeta(ctx, targetID)
+		metaCh <- metaPair{title: t, pageURL: u}
+	}()
 
 	x, y := 0, 0
-	width := int(math.Round(vp.ClientWidth))
-	height := int(math.Round(vp.ClientHeight))
-	if width < 1 {
-		width = 1280
-	}
-	if height < 1 {
-		height = 720
-	}
+	width, height := 1280, 720
+	var pageX, pageY float64
 	captureBeyond := false
 	params := map[string]any{
 		"format":      "png",
 		"fromSurface": true,
 	}
-	if options.FullPage {
-		width = int(math.Ceil(cs.Width))
-		height = int(math.Ceil(cs.Height))
-		captureBeyond = true
-		params["clip"] = map[string]any{"x": 0, "y": 0, "width": width, "height": height, "scale": 1}
-	} else if options.ClipW > 0 {
+
+	if options.ClipW > 0 && !options.FullPage {
+		// Explicit clip already defines exact bounds; skip redundant Page.getLayoutMetrics RPC.
 		x, y = options.ClipX, options.ClipY
 		width, height = options.ClipW, options.ClipH
 		captureBeyond = true
 		params["clip"] = map[string]any{"x": x, "y": y, "width": width, "height": height, "scale": 1}
+	} else {
+		var metrics struct {
+			CSSVisualViewport *struct {
+				PageX        float64 `json:"pageX"`
+				PageY        float64 `json:"pageY"`
+				ClientWidth  float64 `json:"clientWidth"`
+				ClientHeight float64 `json:"clientHeight"`
+			} `json:"cssVisualViewport"`
+			VisualViewport struct {
+				PageX        float64 `json:"pageX"`
+				PageY        float64 `json:"pageY"`
+				ClientWidth  float64 `json:"clientWidth"`
+				ClientHeight float64 `json:"clientHeight"`
+			} `json:"visualViewport"`
+			CSSContentSize *struct {
+				Width  float64 `json:"width"`
+				Height float64 `json:"height"`
+			} `json:"cssContentSize"`
+			ContentSize struct {
+				Width  float64 `json:"width"`
+				Height float64 `json:"height"`
+			} `json:"contentSize"`
+		}
+		if err := c.Send(ctx, sessID, "Page.getLayoutMetrics", nil, &metrics); err != nil {
+			<-metaCh
+			return nil, ScreenshotInfo{}, err
+		}
+		vp := metrics.VisualViewport
+		if metrics.CSSVisualViewport != nil && metrics.CSSVisualViewport.ClientWidth > 0 {
+			vp.PageX = metrics.CSSVisualViewport.PageX
+			vp.PageY = metrics.CSSVisualViewport.PageY
+			vp.ClientWidth = metrics.CSSVisualViewport.ClientWidth
+			vp.ClientHeight = metrics.CSSVisualViewport.ClientHeight
+		}
+		cs := metrics.ContentSize
+		if metrics.CSSContentSize != nil && metrics.CSSContentSize.Width > 0 {
+			cs.Width = metrics.CSSContentSize.Width
+			cs.Height = metrics.CSSContentSize.Height
+		}
+		pageX, pageY = vp.PageX, vp.PageY
+		width = int(math.Round(vp.ClientWidth))
+		height = int(math.Round(vp.ClientHeight))
+		if width < 1 {
+			width = 1280
+		}
+		if height < 1 {
+			height = 720
+		}
+		if options.FullPage {
+			width = int(math.Ceil(cs.Width))
+			height = int(math.Ceil(cs.Height))
+			captureBeyond = true
+			params["clip"] = map[string]any{"x": 0, "y": 0, "width": width, "height": height, "scale": 1}
+		}
 	}
 	if width < 1 || height < 1 || width > 32768 || height > 32768 || int64(width)*int64(height) > 100_000_000 {
+		<-metaCh
 		return nil, ScreenshotInfo{}, errors.New("requested screenshot dimensions are outside supported bounds")
 	}
 	params["captureBeyondViewport"] = captureBeyond
@@ -281,12 +299,15 @@ func (c *cdpClient) screenshotTab(ctx context.Context, tabID, targetID string, o
 		Data string `json:"data"`
 	}
 	if err := c.Send(shotCtx, sessID, "Page.captureScreenshot", params, &capture); err != nil {
+		<-metaCh
 		return nil, ScreenshotInfo{}, err
 	}
 	raw, err := decodeBase64(capture.Data)
 	if err != nil {
+		<-metaCh
 		return nil, ScreenshotInfo{}, err
 	}
+	meta := <-metaCh
 
 	shotID := ""
 	if !options.FullPage && options.ClipW == 0 {
@@ -296,8 +317,8 @@ func (c *cdpClient) screenshotTab(ctx context.Context, tabID, targetID string, o
 			ID:     shotID,
 			Width:  width,
 			Height: height,
-			PageX:  vp.PageX,
-			PageY:  vp.PageY,
+			PageX:  pageX,
+			PageY:  pageY,
 		}
 		ts.mu.Unlock()
 	}
@@ -306,8 +327,8 @@ func (c *cdpClient) screenshotTab(ctx context.Context, tabID, targetID string, o
 		TabID:        tabID,
 		PageEpoch:    epoch,
 		ScreenshotID: shotID,
-		Title:        title,
-		URL:          pageURL,
+		Title:        meta.title,
+		URL:          meta.pageURL,
 		X:            x,
 		Y:            y,
 		Width:        width,

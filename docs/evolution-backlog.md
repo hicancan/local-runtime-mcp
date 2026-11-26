@@ -25,7 +25,4 @@
 
 ## 待正演条目
 
-### [2026-11-26] 中国大学 MOOC 新版课件页下 `icourse.outline` 误报「打开课件目录」
-- **现象 / 证据**：在 Edge 后台标签页打开 `icourse163.org/learn/...#/learn/content` 后，调用 `icourse.outline` 连续两次提示「打开课件目录」（审计 `#514–#515`）。
-- **根因判断**：`icourse.outline` 能力脚本对新版 MOOC 课件目录 DOM / 异步渲染就绪状态的判定条件未覆盖新版页面结构或展开状态。
-- **理想正演方案**：实查新版 MOOC 课件页真实 DOM 与接口结构，更新 `icourse.outline` 的目录提取与就绪判定逻辑。
+（当前清空 — `v18.4.5` 已完成新版 MOOC 课件页 `icourse.outline` 解析、OAuth 真实客户端归属与 `screenshotTab` 并行化优化，等待实战新信号。）

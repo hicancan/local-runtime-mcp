@@ -255,6 +255,9 @@ func TestDiscoveryAndApprovalFlow(t *testing.T) {
 	if !f.server.ValidateBearer(tokens.AccessToken) {
 		t.Fatal("issued access token rejected")
 	}
+	if clientID, ok := f.server.AuthenticateBearer(tokens.AccessToken); !ok || clientID != testClient {
+		t.Fatalf("AuthenticateBearer = (%q, %t), want (%q, true)", clientID, ok, testClient)
+	}
 	for _, nonAccess := range []string{testOwner, testSecret, tokens.RefreshToken, "", "unknown", strings.Repeat("x", 300)} {
 		if f.server.ValidateBearer(nonAccess) {
 			t.Fatal("non-access credential accepted as bearer")

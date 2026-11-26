@@ -159,8 +159,13 @@ func NewHTTP(server *mcp.Server, cfg HTTPConfig) (*HTTPServer, error) {
 				tokenReadOnly = matched.ReadOnly
 				tokenPolicy = remoteTokenPolicy(matched)
 			} else if authorization != nil {
-				valid = authorization.ValidateBearer(provided)
-				defaultAgent = "oauth"
+				if clientID, ok := authorization.AuthenticateBearer(provided); ok {
+					valid = true
+					defaultAgent = clientID
+					if defaultAgent == "" {
+						defaultAgent = "oauth"
+					}
+				}
 			} else if len(cfg.BearerToken) >= 32 {
 				valid = len(provided) == len(cfg.BearerToken) && subtle.ConstantTimeCompare([]byte(provided), []byte(cfg.BearerToken)) == 1
 				defaultAgent = "remote-bearer"

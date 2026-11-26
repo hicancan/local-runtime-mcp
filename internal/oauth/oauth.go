@@ -185,11 +185,12 @@ func (s *Server) Challenge() string {
 	return `Bearer resource_metadata="` + s.issuer + `/.well-known/oauth-protected-resource/mcp", scope="mcp"`
 }
 
-// ValidateBearer accepts only live access tokens issued by this server, never
-// owner approval keys, client secrets, authorization codes, or refresh tokens.
-func (s *Server) ValidateBearer(token string) bool {
+// AuthenticateBearer accepts only live access tokens issued by this server, never
+// owner approval keys, client secrets, authorization codes, or refresh tokens,
+// returning the registered OAuth client_id that owns the grant.
+func (s *Server) AuthenticateBearer(token string) (string, bool) {
 	if len(token) == 0 || len(token) > 256 {
-		return false
+		return "", false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -197,10 +198,19 @@ func (s *Server) ValidateBearer(token string) bool {
 	s.cleanup(now)
 	grant, ok := s.access[digest(token)]
 	if !ok || !now.Before(grant.expires) {
-		return false
+		return "", false
 	}
 	family, ok := s.families[grant.family]
-	return ok && now.Before(family.expires)
+	if !ok || !now.Before(family.expires) {
+		return "", false
+	}
+	return family.clientID, true
+}
+
+// ValidateBearer reports whether token is a live OAuth access token issued by this server.
+func (s *Server) ValidateBearer(token string) bool {
+	_, ok := s.AuthenticateBearer(token)
+	return ok
 }
 
 // ServeHTTP implements only OAuth 2.0 endpoints, not OpenID Connect discovery.

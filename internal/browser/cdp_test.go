@@ -415,7 +415,7 @@ func TestMyersLineDiffDetectsReorderAndNoOp(t *testing.T) {
 
 func TestHiddenTabBackgroundCapturerLifecycle(t *testing.T) {
 	var mu sync.Mutex
-	var startCount, stopCount int
+	var startCount, stopCount, metricsCount int
 	var focusStates []bool
 	var focusEnabled bool
 	var sawMouseWithoutFocus, sawShotWithFocus bool
@@ -483,6 +483,9 @@ func TestHiddenTabBackgroundCapturerLifecycle(t *testing.T) {
 				mu.Unlock()
 				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{}})
 			case "Page.getLayoutMetrics":
+				mu.Lock()
+				metricsCount++
+				mu.Unlock()
 				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"visualViewport": map[string]any{"clientWidth": 1200, "clientHeight": 800}}})
 			case "Page.captureScreenshot":
 				mu.Lock()
@@ -532,6 +535,10 @@ func TestHiddenTabBackgroundCapturerLifecycle(t *testing.T) {
 			t.Fatalf("hidden tab screenshot %d failed: len=%d info=%+v err=%v", i+1, len(data), info, err)
 		}
 	}
+	// Clipped screenshot must skip redundant Page.getLayoutMetrics RPC while returning exact clip bounds.
+	if data, info, err := bridge.Screenshot(ctx, ScreenshotOptions{TabID: tabID, ClipW: 320, ClipH: 140}); err != nil || string(data) != "bgpng" || info.Width != 320 || info.Height != 140 {
+		t.Fatalf("hidden tab clipped screenshot failed: len=%d info=%+v err=%v", len(data), info, err)
+	}
 	// Next input re-enters bgModeInput cleanly; MarkHandoff releases both focus and capturer.
 	if _, err := bridge.Act(ctx, Action{TabID: tabID, Kind: "click", Locator: Locator{Role: "button", Name: "Go"}}); err != nil {
 		t.Fatalf("hidden tab click 3 failed: %v", err)
@@ -544,6 +551,9 @@ func TestHiddenTabBackgroundCapturerLifecycle(t *testing.T) {
 	defer mu.Unlock()
 	if startCount != 1 || stopCount != 1 {
 		t.Fatalf("expected exactly 1 startScreencast and 1 stopScreencast on handoff, got start=%d stop=%d", startCount, stopCount)
+	}
+	if metricsCount != 2 {
+		t.Fatalf("expected 2 Page.getLayoutMetrics calls (skipped for clipped screenshot), got %d", metricsCount)
 	}
 	if sawMouseWithoutFocus {
 		t.Fatal("observed Input.dispatchMouseEvent while focus emulation was disabled")
