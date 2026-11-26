@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -598,5 +600,128 @@ func TestConcurrentRefreshAndBearerValidation(t *testing.T) {
 	}
 	if successes != 1 || f.server.ValidateBearer(tokens.AccessToken) {
 		t.Fatal("refresh race reused a token or kept replayed family valid")
+	}
+}
+
+func TestDiscoveryPathInsertionAlias(t *testing.T) {
+	f := newFixture(t)
+	w := f.request(http.MethodGet, "/.well-known/oauth-authorization-server/mcp", nil, nil, false)
+	var meta map[string]any
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &meta) != nil {
+		t.Fatalf("path-insertion discovery failed: status=%d", w.Code)
+	}
+	if meta["issuer"] != testIssuer || meta["token_endpoint"] != testIssuer+"/oauth/token" {
+		t.Fatalf("unexpected discovery metadata: %+v", meta)
+	}
+}
+
+func TestRefreshAllowsOmittedResourceAndSlidesFamilyExpiry(t *testing.T) {
+	f := newFixture(t)
+	tokens := f.tokens()
+
+	// Advance 20 days and refresh WITHOUT sending the optional resource field.
+	f.advance(20 * 24 * time.Hour)
+	params := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {tokens.RefreshToken}}
+	second := readTokens(t, f.request(http.MethodPost, "/oauth/token", params, nil, true))
+	if !f.server.ValidateBearer(second.AccessToken) {
+		t.Fatal("refresh with omitted resource failed")
+	}
+
+	// Advance another 20 days (40 days total > 30-day base lifetime); sliding window keeps family alive.
+	f.advance(20 * 24 * time.Hour)
+	params.Set("refresh_token", second.RefreshToken)
+	third := readTokens(t, f.request(http.MethodPost, "/oauth/token", params, nil, true))
+	if !f.server.ValidateBearer(third.AccessToken) {
+		t.Fatal("sliding refresh family expired prematurely despite active refreshes")
+	}
+
+	// Full 30 days of inactivity after the latest refresh still expires the family cleanly.
+	f.advance(refreshLifetime)
+	params.Set("refresh_token", third.RefreshToken)
+	assertError(t, f.request(http.MethodPost, "/oauth/token", params, nil, true), http.StatusBadRequest, "invalid_grant")
+}
+
+func TestZeroPlaintextGrantPersistenceAcrossRestarts(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "lrmcp-oauth-grants.json")
+	cfg := testConfig()
+	cfg.StorePath = storePath
+
+	srv1, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f1 := &fixture{t: t, server: srv1}
+	first := f1.tokens()
+	second := readTokens(t, f1.request(http.MethodPost, "/oauth/token", refreshParams(first.RefreshToken), nil, true))
+
+	// Verify persisted file exists and contains ZERO plaintext tokens or secrets.
+	raw, err := os.ReadFile(storePath)
+	if err != nil {
+		t.Fatalf("persisted grant store missing: %v", err)
+	}
+	content := string(raw)
+	for _, secretVal := range []string{first.AccessToken, first.RefreshToken, second.AccessToken, second.RefreshToken, testSecret, testOwner} {
+		if strings.Contains(content, secretVal) {
+			t.Fatalf("persisted grant store leaked plaintext secret/token!")
+		}
+	}
+
+	// Simulate full daemon restart / binary upgrade with a brand-new Server instance.
+	srv2, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f2 := &fixture{t: t, server: srv2}
+
+	if clientID, ok := srv2.AuthenticateBearer(second.AccessToken); !ok || clientID != testClient {
+		t.Fatalf("reloaded access token failed: clientID=%q ok=%t", clientID, ok)
+	}
+	// Refresh token rotation continues seamlessly after restart.
+	third := readTokens(t, f2.request(http.MethodPost, "/oauth/token", refreshParams(second.RefreshToken), nil, true))
+	if !srv2.ValidateBearer(third.AccessToken) {
+		t.Fatal("refresh rotation after restart produced unusable access token")
+	}
+
+	// Reload again and verify replaying a pre-restart USED refresh token still revokes the family!
+	srv3, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f3 := &fixture{t: t, server: srv3}
+	assertError(t, f3.request(http.MethodPost, "/oauth/token", refreshParams(first.RefreshToken), nil, true), http.StatusBadRequest, "invalid_grant")
+	if srv3.ValidateBearer(third.AccessToken) {
+		t.Fatal("replaying used refresh token after restart did not revoke family")
+	}
+
+	// Issue fresh grant, then verify rotating client_secret or owner_token invalidates persisted grants.
+	fourth := f3.tokens()
+	changedSecret := testConfig()
+	changedSecret.StorePath = storePath
+	changedSecret.Clients[0].Secret = "rotated-client-secret-01234567890123456789"
+	srvRotatedClient, err := New(changedSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if srvRotatedClient.ValidateBearer(fourth.AccessToken) {
+		t.Fatal("rotating client_secret did not invalidate persisted grants for that client")
+	}
+
+	changedOwner := testConfig()
+	changedOwner.StorePath = storePath
+	changedOwner.OwnerToken = "rotated-owner-token-0123456789012345678901"
+	srvRotatedOwner, err := New(changedOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if srvRotatedOwner.ValidateBearer(fourth.AccessToken) {
+		t.Fatal("rotating owner_token did not invalidate all persisted grants")
+	}
+
+	// Corrupt store file degrades gracefully without failing startup.
+	if err := os.WriteFile(storePath, []byte("{corrupt json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(cfg); err != nil {
+		t.Fatalf("corrupt grant store prevented startup: %v", err)
 	}
 }

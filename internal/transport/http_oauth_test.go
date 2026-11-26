@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -360,6 +361,59 @@ func TestHTTPOAuthCoexistsWithNamedRemoteTokensAndHeaders(t *testing.T) {
 	}
 	if !seenMeta.Policy("ping", true, false) || seenMeta.Policy("process_run", false, true) {
 		t.Fatal("read-only RemoteToken policy did not enforce read-only boundary")
+	}
+}
+
+func TestHTTPOAuthGrantsSurviveServerRestart(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "lrmcp-oauth-grants.json")
+	makeServer := func() *mcp.Server {
+		s := mcp.NewServer(&mcp.Implementation{Name: "oauth-restart-test", Version: "1"}, nil)
+		mcp.AddTool(s, &mcp.Tool{Name: "ping", Description: "Return pong."}, func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct {
+			Value string `json:"value"`
+		}, error) {
+			return nil, struct {
+				Value string `json:"value"`
+			}{Value: "pong"}, nil
+		})
+		return s
+	}
+
+	auth1 := oauthFixtureConfig()
+	auth1.StorePath = storePath
+	srv1, err := NewHTTP(makeServer(), HTTPConfig{
+		Listen: "127.0.0.1:0", PublicHost: "mcp.example.test", OAuth: &auth1, Wire: "cloudflare",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	done1 := make(chan error, 1)
+	go func() { done1 <- srv1.Run(ctx1) }()
+	access := approveOAuthFixture(t, srv1, strings.Repeat("r", 64))
+	cancel1()
+	if err := <-done1; err != nil {
+		t.Fatalf("first HTTP server shutdown failed: %v", err)
+	}
+
+	// Start a brand-new HTTP server pointing to the same persisted grant store.
+	auth2 := oauthFixtureConfig()
+	auth2.StorePath = storePath
+	srv2 := startHTTPFixture(t, makeServer(), HTTPConfig{
+		Listen: "127.0.0.1:0", PublicHost: "mcp.example.test", OAuth: &auth2, Wire: "cloudflare",
+	})
+	client := mcp.NewClient(&mcp.Implementation{Name: "oauth-restart-client", Version: "1"}, nil)
+	session, err := client.Connect(context.Background(), &mcp.StreamableClientTransport{
+		Endpoint:             "http://" + srv2.Address() + "/mcp",
+		HTTPClient:           &http.Client{Timeout: 5 * time.Second, Transport: bearerRoundTripper{base: http.DefaultTransport, token: access}},
+		DisableStandaloneSSE: true,
+	}, nil)
+	if err != nil {
+		t.Fatalf("OAuth MCP reconnect after server restart failed: %v", err)
+	}
+	defer session.Close()
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "ping", Arguments: map[string]any{}})
+	if err != nil || result.IsError {
+		t.Fatalf("OAuth MCP call after restart failed: %+v %v", result, err)
 	}
 }
 

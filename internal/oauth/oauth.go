@@ -1,6 +1,7 @@
 // Package oauth implements owner-approved OAuth grants for the public MCP
-// endpoint. Clients are registered in the runtime configuration; all grants
-// belong to this running instance and are invalidated when it exits.
+// endpoint. Clients are preregistered in the runtime configuration; when
+// StorePath is set, active grant digests (SHA-256 only, zero plaintext tokens)
+// are persisted atomically across daemon restarts and binary upgrades.
 package oauth
 
 import (
@@ -49,8 +50,11 @@ type Client struct {
 
 // Config describes the public issuer and the key a machine owner must enter on
 // the consent page. OwnerToken is not an MCP bearer token or a client secret.
+// When StorePath is non-empty, active OAuth grant digests are persisted
+// atomically across restarts without storing any plaintext tokens on disk.
 type Config struct {
 	Issuer     string   `yaml:"-"`
+	StorePath  string   `yaml:"-"`
 	OwnerToken string   `yaml:"owner_token,omitempty"`
 	Clients    []Client `yaml:"clients,omitempty"`
 }
@@ -95,17 +99,17 @@ type refreshGrant struct {
 // Server serves OAuth discovery, explicit owner approval, and token endpoints.
 // It is safe to share one Server between concurrent HTTP connections.
 type Server struct {
-	issuer, resource, origin, cookieName string
-	secureCookie                         bool
-	owner                                [32]byte
-	clients                              map[string]registeredClient
-	mu                                   sync.Mutex
-	now                                  func() time.Time
-	tickets                              map[[32]byte]approvalTicket
-	codes                                map[[32]byte]authorizationCode
-	families                             map[[32]byte]grantFamily
-	access                               map[[32]byte]accessGrant
-	refresh                              map[[32]byte]refreshGrant
+	issuer, resource, origin, cookieName, storePath string
+	secureCookie                                    bool
+	owner                                           [32]byte
+	clients                                         map[string]registeredClient
+	mu                                              sync.Mutex
+	now                                             func() time.Time
+	tickets                                         map[[32]byte]approvalTicket
+	codes                                           map[[32]byte]authorizationCode
+	families                                        map[[32]byte]grantFamily
+	access                                          map[[32]byte]accessGrant
+	refresh                                         map[[32]byte]refreshGrant
 }
 
 // New validates all configuration before creating an authorization server.
@@ -123,7 +127,7 @@ func New(config Config) (*Server, error) {
 	}
 	s := &Server{
 		issuer: issuer, resource: issuer + "/mcp", origin: parsed.Scheme + "://" + parsed.Host,
-		secureCookie: parsed.Scheme == "https", cookieName: "lrmcp-oauth",
+		secureCookie: parsed.Scheme == "https", cookieName: "lrmcp-oauth", storePath: strings.TrimSpace(config.StorePath),
 		owner: sha256.Sum256([]byte(config.OwnerToken)), clients: make(map[string]registeredClient),
 		now: time.Now, tickets: make(map[[32]byte]approvalTicket), codes: make(map[[32]byte]authorizationCode),
 		families: make(map[[32]byte]grantFamily), access: make(map[[32]byte]accessGrant), refresh: make(map[[32]byte]refreshGrant),
@@ -158,6 +162,7 @@ func New(config Config) (*Server, error) {
 		}
 		s.clients[client.ID] = registered
 	}
+	s.loadGrants()
 	return s, nil
 }
 
@@ -234,7 +239,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"resource": s.resource, "authorization_servers": []string{s.issuer},
 			"scopes_supported": []string{scope}, "bearer_methods_supported": []string{"header"},
 		})
-	case "/.well-known/oauth-authorization-server":
+	case "/.well-known/oauth-authorization-server", "/.well-known/oauth-authorization-server/mcp":
 		if !method(w, r, http.MethodGet) {
 			return
 		}
@@ -429,18 +434,30 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if form.Get("resource") != s.resource {
-		oauthError(w, http.StatusBadRequest, "invalid_target", "resource must identify this MCP endpoint")
-		return
-	}
 	if requestedScope := form.Get("scope"); requestedScope != "" && requestedScope != scope {
 		oauthError(w, http.StatusBadRequest, "invalid_scope", "only the mcp scope is supported")
 		return
 	}
+	grantType := form.Get("grant_type")
+	switch grantType {
+	case "authorization_code":
+		if form.Get("resource") != s.resource {
+			oauthError(w, http.StatusBadRequest, "invalid_target", "resource must identify this MCP endpoint")
+			return
+		}
+	case "refresh_token":
+		// A refresh family is already bound to s.resource at issuance; allow OAuth 2.1
+		// clients that omit optional resource on background refresh while still
+		// rejecting any mismatched resource target.
+		if res := form.Get("resource"); res != "" && res != s.resource {
+			oauthError(w, http.StatusBadRequest, "invalid_target", "resource must identify this MCP endpoint")
+			return
+		}
+	}
 	s.mu.Lock()
 	now := s.now()
 	s.cleanup(now)
-	switch form.Get("grant_type") {
+	switch grantType {
 	case "authorization_code":
 		key := digest(form.Get("code"))
 		code, exists := s.codes[key]
@@ -453,6 +470,7 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 		}
 		if code.consumed {
 			s.revokeFamily(code.family)
+			s.persistLocked(now)
 			s.mu.Unlock()
 			oauthError(w, http.StatusBadRequest, "invalid_grant", "authorization code was already used")
 			return
@@ -478,6 +496,7 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 		s.families[family] = grantFamily{clientID: clientID, expires: now.Add(refreshLifetime)}
 		code.consumed, code.family = true, family
 		s.codes[key] = code
+		s.persistLocked(now)
 		s.mu.Unlock()
 		writeTokens(w, access, refresh)
 	case "refresh_token":
@@ -491,6 +510,7 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 		}
 		if refresh.used {
 			s.revokeFamily(refresh.family)
+			s.persistLocked(now)
 			s.mu.Unlock()
 			oauthError(w, http.StatusBadRequest, "invalid_grant", "refresh token was already used")
 			return
@@ -508,6 +528,11 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 		}
 		refresh.used = true
 		s.refresh[key] = refresh
+		// Slide the family inactivity window on each legitimate refresh so actively
+		// used remote connectors remain authenticated without forced re-approval.
+		family.expires = now.Add(refreshLifetime)
+		s.families[refresh.family] = family
+		s.persistLocked(now)
 		s.mu.Unlock()
 		writeTokens(w, access, nextRefresh)
 	default:
@@ -550,6 +575,7 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) {
 	}
 	if family, exists := s.families[familyID]; exists && family.clientID == clientID {
 		s.revokeFamily(familyID)
+		s.persistLocked(s.now())
 	}
 	s.mu.Unlock()
 	// RFC 7009 deliberately does not reveal whether the token existed.

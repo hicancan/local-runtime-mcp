@@ -88,7 +88,7 @@ The public origin supports a selected Bearer or OAuth mode. OAuth uses Authoriza
 
 OAuth grants access to the full machine-control surface with the permissions of the account running `lrmcp`. Resource IDs and desktop ownership coordinate work inside that shared authority. For separate security boundaries, run separate OS accounts or machines.
 
-Authorization codes, pending consent, access tokens, and refresh tokens are in memory. Restarting the runtime requires clients to authorize again. Registered client credentials and the owner approval key remain in the portable YAML. An archive or runtime update preserves the operator's configuration; switching authentication is an explicit setup or configuration action.
+Authorization codes and pending consent tickets remain in memory only. Active OAuth access and refresh grant families are persisted atomically alongside the configuration as SHA-256 digests (`lrmcp-oauth-grants.json`, mode `0600`, zero plaintext tokens on disk) with a sliding 30-day inactivity window, so binary upgrades, daemon restarts, and tunnel reconnects never force clients to re-authorize. Rotating `owner_token`, rotating a client's `client_secret`, or deleting `lrmcp-oauth-grants.json` immediately invalidates the affected persisted grants. Registered client credentials and the owner approval key remain in the portable YAML.
 
 ## Cross-provider acceptance
 

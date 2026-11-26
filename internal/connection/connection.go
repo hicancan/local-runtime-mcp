@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -332,6 +333,9 @@ func publicHTTPConfig(cfg *config.Config) (transport.HTTPConfig, error) {
 		}
 		oauthConfig := cfg.HTTP.OAuth
 		oauthConfig.Issuer = "https://" + cfg.HTTP.PublicHost
+		if cfg.Path != "" {
+			oauthConfig.StorePath = filepath.Join(filepath.Dir(cfg.Path), "lrmcp-oauth-grants.json")
+		}
 		result.OAuth = &oauthConfig
 	default:
 		return result, errors.New("http.auth must be bearer or oauth")

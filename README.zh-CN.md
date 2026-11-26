@@ -296,7 +296,7 @@ go build -trimpath -ldflags="-s -w" -o lrmcp.exe ./cmd/lrmcp
 ## 安全、隐私与许可
 
 - 通过认证的客户端以运行 `lrmcp` 的系统账户权限执行；本机面（`127.0.0.1:9317`）与扩展桥（`127.0.0.1:9315`）严格拒绝非回环主机、跨源请求与代理头。
-- 远端外线严格遵循 `grants.remote` 权限边界（含 SDK 级只读沙箱），OAuth 访问与刷新令牌仅驻留内存、重启即清空。
+- 远端外线严格遵循 `grants.remote` 权限边界（含 SDK 级只读沙箱），OAuth 授权持久化仅写入 SHA-256 摘要（`lrmcp-oauth-grants.json`，磁盘零明文令牌）。
 - **零遥测、零静默上报**——除你主动插上的隧道之外，一切数据留在本地。
 - 详见 [SECURITY.md](SECURITY.md)、[PRIVACY.md](PRIVACY.md) 与 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 - 遵循 [GNU AGPL v3.0 only](LICENSE) 开源许可。

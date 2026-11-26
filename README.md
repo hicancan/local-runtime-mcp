@@ -296,7 +296,7 @@ go build -trimpath -ldflags="-s -w" -o lrmcp.exe ./cmd/lrmcp
 ## Security, Privacy, and License
 
 - Authenticated clients operate under the OS account running `lrmcp`; `127.0.0.1:9317` (local plane) and `127.0.0.1:9315` (extension bridge) strictly reject non-loopback hosts, foreign origins, and proxy headers.
-- Remote wires obey per-wire `grants.remote` boundaries (including SDK-enforced read-only mode), and OAuth access/refresh tokens live in memory only.
+- Remote wires obey per-wire `grants.remote` boundaries (including SDK-enforced read-only mode), and OAuth grant persistence stores SHA-256 digests only (`lrmcp-oauth-grants.json`, zero plaintext tokens on disk).
 - **Zero telemetry or phone-home** — everything stays on your machine unless you explicitly plug in a tunnel.
 - See [SECURITY.md](SECURITY.md), [PRIVACY.md](PRIVACY.md), and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 - Licensed under [GNU AGPL v3.0 only](LICENSE).
