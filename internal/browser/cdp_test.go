@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -569,5 +570,43 @@ func TestHiddenTabBackgroundCapturerLifecycle(t *testing.T) {
 		if focusStates[i] != wantFocus[i] {
 			t.Fatalf("focus transition[%d] = %v, want %v (all=%v)", i, focusStates[i], wantFocus[i], focusStates)
 		}
+	}
+}
+
+func TestConcurrentConnectSingleflight(t *testing.T) {
+	srv, wsURL := startMockCDPServer(t)
+	defer srv.Close()
+
+	ctx := context.Background()
+	bridge, err := Start(ctx, config.Browser{
+		CDPEndpoints:   []string{wsURL},
+		DisableAutoCDP: true,
+	})
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer bridge.Close(ctx)
+
+	const callers = 8
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			inst, err := bridge.Connect(ctx, "cdp-1")
+			if err != nil {
+				errs <- err
+				return
+			}
+			if !inst.Connected {
+				errs <- fmt.Errorf("expected connected instance, got %+v", inst)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent Connect failed: %v", err)
 	}
 }

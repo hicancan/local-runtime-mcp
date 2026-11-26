@@ -25,4 +25,4 @@
 
 ## 待正演条目
 
-（当前清空 — `v18.4.7` 已统一全栈桌面 `ref_id` 命名并将 `emitImage` 响应对齐为纯 `ImageContent` + `StructuredContent` 报文格式，等待云端双通道视觉对照复测信号。）
+（当前清空 — `v18.4.8` 已落地无遮蔽原生 `ImageContent` 透传、`run.files` 双向文件入站通道、CDP 并发拨号单飞协调与扩展配置自动同步。）

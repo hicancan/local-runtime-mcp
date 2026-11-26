@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -95,8 +94,9 @@ func TestMultiIngressHostSharesSessionsAndSurvivesPrivateClosure(t *testing.T) {
 		t.Fatalf("launch private cell failed: %v %+v", err, runRes)
 	}
 	var c1 jsrt.CellResult
-	raw1, _ := json.Marshal(runRes.StructuredContent)
-	_ = json.Unmarshal(raw1, &c1)
+	if err := decodeToolJSON(runRes, &c1); err != nil {
+		t.Fatalf("decode run result: %v", err)
+	}
 	if c1.Status != "running" || c1.CellID == "" {
 		t.Fatalf("expected running cell_id, got %+v", c1)
 	}
@@ -114,8 +114,9 @@ func TestMultiIngressHostSharesSessionsAndSurvivesPrivateClosure(t *testing.T) {
 		t.Fatalf("public entrance could not collect private cell: %v %+v", err, waitRes)
 	}
 	var c2 jsrt.CellResult
-	raw2, _ := json.Marshal(waitRes.StructuredContent)
-	_ = json.Unmarshal(raw2, &c2)
+	if err := decodeToolJSON(waitRes, &c2); err != nil {
+		t.Fatalf("decode wait result: %v", err)
+	}
 	if c2.Status != "done" || c2.Value != "shared-ok" || !strings.Contains(c2.Output, "survived-closure") {
 		t.Fatalf("unexpected collected cell: %+v", c2)
 	}
@@ -147,8 +148,9 @@ func TestMultiIngressHostSharesSessionsAndSurvivesPrivateClosure(t *testing.T) {
 			Control computer.ControlStatus `json:"control"`
 		} `json:"value"`
 	}
-	rawP, _ := json.Marshal(probeRes.StructuredContent)
-	_ = json.Unmarshal(rawP, &probe)
+	if err := decodeToolJSON(probeRes, &probe); err != nil {
+		t.Fatalf("decode probe result: %v", err)
+	}
 	if probe.Value.File.Type != "file" || !probe.Value.Browser.Configured || probe.Value.Control.Status != "free" {
 		t.Fatalf("unexpected probe result: %+v", probe.Value)
 	}

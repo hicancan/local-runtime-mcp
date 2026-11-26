@@ -74,6 +74,8 @@ type cdpEntry struct {
 	lastSeen   time.Time
 	client     *cdpClient
 	dialing    bool
+	dialDone   chan struct{}
+	dialErr    error
 	rejectedFP string
 }
 
@@ -525,24 +527,69 @@ func (b *Bridge) resolveClient(ctx context.Context, browserID string, forceRetry
 		return nil, fmt.Errorf("%s is awaiting one-time 'Allow' on its remote debugging prompt (%s); click Allow in the browser then call browser.connect(%q)", entry.discovered.Label, entry.discovered.WSURL, entry.discovered.ID)
 	}
 	if entry.dialing {
+		waitCh := entry.dialDone
+		discLabel := entry.discovered.Label
+		discWS := entry.discovered.WSURL
 		b.mu.Unlock()
-		return nil, fmt.Errorf("%s already has a pending remote debugging connection awaiting one-time 'Allow' (%s)", entry.discovered.Label, entry.discovered.WSURL)
+		if waitCh != nil {
+			select {
+			case <-waitCh:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		b.mu.Lock()
+		if entry.client != nil && entry.client.Alive() {
+			cl := entry.client
+			entry.lastSeen = time.Now()
+			b.mu.Unlock()
+			return cl, nil
+		}
+		err := entry.dialErr
+		b.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%s remote debugging connection did not complete (%s)", discLabel, discWS)
 	}
+	dialDone := make(chan struct{})
 	entry.state = "awaiting_approval"
 	entry.dialing = true
+	entry.dialDone = dialDone
+	entry.dialErr = nil
 	disc := entry.discovered
 	b.mu.Unlock()
+
+	finishDial := func(cl *cdpClient, state string, retErr error, rejected bool) (*cdpClient, error) {
+		b.mu.Lock()
+		entry.dialing = false
+		if entry.dialDone == dialDone {
+			entry.dialDone = nil
+		}
+		entry.dialErr = retErr
+		if retErr != nil {
+			entry.lastError = retErr.Error()
+			entry.state = state
+			if rejected {
+				entry.rejectedFP = disc.Fingerprint
+			}
+		} else {
+			entry.client = cl
+			entry.state = "connected"
+			entry.lastError = ""
+			entry.rejectedFP = ""
+			entry.lastSeen = time.Now()
+		}
+		b.mu.Unlock()
+		close(dialDone)
+		return cl, retErr
+	}
 
 	wsURL := disc.WSURL
 	if wsURL == "" && disc.HTTPURL != "" {
 		resolved, _, err := resolveHTTPCDPURL(ctx, disc.HTTPURL)
 		if err != nil {
-			b.mu.Lock()
-			entry.dialing = false
-			entry.state = "offline"
-			entry.lastError = err.Error()
-			b.mu.Unlock()
-			return nil, err
+			return finishDial(nil, "offline", err, false)
 		}
 		wsURL = resolved
 	}
@@ -555,38 +602,20 @@ func (b *Bridge) resolveClient(ctx context.Context, browserID string, forceRetry
 	}
 
 	cl, err := dialCDP(dialCtx, disc.ID, disc.Label, wsURL, disc.Fingerprint)
-	b.mu.Lock()
-	entry.dialing = false
 	if err != nil {
-		entry.lastError = err.Error()
 		if errors.Is(err, context.Canceled) {
-			entry.state = "offline"
-			b.mu.Unlock()
-			return nil, err
+			return finishDial(nil, "offline", err, false)
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
-			entry.state = "awaiting_approval"
-			b.mu.Unlock()
-			return nil, fmt.Errorf("%s is waiting for one-time 'Allow' on its remote debugging prompt (%s)", disc.Label, wsURL)
+			return finishDial(nil, "awaiting_approval", fmt.Errorf("%s is waiting for one-time 'Allow' on its remote debugging prompt (%s)", disc.Label, wsURL), false)
 		}
 		var opErr *net.OpError
 		if errors.As(err, &opErr) && opErr.Op == "dial" {
-			entry.state = "offline"
-			b.mu.Unlock()
-			return nil, fmt.Errorf("connect CDP %s: %w", disc.Label, err)
+			return finishDial(nil, "offline", fmt.Errorf("connect CDP %s: %w", disc.Label, err), false)
 		}
-		entry.state = "rejected"
-		entry.rejectedFP = disc.Fingerprint
-		b.mu.Unlock()
-		return nil, fmt.Errorf("connect CDP %s: %w", disc.Label, err)
+		return finishDial(nil, "rejected", fmt.Errorf("connect CDP %s: %w", disc.Label, err), true)
 	}
-	entry.client = cl
-	entry.state = "connected"
-	entry.lastError = ""
-	entry.rejectedFP = ""
-	entry.lastSeen = time.Now()
-	b.mu.Unlock()
-	return cl, nil
+	return finishDial(cl, "connected", nil, false)
 }
 
 func makeTabHandle(browserID, targetID string) string {

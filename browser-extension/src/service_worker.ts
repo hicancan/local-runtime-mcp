@@ -18,9 +18,11 @@ let settingsRead: Promise<BridgeSettings> | undefined;
 
 function bridgeSettings(): Promise<BridgeSettings> {
   if (!settingsRead) settingsRead = (async () => {
-    const settings = await chrome.storage.local.get({ address: packagedConfig.address || '127.0.0.1:9315', token: packagedConfig.token || '', instanceId: '', label: '' });
-    if (!settings.instanceId) { settings.instanceId = crypto.randomUUID(); await chrome.storage.local.set({ instanceId: settings.instanceId }); }
-    return { address: settings.address, token: settings.token, instanceId: settings.instanceId, label: settings.label };
+    const stored = await chrome.storage.local.get({ address: '', token: '', instanceId: '', label: '' });
+    if (!stored.instanceId) { stored.instanceId = crypto.randomUUID(); await chrome.storage.local.set({ instanceId: stored.instanceId }); }
+    const address = stored.address || packagedConfig.address || '127.0.0.1:9315';
+    const token = stored.token || packagedConfig.token || '';
+    return { address, token, instanceId: stored.instanceId, label: stored.label };
   })().finally(() => { settingsRead = undefined; });
   return settingsRead;
 }

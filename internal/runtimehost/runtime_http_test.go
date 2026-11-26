@@ -1,7 +1,6 @@
 package runtimehost
 
 import (
-	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -48,8 +47,9 @@ func TestHTTPParallelRunAndAsyncWait(t *testing.T) {
 		t.Fatalf("start async cell failed: %v %+v", err, r1)
 	}
 	var c1 jsrt.CellResult
-	b1, _ := json.Marshal(r1.StructuredContent)
-	_ = json.Unmarshal(b1, &c1)
+	if err := decodeToolJSON(r1, &c1); err != nil {
+		t.Fatalf("decode run result: %v", err)
+	}
 	if c1.Status != "running" || c1.CellID == "" {
 		t.Fatalf("expected running cell, got %+v", c1)
 	}
@@ -62,8 +62,9 @@ func TestHTTPParallelRunAndAsyncWait(t *testing.T) {
 		t.Fatalf("wait over HTTP failed: %v %+v", err, r2)
 	}
 	var c2 jsrt.CellResult
-	b2, _ := json.Marshal(r2.StructuredContent)
-	_ = json.Unmarshal(b2, &c2)
+	if err := decodeToolJSON(r2, &c2); err != nil {
+		t.Fatalf("decode wait result: %v", err)
+	}
 	if c2.Status != "done" || c2.Value != "done-over-http" || !strings.Contains(c2.Output, "tick2") {
 		t.Fatalf("unexpected wait result: %+v", c2)
 	}

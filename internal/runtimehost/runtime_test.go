@@ -46,8 +46,7 @@ func TestConcurrentClientsShareHostButNotResponseIdentity(t *testing.T) {
 				var cell struct {
 					Value filesystem.TextWriteResult `json:"value"`
 				}
-				data, _ := json.Marshal(result.StructuredContent)
-				err = json.Unmarshal(data, &cell)
+				err = decodeToolJSON(result, &cell)
 				if err == nil && cell.Value.Path != filepath.Join(directory, name) {
 					err = &toolFailure{result}
 				}
@@ -113,3 +112,19 @@ func sharedHTTPTestClients(t *testing.T, transportA, transportB http.RoundTrippe
 type toolFailure struct{ result *mcp.CallToolResult }
 
 func (e *toolFailure) Error() string { data, _ := json.Marshal(e.result); return string(data) }
+
+func decodeToolJSON(res *mcp.CallToolResult, dst any) error {
+	if res.StructuredContent != nil {
+		b, err := json.Marshal(res.StructuredContent)
+		if err != nil {
+			return err
+		}
+		return json.Unmarshal(b, dst)
+	}
+	for i := len(res.Content) - 1; i >= 0; i-- {
+		if tc, ok := res.Content[i].(*mcp.TextContent); ok && tc.Text != "" {
+			return json.Unmarshal([]byte(tc.Text), dst)
+		}
+	}
+	return &toolFailure{res}
+}

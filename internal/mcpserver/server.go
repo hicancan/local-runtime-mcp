@@ -46,6 +46,7 @@ SDK signatures (all async unless noted):
 - TabHandle (.id/.title/.url/.browser_id): .goto(url) | .reload() | .back() | .forward() | .close() | .markHandoff() (sync) | .snapshot({ diff?, max_elements?, max_text? }?) | .screenshot({ full_page?, clip_x?, clip_y?, clip_width?, clip_height? }?) | .eval(jsOrFn, ...args) | .cdp(method, params?) | .getByRole(role, nameOrOpts?)/.getByText/.getByLabel/.getByPlaceholder/.locator(css) -> .click()/.fill(t)/.type(t)/.press(k)/.select(o)/.check(b)/.uploadFiles(paths)/.waitFor({ timeout_ms? })/.nth(i) | .network({ resource_types?, url_contains?, include_preserved?, failed_only?, limit? }?) | .networkBody(req_id) | .console({ levels?, limit? }?) | .emulate({ width?, height?, mobile?, cpu_throttling_rate?, network_preset?, color_scheme?, ... }) | .css(selectorOrLoc) | .heapSnapshot(path?) | .logpoint(url, line1Based, expr, col0Based?) | .screencastStart(opts?) | .screencastStop()
 - desktop.targets({ pid?, title?, process? }?) -> { displays, windows: [{ target_id, pid, process, title, bounds, state, active }] }; desktop.state({ target_id?, display_id?, control_id?, image?, elements?: "all"|"interactive"|"none", max_elements?, offset?, max_width?, max_height? }?); desktop.wait({ target_id, name?, role?, automation_id?, until?: "present"|"absent", timeout_ms?, image? }); desktop.action({ kind, control_id?, target_id?, state_id?, ref_id?, ... }); desktop.control("status"|"acquire"|"release", { control_id?, label? }?)
 - img.read(path, { max_bytes?, max_pixels?, max_width?, max_height?, crop_x?, crop_y?, crop_width?, crop_height? }?); emitImage(imgOrShotOrPath, label?) (sync)
+- inputFiles / inputFile: host-uploaded or generated files passed via run's optional files parameter are automatically downloaded locally and bound as inputFiles ([{ file_id, name, path, mime_type, size, sha256 }]) and inputFile (inputFiles[0] || null)
 - caps.list() -> Capability[]; caps.call(name, args?, browser_id?, tab_id?); help(topic?) (sync); print(...); sleep(ms)`
 
 // ToolFilter reports whether a tool with the given name and side-effect hints
@@ -61,6 +62,7 @@ type Dependencies struct {
 	Computer     computer.Controller
 	Capabilities *capability.Registry
 	Audit        *audit.Store
+	InboundDir   string
 	Wire         string
 	LocalApps    bool
 	ReadOnly     bool
@@ -80,6 +82,7 @@ type Managed struct {
 	static      []toolSpec
 	registry    *capability.Registry
 	runtime     *jsrt.Engine
+	inbound     *inboundStore
 	ownsRuntime bool
 
 	taskMu      sync.RWMutex
@@ -126,6 +129,7 @@ func NewManaged(deps Dependencies) *Managed {
 		registered:  map[string]string{},
 		registry:    deps.Capabilities,
 		runtime:     engine,
+		inbound:     newInboundStore(deps.InboundDir),
 		ownsRuntime: ownsRuntime,
 		activeTasks: map[string]string{},
 	}
@@ -227,12 +231,13 @@ func (m *Managed) isReadOnlyCall(ctx context.Context) bool {
 }
 
 type runInput struct {
-	Title          string `json:"title" jsonschema:"required concise 4-16 word description of what this step is doing (shown live in lrmcp ui)"`
-	DoneTitle      string `json:"done_title,omitempty" jsonschema:"optional completed past-tense summary replacing title once finished"`
-	Code           string `json:"code" jsonschema:"async JavaScript executed in this session's persistent VM with proc, fs, browser, desktop, img, caps, emitImage, print, sleep"`
-	SessionID      string `json:"session_id,omitempty" jsonschema:"optional explicit task session_id returned by session(action='start')"`
-	YieldMS        int    `json:"yield_ms,omitempty" jsonschema:"milliseconds to wait before returning a running cell_id (1-60000; default 15000)"`
-	MaxOutputBytes int    `json:"max_output_bytes,omitempty" jsonschema:"maximum retained print/console output bytes (default 262144)"`
+	Title          string           `json:"title" jsonschema:"required concise 4-16 word description of what this step is doing (shown live in lrmcp ui)"`
+	DoneTitle      string           `json:"done_title,omitempty" jsonschema:"optional completed past-tense summary replacing title once finished"`
+	Code           string           `json:"code" jsonschema:"async JavaScript executed in this session's persistent VM with proc, fs, browser, desktop, img, caps, emitImage, inputFiles, inputFile, print, sleep"`
+	Files          []InboundFileRef `json:"files,omitempty" jsonschema:"optional chat-host files (user-uploaded or generated images, PDFs, documents) staged locally and exposed in JS as inputFiles and inputFile"`
+	SessionID      string           `json:"session_id,omitempty" jsonschema:"optional explicit task session_id returned by session(action='start')"`
+	YieldMS        int              `json:"yield_ms,omitempty" jsonschema:"milliseconds to wait before returning a running cell_id (1-60000; default 15000)"`
+	MaxOutputBytes int              `json:"max_output_bytes,omitempty" jsonschema:"maximum retained print/console output bytes (default 262144)"`
 }
 
 type waitInput struct {
@@ -251,18 +256,50 @@ func runToolSpec(m *Managed, defaultWire string) toolSpec {
 		),
 		func(schema *jsonschema.Schema) {
 			schema.Required = []string{"title", "code"}
+			// Enforce OpenAI Apps SDK's strict _meta["openai/fileParams"] array schema:
+			// exact type="array" (never nullable union), all 4 file properties declared,
+			// and required=["download_url", "file_id"] only.
+			schema.Properties["files"] = &jsonschema.Schema{
+				Type:        "array",
+				Description: "Optional chat-host files (user-uploaded images, PDFs, documents, or generated artifacts) automatically downloaded locally and bound in JS as inputFiles ([{ file_id, name, path, mime_type, size, sha256 }]) and inputFile (inputFiles[0] || null).",
+				Items: &jsonschema.Schema{
+					Type: "object",
+					Properties: map[string]*jsonschema.Schema{
+						"download_url": {Type: "string", Description: "HTTPS download URL provided by the chat host"},
+						"file_id":      {Type: "string", Description: "Opaque file identifier provided by the chat host"},
+						"mime_type":    {Type: "string", Description: "Optional MIME type of the file"},
+						"file_name":    {Type: "string", Description: "Optional original filename"},
+					},
+					Required: []string{"download_url", "file_id"},
+				},
+			}
 		},
 	)
+	runTool.Meta = mcp.Meta{
+		"openai/fileParams": []string{"files"},
+	}
 	return toolSpec{
 		name:     "run",
 		readOnly: true, // read-only remote grants remain allowed and enforce SDK-level read-only inside jsrt
 		register: func(s *mcp.Server) {
-			mcp.AddTool(s, runTool, func(ctx context.Context, req *mcp.CallToolRequest, in runInput) (*mcp.CallToolResult, jsrt.CellResult, error) {
+			mcp.AddTool(s, runTool, func(ctx context.Context, req *mcp.CallToolRequest, in runInput) (*mcp.CallToolResult, any, error) {
 				if strings.TrimSpace(in.Title) == "" {
-					return nil, jsrt.CellResult{}, errors.New("title is required")
+					return nil, nil, errors.New("title is required")
 				}
 				if strings.TrimSpace(in.Code) == "" {
-					return nil, jsrt.CellResult{}, errors.New("code is required")
+					return nil, nil, errors.New("code is required")
+				}
+				readOnly := m.isReadOnlyCall(ctx)
+				var stagedFiles []jsrt.InboundFile
+				if len(in.Files) > 0 {
+					if readOnly {
+						return nil, nil, errors.New("read-only grant forbids receiving inbound files")
+					}
+					var err error
+					stagedFiles, err = m.inbound.FetchAll(ctx, in.Files)
+					if err != nil {
+						return nil, nil, err
+					}
 				}
 				sid, _, _, wire, _ := resolveCaller(ctx, m, req.Session, defaultWire, "")
 				if explicit := audit.SanitizeID(in.SessionID); explicit != "" {
@@ -279,12 +316,13 @@ func runToolSpec(m *Managed, defaultWire string) toolSpec {
 					Code:           in.Code,
 					YieldMS:        in.YieldMS,
 					MaxOutputBytes: in.MaxOutputBytes,
-					ReadOnly:       m.isReadOnlyCall(ctx),
+					ReadOnly:       readOnly,
+					InboundFiles:   stagedFiles,
 				})
 				if err != nil {
-					return nil, res, err
+					return nil, nil, err
 				}
-				return cellResultToMCP(res), res, nil
+				return cellResultToMCP(res), nil, nil
 			})
 		},
 	}
@@ -313,7 +351,7 @@ func waitToolSpec(m *Managed, defaultWire string) toolSpec {
 		name:     "wait",
 		readOnly: true,
 		register: func(s *mcp.Server) {
-			mcp.AddTool(s, waitTool, func(ctx context.Context, req *mcp.CallToolRequest, in waitInput) (*mcp.CallToolResult, jsrt.CellResult, error) {
+			mcp.AddTool(s, waitTool, func(ctx context.Context, req *mcp.CallToolRequest, in waitInput) (*mcp.CallToolResult, any, error) {
 				sid, _, _, _, _ := resolveCaller(ctx, m, req.Session, defaultWire, "")
 				meta := audit.CallMetaFromContext(ctx)
 				enforce := meta.Policy != nil || meta.ReadOnly
@@ -325,9 +363,9 @@ func waitToolSpec(m *Managed, defaultWire string) toolSpec {
 					EnforceSession: enforce,
 				})
 				if err != nil {
-					return nil, res, err
+					return nil, nil, err
 				}
-				return cellResultToMCP(res), res, nil
+				return cellResultToMCP(res), nil, nil
 			})
 		},
 	}
@@ -340,18 +378,11 @@ func cellResultToMCP(res jsrt.CellResult) *mcp.CallToolResult {
 			content = append(content, &mcp.ImageContent{Data: img.Data, MIMEType: img.MIMEType})
 		}
 	}
-	// Preserve v17 wire parity: when native images are emitted, keep Content strictly
-	// ImageContent blocks (Content[0].type == "image") while StructuredContent carries
-	// the complete CellResult JSON, preventing MCP hosts from shadowing images behind
-	// a leading duplicate TextContent block.
-	if len(content) == 0 {
-		payload, _ := json.Marshal(res)
-		content = append(content, &mcp.TextContent{Text: string(payload)})
-	}
+	payload, _ := json.Marshal(res)
+	content = append(content, &mcp.TextContent{Text: string(payload)})
 	return &mcp.CallToolResult{
-		IsError:           res.Status == "error",
-		Content:           content,
-		StructuredContent: res,
+		IsError: res.Status == "error",
+		Content: content,
 	}
 }
 

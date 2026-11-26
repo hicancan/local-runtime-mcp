@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -105,6 +106,20 @@ func Start(ctx context.Context, cfg *config.Config) (*Host, error) {
 		_ = auditStore.Close()
 		return nil, err
 	}
+	// Keep an adjacent unpacked browser-extension directory synchronized with
+	// the live bridge address/token so extracting a release archive over an
+	// existing install never breaks the Edge/Chrome owner panel with a blank
+	// runtime_config.js.
+	if cfg.Path != "" && cfg.Browser.Token != "" {
+		extDir := filepath.Join(filepath.Dir(cfg.Path), "browser-extension")
+		if _, statErr := os.Stat(filepath.Join(extDir, "manifest.json")); statErr == nil {
+			listen := cfg.Browser.Listen
+			if listen == "" {
+				listen = config.DefaultBrowser
+			}
+			_ = browser.ConfigureExtension(extDir, listen, cfg.Browser.Token)
+		}
+	}
 	registry, err := capability.Load(cfg.Capabilities.Directory, bridge)
 	if err != nil {
 		cancel()
@@ -146,6 +161,11 @@ func Start(ctx context.Context, cfg *config.Config) (*Host, error) {
 		LocalApps:    true,
 	})
 
+	inboundDir := ""
+	if cfg.Path != "" {
+		inboundDir = filepath.Join(filepath.Dir(cfg.Path), "lrmcp-inbound")
+	}
+
 	baseDeps := mcpserver.Dependencies{
 		Runtime:      remoteRT,
 		Process:      processes,
@@ -154,6 +174,7 @@ func Start(ctx context.Context, cfg *config.Config) (*Host, error) {
 		Computer:     controller,
 		Capabilities: registry,
 		Audit:        auditStore,
+		InboundDir:   inboundDir,
 	}
 	httpDeps := baseDeps
 	httpDeps.Wire = "http"

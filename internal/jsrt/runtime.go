@@ -437,6 +437,25 @@ func (v *sessionVM) startCell(cell *cellRun, code string) error {
 			v.vm.ClearInterrupt()
 		}()
 
+		// Bind per-cell inbound files transferred from the MCP host (e.g. ChatGPT fileParams).
+		filesSlice := make([]map[string]any, 0, len(cell.inboundFiles))
+		for _, f := range cell.inboundFiles {
+			filesSlice = append(filesSlice, map[string]any{
+				"file_id":   f.FileID,
+				"name":      f.Name,
+				"path":      f.Path,
+				"mime_type": f.MIMEType,
+				"size":      f.Size,
+				"sha256":    f.SHA256,
+			})
+		}
+		_ = v.vm.Set("inputFiles", filesSlice)
+		if len(filesSlice) > 0 {
+			_ = v.vm.Set("inputFile", filesSlice[0])
+		} else {
+			_ = v.vm.Set("inputFile", goja.Null())
+		}
+
 		val, runErr := v.vm.RunProgram(prog)
 		if runErr != nil {
 			decActive()

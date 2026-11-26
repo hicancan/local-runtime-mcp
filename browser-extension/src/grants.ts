@@ -42,10 +42,12 @@ type GrantAction =
   | { method: 'ui_bootstrap'; origin: string };
 
 async function postGrant(payload: GrantAction): Promise<View> {
-  const settings = await chrome.storage.local.get({ address: packagedConfig.address || '127.0.0.1:9315', token: packagedConfig.token || '' });
-  if (!settings.token) throw new Error('not configured');
-  const response = await fetch(`http://${settings.address}/v1/grants`, {
-    method: 'POST', headers: { Authorization: `Bearer ${settings.token}`, 'Content-Type': 'application/json' },
+  const stored = await chrome.storage.local.get({ address: '', token: '' });
+  const address = stored.address || packagedConfig.address || '127.0.0.1:9315';
+  const token = stored.token || packagedConfig.token || '';
+  if (!token) throw new Error('not configured');
+  const response = await fetch(`http://${address}/v1/grants`, {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
   const body = await response.json().catch(() => null);
@@ -75,10 +77,12 @@ export async function stopDesktop(origin: string): Promise<View> {
 }
 
 export async function mintStudioURL(origin: string): Promise<string> {
-  const settings = await chrome.storage.local.get({ address: packagedConfig.address || '127.0.0.1:9315', token: packagedConfig.token || '' });
-  if (!settings.token) throw new Error('not configured');
-  const response = await fetch(`http://${settings.address}/v1/grants`, {
-    method: 'POST', headers: { Authorization: `Bearer ${settings.token}`, 'Content-Type': 'application/json' },
+  const stored = await chrome.storage.local.get({ address: '', token: '' });
+  const address = stored.address || packagedConfig.address || '127.0.0.1:9315';
+  const token = stored.token || packagedConfig.token || '';
+  if (!token) throw new Error('not configured');
+  const response = await fetch(`http://${address}/v1/grants`, {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ method: 'ui_bootstrap', origin }),
   });
   const body = await response.json().catch(() => null);

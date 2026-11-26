@@ -350,13 +350,17 @@ func (m *Managed) installMiddleware(store *audit.Store, defaultWire string) {
 			}
 
 			start := time.Now()
+			auditArgs := rawParams.Arguments
+			if toolName == "run" {
+				auditArgs = redactInboundArgs(auditArgs)
+			}
 			evID, auditSID := store.StartTool(audit.StartToolInput{
 				SessionID:  sid,
 				AgentID:    aid,
 				ClientName: clientName,
 				Wire:       wire,
 				ToolName:   toolName,
-				RawArgs:    rawParams.Arguments,
+				RawArgs:    auditArgs,
 			})
 
 			res, err := next(ctx, method, req)

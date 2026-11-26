@@ -28,6 +28,18 @@ type ImagePayload struct {
 	Height   int    `json:"height,omitempty"`
 }
 
+// InboundFile describes a file received from the MCP host (for example via
+// ChatGPT _meta["openai/fileParams"]) and staged locally for this run cell.
+type InboundFile struct {
+	FileID     string `json:"file_id"`
+	Name       string `json:"name"`
+	Path       string `json:"path"`
+	MIMEType   string `json:"mime_type"`
+	Size       int64  `json:"size"`
+	SHA256     string `json:"sha256"`
+	DurationMS int64  `json:"-"`
+}
+
 // SubOp records one fine-grained machine operation invoked inside a run cell
 // so /ui renders a complete structured execution tree under the run title.
 type SubOp struct {
@@ -47,6 +59,7 @@ type RunOptions struct {
 	YieldMS        int
 	MaxOutputBytes int
 	ReadOnly       bool
+	InboundFiles   []InboundFile
 }
 
 // WaitOptions configures awaiting, polling, or terminating a running cell.
@@ -60,31 +73,33 @@ type WaitOptions struct {
 
 // CellResult is the structured outcome of a run or wait call.
 type CellResult struct {
-	CellID      string         `json:"cell_id"`
-	Status      string         `json:"status"` // "done", "running", "error", "canceled"
-	Title       string         `json:"title"`
-	DoneTitle   string         `json:"done_title,omitempty"`
-	Value       any            `json:"value,omitempty"`
-	Output      string         `json:"output,omitempty"`
-	Truncated   bool           `json:"truncated,omitempty"`
-	Error       string         `json:"error,omitempty"`
-	DurationMS  int64          `json:"duration_ms"`
-	SubOps      []SubOp        `json:"sub_ops,omitempty"`
-	SubOpErrors int            `json:"sub_op_errors,omitempty"`
-	Images      []ImagePayload `json:"-"`
+	CellID       string         `json:"cell_id"`
+	Status       string         `json:"status"` // "done", "running", "error", "canceled"
+	Title        string         `json:"title"`
+	DoneTitle    string         `json:"done_title,omitempty"`
+	Value        any            `json:"value,omitempty"`
+	Output       string         `json:"output,omitempty"`
+	Truncated    bool           `json:"truncated,omitempty"`
+	Error        string         `json:"error,omitempty"`
+	DurationMS   int64          `json:"duration_ms"`
+	SubOps       []SubOp        `json:"sub_ops,omitempty"`
+	SubOpErrors  int            `json:"sub_op_errors,omitempty"`
+	InboundFiles []InboundFile  `json:"inbound_files,omitempty"`
+	Images       []ImagePayload `json:"-"`
 }
 
 type cellRun struct {
-	id         string
-	sessionID  string
-	title      string
-	doneTitle  string
-	readOnly   bool
-	maxOut     int
-	startedAt  time.Time
-	ctx        context.Context
-	cancel     context.CancelFunc
-	done       chan struct{}
+	id           string
+	sessionID    string
+	title        string
+	doneTitle    string
+	readOnly     bool
+	maxOut       int
+	inboundFiles []InboundFile
+	startedAt    time.Time
+	ctx          context.Context
+	cancel       context.CancelFunc
+	done         chan struct{}
 
 	mu          sync.Mutex
 	status      string // "running", "done", "error", "canceled"
@@ -114,19 +129,24 @@ func newCellRun(parent context.Context, opts RunOptions) *cellRun {
 		maxOut = maxOutBytesLimit
 	}
 	ctx, cancel := context.WithCancel(parent)
-	return &cellRun{
-		id:        newCellID(),
-		sessionID: opts.SessionID,
-		title:     opts.Title,
-		doneTitle: opts.DoneTitle,
-		readOnly:  opts.ReadOnly,
-		maxOut:    maxOut,
-		startedAt: time.Now(),
-		ctx:       ctx,
-		cancel:    cancel,
-		done:      make(chan struct{}),
-		status:    "running",
+	c := &cellRun{
+		id:           newCellID(),
+		sessionID:    opts.SessionID,
+		title:        opts.Title,
+		doneTitle:    opts.DoneTitle,
+		readOnly:     opts.ReadOnly,
+		maxOut:       maxOut,
+		inboundFiles: append([]InboundFile(nil), opts.InboundFiles...),
+		startedAt:    time.Now(),
+		ctx:          ctx,
+		cancel:       cancel,
+		done:         make(chan struct{}),
+		status:       "running",
 	}
+	for _, f := range c.inboundFiles {
+		c.recordSubOp("inbound.file", f.Name, f.DurationMS, nil)
+	}
+	return c
 }
 
 func (c *cellRun) appendOutput(s string) {
@@ -258,18 +278,24 @@ func (c *cellRun) snapshot(incremental bool) CellResult {
 		end = c.finishedAt
 	}
 
+	var inbound []InboundFile
+	if !incremental && len(c.inboundFiles) > 0 {
+		inbound = append([]InboundFile(nil), c.inboundFiles...)
+	}
+
 	return CellResult{
-		CellID:      c.id,
-		Status:      c.status,
-		Title:       c.title,
-		DoneTitle:   c.doneTitle,
-		Value:       c.value,
-		Output:      out,
-		Truncated:   c.truncated,
-		Error:       c.errText,
-		DurationMS:  end.Sub(c.startedAt).Milliseconds(),
-		SubOps:      ops,
-		SubOpErrors: subOpErrs,
-		Images:      imgs,
+		CellID:       c.id,
+		Status:       c.status,
+		Title:        c.title,
+		DoneTitle:    c.doneTitle,
+		Value:        c.value,
+		Output:       out,
+		Truncated:    c.truncated,
+		Error:        c.errText,
+		DurationMS:   end.Sub(c.startedAt).Milliseconds(),
+		SubOps:       ops,
+		SubOpErrors:  subOpErrs,
+		InboundFiles: inbound,
+		Images:       imgs,
 	}
 }

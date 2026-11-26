@@ -3,7 +3,7 @@ package jsrt
 import "strings"
 
 const helpIndex = `Local Runtime MCP (lrmcp) JS SDK — call help("<topic>") for details.
-Topics: proc, fs, browser, tab, locator, desktop, img, caps, utils
+Topics: proc, fs, browser, tab, locator, desktop, img, files, caps, utils
 
 Quick reference:
 - proc:    proc.run(program, args?, opts?) | proc.run({ cmd, shell?, cwd?, env?, stdin?, timeout_seconds?, max_output_tokens?, yield_time_ms?, io_mode? }) | proc.continue(opts) | proc.kill(session_id)
@@ -12,6 +12,7 @@ Quick reference:
 - tab:     tab.goto(url) | reload() | back() | forward() | close() | markHandoff() | snapshot(opts?) | screenshot(opts?) | eval(jsOrFn, ...args) | cdp(method, params?) | getByRole/getByText/getByLabel/getByPlaceholder/locator | click/fill/press/scroll/handleDialog | network(filter?) | networkBody(req_id) | console(filter?) | emulate(opts) | css(selectorOrLoc) | heapSnapshot(file_path?) | logpoint(url, line, expr, col?) | screencastStart(opts?) | screencastStop()
 - desktop: desktop.targets(opts?) | desktop.state(opts?) | desktop.wait(opts) | desktop.action(act) | desktop.control(kindOrOpts, opts?)
 - img:     img.read(path, opts?) | emitImage(imgOrShotOrPath, label?)
+- files:   inputFiles (array of host-transferred files staged locally) | inputFile (inputFiles[0] or null)
 - caps:    caps.list() | caps.call(name, args?, browser_id?, tab_id?)
 - utils:   print(...args) | write(...args) | console.log(...) | sleep(ms) | help(topic?)
 
@@ -116,6 +117,16 @@ DevTools:
 - img.read(path, { max_bytes?, max_pixels?, crop_x?, crop_y?, crop_width?, crop_height?, max_width?, max_height? }?)
 - emitImage(imgOrShotOrPath, label?) -> attaches native MCP ImageContent (returns { emitted: bool, ... })`,
 
+	"files": `Inbound files (chat host -> local machine via run.files / _meta["openai/fileParams"]):
+- Pass user-uploaded or generated attachments in the optional run(files: [...]) parameter.
+- lrmcp automatically downloads and stages them locally before executing your JS cell.
+- Inside JS, read globals:
+  - inputFiles: Array<{ file_id, name, path, mime_type, size, sha256 }> (always an array; [] if none)
+  - inputFile:  inputFiles[0] || null
+- Example:
+  await proc.run("pwsh", ["-NoProfile", "-Command", "Copy-Item -LiteralPath '" + inputFile.path + "' -Destination 'D:\\Downloads\\saved.png'"]);
+  const im = await img.read(inputFile.path); emitImage(im, "echo");`,
+
 	"caps": `caps SDK (owner-approved site/app capabilities):
 - caps.list() -> Promise<CapabilityDefinition[]>
 - caps.call(name, args?, browser_id?, tab_id?) -> Promise<any> (browser_id & tab_id required for webpage capabilities)`,
@@ -147,6 +158,9 @@ func lookupHelp(topic string) string {
 	}
 	if t == "emitimage" || t == "image" {
 		return helpTopics["img"]
+	}
+	if t == "inputfile" || t == "inputfiles" || t == "inbound" || t == "upload" {
+		return helpTopics["files"]
 	}
 	if t == "print" || t == "sleep" || t == "write" || t == "console" || t == "help" {
 		return helpTopics["utils"]

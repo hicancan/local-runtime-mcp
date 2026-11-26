@@ -139,7 +139,7 @@ func TestUnifiedDaemonSharesOneHostAcrossStdioProxiesAndHotPlugsHTTP(t *testing.
 		if err != nil || res.IsError {
 			t.Fatalf("client-%d browser.status failed: %v %+v", idx+1, err, res)
 		}
-		raw, _ := json.Marshal(res.StructuredContent)
+		raw, _ := json.Marshal(res.Content)
 		if !strings.Contains(string(raw), browserAddr) || strings.Contains(string(raw), "unavailable") {
 			t.Fatalf("client-%d lost shared browser bridge: %s", idx+1, raw)
 		}
@@ -238,7 +238,7 @@ func TestFirstStdioHostsLocalPlaneInProcessWhenAutoSpawnDisabled(t *testing.T) {
 		if err != nil || res.IsError {
 			t.Fatalf("session %d browser.status failed: %v %+v", idx+1, err, res)
 		}
-		raw, _ := json.Marshal(res.StructuredContent)
+		raw, _ := json.Marshal(res.Content)
 		if !strings.Contains(string(raw), browserAddr) || strings.Contains(string(raw), "unavailable") {
 			t.Fatalf("session %d did not share browser bridge: %s", idx+1, raw)
 		}
