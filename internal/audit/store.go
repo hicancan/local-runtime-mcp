@@ -69,9 +69,23 @@ type Event struct {
 
 // LivePacket is fanned out to SSE subscribers in real time.
 type LivePacket struct {
-	Type    string   `json:"type"` // "event", "session"
+	Type    string   `json:"type"` // "event", "session", "refresh"
 	Event   *Event   `json:"event,omitempty"`
 	Session *Session `json:"session,omitempty"`
+}
+
+// DeleteRequest selects agent timelines and/or individual sessions to purge.
+type DeleteRequest struct {
+	AgentIDs   []string `json:"agent_ids,omitempty"`
+	SessionIDs []string `json:"session_ids,omitempty"`
+	Vacuum     bool     `json:"vacuum,omitempty"`
+}
+
+// DeleteResult summarizes sessions, events, and unreferenced blobs purged from the store.
+type DeleteResult struct {
+	Sessions int64 `json:"sessions"`
+	Events   int64 `json:"events"`
+	Blobs    int   `json:"blobs"`
 }
 
 // EventFilter constrains ListEvents queries.
@@ -574,20 +588,25 @@ func (s *Store) FinishTool(eventID int64, sessionID string, in FinishToolInput) 
 	if err != nil {
 		return
 	}
+	var res sql.Result
 	if finalSummary != "" {
-		_, err = tx.Exec(`
+		res, err = tx.Exec(`
 			UPDATE events
 			SET status = ?, summary = ?, result_json = ?, image_blob = ?, image_mime = ?, error_text = ?, duration_ms = ?
 			WHERE id = ?
 		`, status, finalSummary, resultJSON, blobHash, blobMIME, errText, in.DurationMS, eventID)
 	} else {
-		_, err = tx.Exec(`
+		res, err = tx.Exec(`
 			UPDATE events
 			SET status = ?, result_json = ?, image_blob = ?, image_mime = ?, error_text = ?, duration_ms = ?
 			WHERE id = ?
 		`, status, resultJSON, blobHash, blobMIME, errText, in.DurationMS, eventID)
 	}
 	if err != nil {
+		_ = tx.Rollback()
+		return
+	}
+	if affected, _ := res.RowsAffected(); affected == 0 {
 		_ = tx.Rollback()
 		return
 	}
@@ -983,6 +1002,193 @@ func (s *Store) MarkSessionClosed(sessionID string) {
 	if sess, err := s.getSession(sessionID); err == nil {
 		s.broadcast(LivePacket{Type: "session", Session: &sess})
 	}
+}
+
+// DeleteAgent permanently removes all sessions, events, FTS5 entries, and
+// unreferenced image blobs belonging to agentID.
+func (s *Store) DeleteAgent(agentID string) (DeleteResult, error) {
+	return s.Delete(DeleteRequest{AgentIDs: []string{agentID}})
+}
+
+// DeleteSession permanently removes one session, its events, FTS5 entries, and
+// unreferenced image blobs.
+func (s *Store) DeleteSession(sessionID string) (DeleteResult, error) {
+	return s.Delete(DeleteRequest{SessionIDs: []string{sessionID}})
+}
+
+// Delete atomically removes matching agent timelines and/or sessions along with
+// their FTS5 index entries and unreferenced blobs, optionally compacting SQLite.
+func (s *Store) Delete(req DeleteRequest) (DeleteResult, error) {
+	if s == nil || s.db == nil {
+		return DeleteResult{}, nil
+	}
+	agents := dedupeTrimmed(req.AgentIDs)
+	sessions := dedupeTrimmed(req.SessionIDs)
+	if len(agents) == 0 && len(sessions) == 0 {
+		return DeleteResult{}, errors.New("at least one agent_id or session_id is required")
+	}
+	for _, a := range agents {
+		if a == "lrmcp-daemon" {
+			return DeleteResult{}, errors.New("cannot delete system daemon timeline")
+		}
+	}
+	for _, sid := range sessions {
+		if sid == "system:daemon" {
+			return DeleteResult{}, errors.New("cannot delete system daemon timeline")
+		}
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return DeleteResult{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	candidateBlobs := map[string]struct{}{}
+	collectBlobs := func(query, arg string) error {
+		rows, qErr := tx.Query(query, arg)
+		if qErr != nil {
+			return qErr
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var h string
+			if err := rows.Scan(&h); err != nil {
+				return err
+			}
+			if h != "" {
+				candidateBlobs[h] = struct{}{}
+			}
+		}
+		return rows.Err()
+	}
+
+	for _, a := range agents {
+		if err := collectBlobs(`SELECT DISTINCT image_blob FROM events WHERE agent_id = ? AND image_blob != ''`, a); err != nil {
+			return DeleteResult{}, err
+		}
+	}
+	for _, sid := range sessions {
+		if err := collectBlobs(`SELECT DISTINCT image_blob FROM events WHERE session_id = ? AND image_blob != ''`, sid); err != nil {
+			return DeleteResult{}, err
+		}
+	}
+
+	var out DeleteResult
+	for _, a := range agents {
+		if _, err := tx.Exec(`DELETE FROM events_fts WHERE rowid IN (SELECT id FROM events WHERE agent_id = ?)`, a); err != nil {
+			return DeleteResult{}, err
+		}
+		resEv, err := tx.Exec(`DELETE FROM events WHERE agent_id = ?`, a)
+		if err != nil {
+			return DeleteResult{}, err
+		}
+		if n, _ := resEv.RowsAffected(); n > 0 {
+			out.Events += n
+		}
+		resSess, err := tx.Exec(`DELETE FROM sessions WHERE agent_id = ?`, a)
+		if err != nil {
+			return DeleteResult{}, err
+		}
+		if n, _ := resSess.RowsAffected(); n > 0 {
+			out.Sessions += n
+		}
+	}
+	for _, sid := range sessions {
+		if _, err := tx.Exec(`DELETE FROM events_fts WHERE rowid IN (SELECT id FROM events WHERE session_id = ?)`, sid); err != nil {
+			return DeleteResult{}, err
+		}
+		resEv, err := tx.Exec(`DELETE FROM events WHERE session_id = ?`, sid)
+		if err != nil {
+			return DeleteResult{}, err
+		}
+		if n, _ := resEv.RowsAffected(); n > 0 {
+			out.Events += n
+		}
+		resSess, err := tx.Exec(`DELETE FROM sessions WHERE id = ?`, sid)
+		if err != nil {
+			return DeleteResult{}, err
+		}
+		if n, _ := resSess.RowsAffected(); n > 0 {
+			out.Sessions += n
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return DeleteResult{}, err
+	}
+
+	// Evict any matching in-flight entries so late completions cannot resurrect FTS rows.
+	agentSet := make(map[string]bool, len(agents))
+	for _, a := range agents {
+		agentSet[a] = true
+	}
+	sessionSet := make(map[string]bool, len(sessions))
+	for _, sid := range sessions {
+		sessionSet[sid] = true
+	}
+	s.inFlightMu.Lock()
+	for id, meta := range s.inFlight {
+		if agentSet[meta.agentID] || sessionSet[meta.sessionID] {
+			delete(s.inFlight, id)
+		}
+	}
+	s.inFlightMu.Unlock()
+
+	// Immediately reclaim blobs that were only referenced by the purged events.
+	for h := range candidateBlobs {
+		if !validBlobHash.MatchString(h) {
+			continue
+		}
+		var dummy int
+		if err := s.db.QueryRow(`SELECT 1 FROM events WHERE image_blob = ? LIMIT 1`, h).Scan(&dummy); errors.Is(err, sql.ErrNoRows) {
+			if s.blobDir != "" {
+				if os.Remove(filepath.Join(s.blobDir, h)) == nil {
+					out.Blobs++
+				}
+			} else {
+				s.blobMu.Lock()
+				if _, ok := s.memBlobs[h]; ok {
+					delete(s.memBlobs, h)
+					out.Blobs++
+				}
+				s.blobMu.Unlock()
+			}
+		}
+	}
+
+	if s.dbPath != "" {
+		if req.Vacuum {
+			_, prunedBlobs, _ := s.Prune()
+			out.Blobs += prunedBlobs
+			_, _ = s.db.Exec(`VACUUM;`)
+			_, _ = s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE);`)
+		} else if out.Sessions > 0 || out.Events > 0 {
+			_, _ = s.db.Exec(`PRAGMA incremental_vacuum;`)
+			_, _ = s.db.Exec(`PRAGMA wal_checkpoint(PASSIVE);`)
+		}
+	}
+
+	if (out.Sessions > 0 || out.Events > 0 || req.Vacuum) && s.hasSubscribers() {
+		s.broadcast(LivePacket{Type: "refresh"})
+	}
+	return out, nil
+}
+
+func dedupeTrimmed(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, raw := range values {
+		v := strings.TrimSpace(raw)
+		if v == "" {
+			continue
+		}
+		if _, dup := seen[v]; dup {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
 }
 
 // Stats returns aggregate audit database statistics.

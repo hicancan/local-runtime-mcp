@@ -194,3 +194,152 @@ func TestAuditSessionDoneGuardIsolationAndOrphanBlobGC(t *testing.T) {
 		t.Fatalf("orphan blob should have been removed")
 	}
 }
+
+func TestDeleteAgentAndSessionPurgesEventsFTSBlobsAndNotifies(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "audit-delete.db")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	uniquePNG := []byte{0x89, 'P', 'N', 'G', 10, 20, 30, 40}
+	sharedPNG := []byte{0x89, 'P', 'N', 'G', 50, 60, 70, 80}
+
+	evReal, _ := store.StartTool(StartToolInput{
+		SessionID: "local:real-s1",
+		AgentID:   "real-client",
+		Wire:      "local",
+		ToolName:  "run",
+		RawArgs:   json.RawMessage(`{"title":"keep-real-token"}`),
+	})
+	store.FinishTool(evReal, "local:real-s1", FinishToolInput{
+		Status:    "ok",
+		Result:    map[string]any{"msg": "keep-real-token"},
+		ImageData: sharedPNG,
+		ImageMIME: "image/png",
+	})
+
+	evSmoke1, _ := store.StartTool(StartToolInput{
+		SessionID: "local:smoke-s1",
+		AgentID:   "smoke-agent",
+		Wire:      "local",
+		ToolName:  "run",
+		RawArgs:   json.RawMessage(`{"title":"purge-smoke-token"}`),
+	})
+	store.FinishTool(evSmoke1, "local:smoke-s1", FinishToolInput{
+		Status:    "ok",
+		Result:    map[string]any{"msg": "purge-smoke-token"},
+		ImageData: uniquePNG,
+		ImageMIME: "image/png",
+	})
+	evSmokeShared, _ := store.StartTool(StartToolInput{
+		SessionID: "local:smoke-s2",
+		AgentID:   "smoke-agent",
+		Wire:      "local",
+		ToolName:  "run",
+	})
+	store.FinishTool(evSmokeShared, "local:smoke-s2", FinishToolInput{
+		Status:    "ok",
+		ImageData: sharedPNG,
+		ImageMIME: "image/png",
+	})
+	_, _ = store.RecordNote(NoteInput{
+		SessionID: "local:partial-drop",
+		AgentID:   "partial-client",
+		Wire:      "local",
+		Message:   "drop-session-token",
+	})
+	_, _ = store.RecordNote(NoteInput{
+		SessionID: "local:partial-keep",
+		AgentID:   "partial-client",
+		Wire:      "local",
+		Message:   "keep-session-token",
+	})
+	store.RecordSystem("system", "daemon started", nil)
+
+	ev1Full, err := store.GetEvent(evSmoke1)
+	if err != nil || ev1Full.ImageBlob == "" {
+		t.Fatalf("missing unique blob: %+v %v", ev1Full, err)
+	}
+	evRealFull, err := store.GetEvent(evReal)
+	if err != nil || evRealFull.ImageBlob == "" {
+		t.Fatalf("missing shared blob: %+v %v", evRealFull, err)
+	}
+
+	// Guard rails: empty request and system daemon timeline must be rejected.
+	if _, err := store.Delete(DeleteRequest{}); err == nil {
+		t.Fatal("expected error for empty delete request")
+	}
+	if _, err := store.DeleteAgent("lrmcp-daemon"); err == nil {
+		t.Fatal("expected error deleting lrmcp-daemon")
+	}
+	if _, err := store.DeleteSession("system:daemon"); err == nil {
+		t.Fatal("expected error deleting system:daemon")
+	}
+
+	ch, unsub := store.Subscribe()
+	defer unsub()
+
+	res, err := store.Delete(DeleteRequest{
+		AgentIDs:   []string{"smoke-agent"},
+		SessionIDs: []string{"local:partial-drop"},
+		Vacuum:     true,
+	})
+	if err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+	if res.Sessions != 3 || res.Events != 3 || res.Blobs != 1 {
+		t.Fatalf("unexpected DeleteResult: %+v", res)
+	}
+
+	// SSE refresh notification must fire.
+	select {
+	case pkt := <-ch:
+		if pkt.Type != "refresh" {
+			t.Fatalf("expected refresh packet, got %+v", pkt)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("missing SSE refresh packet")
+	}
+
+	// Unique blob must be removed from disk; shared blob must survive.
+	if store.BlobPath(ev1Full.ImageBlob) != "" {
+		t.Fatalf("unique blob %s was not removed", ev1Full.ImageBlob)
+	}
+	if store.BlobPath(evRealFull.ImageBlob) == "" {
+		t.Fatalf("shared blob %s was wrongly removed", evRealFull.ImageBlob)
+	}
+
+	// FTS5 index must be clean for deleted records and intact for kept records.
+	if hits, err := store.Search("purge-smoke-token", 10); err != nil || len(hits) != 0 {
+		t.Fatalf("deleted agent still searchable: %+v err=%v", hits, err)
+	}
+	if hits, err := store.Search("drop-session-token", 10); err != nil || len(hits) != 0 {
+		t.Fatalf("deleted session still searchable: %+v err=%v", hits, err)
+	}
+	if hits, err := store.Search("keep-real-token", 10); err != nil || len(hits) != 1 {
+		t.Fatalf("kept agent search broken: %+v err=%v", hits, err)
+	}
+	if hits, err := store.Search("keep-session-token", 10); err != nil || len(hits) != 1 {
+		t.Fatalf("kept session search broken: %+v err=%v", hits, err)
+	}
+
+	// In-flight tool completion after purge must not resurrect deleted events or FTS rows.
+	inFlightID, _ := store.StartTool(StartToolInput{
+		SessionID: "local:ephemeral-s1",
+		AgentID:   "ephemeral-agent",
+		Wire:      "local",
+		ToolName:  "run",
+	})
+	if _, err := store.DeleteAgent("ephemeral-agent"); err != nil {
+		t.Fatal(err)
+	}
+	store.FinishTool(inFlightID, "local:ephemeral-s1", FinishToolInput{
+		Status: "ok",
+		Result: map[string]any{"ghost": "must-not-resurrect"},
+	})
+	if hits, err := store.Search("must-not-resurrect", 10); err != nil || len(hits) != 0 {
+		t.Fatalf("deleted in-flight event resurrected in FTS: %+v err=%v", hits, err)
+	}
+}

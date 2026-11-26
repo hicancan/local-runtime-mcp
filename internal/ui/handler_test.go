@@ -136,4 +136,38 @@ func TestStudioSingleUseBootstrapCookieCSRFAndAuditAPI(t *testing.T) {
 	if okRec.Code != http.StatusOK || !stoppedDesktop {
 		t.Fatalf("same-origin POST failed: %d stopped=%t", okRec.Code, stoppedDesktop)
 	}
+
+	// Audit delete refuses system daemon timeline and deletes target agent cleanly.
+	badDelRec := httptest.NewRecorder()
+	badDelReq := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:9317/ui/api/audit/delete", strings.NewReader(`{"agent_ids":["lrmcp-daemon"]}`))
+	badDelReq.AddCookie(sessionCookie)
+	badDelReq.Header.Set("X-LRMCP-UI", "1")
+	badDelReq.Header.Set("Origin", "http://127.0.0.1:9317")
+	studio.ServeHTTP(badDelRec, badDelReq)
+	if badDelRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 deleting lrmcp-daemon, got %d", badDelRec.Code)
+	}
+
+	delRec := httptest.NewRecorder()
+	delReq := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:9317/ui/api/audit/delete", strings.NewReader(`{"agent_ids":["astra-1"]}`))
+	delReq.AddCookie(sessionCookie)
+	delReq.Header.Set("X-LRMCP-UI", "1")
+	delReq.Header.Set("Origin", "http://127.0.0.1:9317")
+	studio.ServeHTTP(delRec, delReq)
+	var delResp struct {
+		Deleted audit.DeleteResult `json:"deleted"`
+	}
+	if delRec.Code != http.StatusOK || json.Unmarshal(delRec.Body.Bytes(), &delResp) != nil || delResp.Deleted.Sessions != 1 || delResp.Deleted.Events != 1 {
+		t.Fatalf("audit delete API failed: %d %s", delRec.Code, delRec.Body.String())
+	}
+
+	// Deleted agent no longer appears in search or sessions.
+	afterRec := httptest.NewRecorder()
+	afterReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9317/ui/api/search?q=%E6%88%AA%E6%AD%A2%E6%97%B6%E9%97%B4", nil)
+	afterReq.AddCookie(sessionCookie)
+	studio.ServeHTTP(afterRec, afterReq)
+	searchResp.Events = nil
+	if afterRec.Code != http.StatusOK || json.Unmarshal(afterRec.Body.Bytes(), &searchResp) != nil || len(searchResp.Events) != 0 {
+		t.Fatalf("deleted agent still returned in search: %d %s", afterRec.Code, afterRec.Body.String())
+	}
 }

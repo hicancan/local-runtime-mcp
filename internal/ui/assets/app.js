@@ -37,6 +37,11 @@
       webGrantsTitle: '已授权站点',
       webGrantsEmpty: '暂无站点授权，可在浏览器右上角 L 图标面板随时开启。',
       kickConfirm: '确认断开该会话并标记为已关闭？',
+      deleteAgentTitle: '删除此 Agent 全部记录',
+      deleteSessionTitle: '删除此会话记录',
+      deleteAgentConfirm: (id, n) => `确认永久删除「${id}」下的全部 ${n} 个会话及记录？`,
+      deleteSessionConfirm: (title) => `确认永久删除会话「${title}」及其全部记录？`,
+      toastDeleted: (s, e) => `已清理 ${s} 个会话 · ${e} 条记录`,
       toastApproved: '已批准上线',
       toastRejected: '已拒绝提案',
       toastDesktopStopped: '已紧急收回键鼠控制权',
@@ -84,6 +89,11 @@
       webGrantsTitle: 'Website Grants',
       webGrantsEmpty: 'No site grants configured yet; toggle them from the L extension popup.',
       kickConfirm: 'Disconnect this session and mark it closed?',
+      deleteAgentTitle: 'Delete all records for this agent',
+      deleteSessionTitle: 'Delete this session',
+      deleteAgentConfirm: (id, n) => `Permanently delete all ${n} sessions and logs for "${id}"?`,
+      deleteSessionConfirm: (title) => `Permanently delete session "${title}" and its logs?`,
+      toastDeleted: (s, e) => `Deleted ${s} sessions · ${e} events`,
       toastApproved: 'Proposal approved',
       toastRejected: 'Proposal rejected',
       toastDesktopStopped: 'Desktop physical control revoked',
@@ -262,7 +272,7 @@
       for (const s of visible) {
         const isActive = state.view === 'session' && state.sessionId === s.id;
         const dotClass = s.status === 'working' ? 'working' : (s.status === 'error' ? 'error' : (Date.now() - s.last_seen_at < 300000 && s.status !== 'closed' && s.status !== 'done' && s.status !== 'idle' ? 'active' : ''));
-        childrenWrap.append(el('button', {
+        const itemBtn = el('button', {
           type: 'button',
           class: `session-item${isActive ? ' active' : ''}`,
           title: `${s.agent_id} · ${s.id} (${s.tool_count} ops)`,
@@ -279,7 +289,25 @@
               s.error_count > 0 ? el('span', { style: 'color:var(--err)' }, `${s.error_count} err`) : null,
             ) : null,
           ),
-        ));
+        );
+        if (f.isSystem) {
+          childrenWrap.append(itemBtn);
+        } else {
+          childrenWrap.append(el('div', { class: `session-row${isActive ? ' active' : ''}` },
+            itemBtn,
+            el('button', {
+              type: 'button',
+              class: 'row-del-btn',
+              title: t('deleteSessionTitle'),
+              'aria-label': t('deleteSessionTitle'),
+              onClick: (ev) => {
+                ev.stopPropagation();
+                if (!confirm(t('deleteSessionConfirm', sessionDisplayTitle(s)))) return;
+                void deleteAudit({ session_ids: [s.id] });
+              },
+            }, '×'),
+          ));
+        }
       }
       if (f.sessions.length > PAGE_LIMIT) {
         childrenWrap.append(el('button', {
@@ -293,22 +321,37 @@
         }, showAll ? t('showLess') : t('showMore', f.sessions.length - PAGE_LIMIT)));
       }
 
-      const folderEl = el('div', { class: `agent-folder${isCollapsed ? ' collapsed' : ''}` },
+      const headerBtn = el('button', {
+        type: 'button',
+        class: 'agent-header',
+        onClick: () => {
+          if (state.collapsedAgents.has(f.key)) state.collapsedAgents.delete(f.key);
+          else state.collapsedAgents.add(f.key);
+          saveCollapsedAgents();
+          renderSidebar();
+        },
+      },
+        el('span', { class: 'agent-chev' }, '▾'),
+        el('span', { class: 'agent-name' }, f.agentId),
+        el('span', { class: `agent-wire${isCloud ? ' cloud' : ''}` }, f.wire),
+        el('span', { class: 'agent-count' }, String(f.sessions.length)),
+      );
+      const headerNode = f.isSystem ? headerBtn : el('div', { class: 'agent-header-row' },
+        headerBtn,
         el('button', {
           type: 'button',
-          class: 'agent-header',
-          onClick: () => {
-            if (state.collapsedAgents.has(f.key)) state.collapsedAgents.delete(f.key);
-            else state.collapsedAgents.add(f.key);
-            saveCollapsedAgents();
-            renderSidebar();
+          class: 'row-del-btn',
+          title: t('deleteAgentTitle'),
+          'aria-label': t('deleteAgentTitle'),
+          onClick: (ev) => {
+            ev.stopPropagation();
+            if (!confirm(t('deleteAgentConfirm', f.agentId, f.sessions.length))) return;
+            void deleteAudit({ agent_ids: [f.agentId] });
           },
-        },
-          el('span', { class: 'agent-chev' }, '▾'),
-          el('span', { class: 'agent-name' }, f.agentId),
-          el('span', { class: `agent-wire${isCloud ? ' cloud' : ''}` }, f.wire),
-          el('span', { class: 'agent-count' }, String(f.sessions.length)),
-        ),
+        }, '×'),
+      );
+      const folderEl = el('div', { class: `agent-folder${isCollapsed ? ' collapsed' : ''}` },
+        headerNode,
         childrenWrap,
       );
       host.append(folderEl);
@@ -692,10 +735,25 @@
     state.status = st;
     state.sessions = sess.sessions || [];
     state.proposals = props.proposals || [];
+    if (state.view === 'session' && state.sessionId && !state.sessions.some((s) => s.id === state.sessionId)) {
+      state.view = 'all';
+      state.sessionId = null;
+    }
     await loadCurrentViewEvents();
     renderSidebar();
     renderSovereignBar();
     renderContent();
+  }
+
+  async function deleteAudit(payload) {
+    try {
+      const res = await apiPost('/ui/api/audit/delete', payload);
+      const del = res.deleted || {};
+      showToast(t('toastDeleted', del.sessions || 0, del.events || 0));
+      await loadAll();
+    } catch (err) {
+      showToast(err.message);
+    }
   }
 
   async function loadCurrentViewEvents() {
@@ -812,6 +870,7 @@
     };
     es.addEventListener('event', handle);
     es.addEventListener('session', handle);
+    es.addEventListener('refresh', () => { void loadAll(); });
   }
 
   // Wire UI bindings

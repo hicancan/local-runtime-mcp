@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
@@ -81,7 +82,7 @@ func openBrowserURL(target string) error {
 
 func auditCmd(ctx context.Context, args []string, stdout, stderr io.Writer, configPath string) error {
 	if len(args) < 1 {
-		return errors.New("audit requires list, events, show, search, tail, or export")
+		return errors.New("audit requires list, events, show, search, tail, export, or delete")
 	}
 	switch args[0] {
 	case "list", "sessions":
@@ -299,8 +300,69 @@ func auditCmd(ctx context.Context, args []string, stdout, stderr io.Writer, conf
 		_, err = io.Copy(target, resp.Body)
 		return err
 
+	case "delete":
+		flags := flagSet("lrmcp audit delete", stderr)
+		var agents stringList
+		flags.Var(&agents, "agent", "agent ID to delete permanently (repeatable)")
+		var sessions stringList
+		flags.Var(&sessions, "session", "session ID to delete permanently (repeatable)")
+		vacuum := flags.Bool("vacuum", false, "compact SQLite database and truncate WAL after deletion")
+		localFlags := addLocalFlags(flags)
+		if err := flags.Parse(args[1:]); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 {
+			return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+		}
+		if len(agents) == 0 && len(sessions) == 0 {
+			return errors.New("audit delete requires at least one --agent or --session")
+		}
+		var overrides config.Overrides
+		localFlags.apply(&overrides)
+		cfg, err := config.Resolve(configPath, overrides)
+		if err != nil {
+			return err
+		}
+		req := audit.DeleteRequest{
+			AgentIDs:   agents,
+			SessionIDs: sessions,
+			Vacuum:     *vacuum,
+		}
+		if cfg.Local.Token != "" && transport.ProbeLocal(ctx, cfg.Local.Listen, cfg.Local.Token) {
+			var resp struct {
+				Deleted audit.DeleteResult `json:"deleted"`
+				Stats   audit.Stats        `json:"stats"`
+			}
+			if err := transport.AdminRequest(ctx, cfg.Local.Listen, cfg.Local.Token, http.MethodPost, "/admin/audit/delete", req, &resp); err != nil {
+				return err
+			}
+			return writeJSON(stdout, map[string]any{"live": true, "deleted": resp.Deleted, "stats": resp.Stats})
+		}
+		baseDir := filepath.Dir(configPath)
+		if cfg.Path != "" {
+			baseDir = filepath.Dir(cfg.Path)
+		}
+		auditPath := filepath.Join(baseDir, "lrmcp-audit.db")
+		if _, err := os.Stat(auditPath); errors.Is(err, os.ErrNotExist) {
+			return writeJSON(stdout, map[string]any{"live": false, "deleted": audit.DeleteResult{}, "stats": audit.Stats{}})
+		}
+		store, err := audit.Open(auditPath)
+		if err != nil {
+			return err
+		}
+		deleted, delErr := store.Delete(req)
+		stats, _ := store.Stats()
+		closeErr := store.Close()
+		if delErr != nil {
+			return delErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		return writeJSON(stdout, map[string]any{"live": false, "deleted": deleted, "stats": stats})
+
 	default:
-		return errors.New("audit requires list, events, show, search, tail, or export")
+		return errors.New("audit requires list, events, show, search, tail, export, or delete")
 	}
 }
 

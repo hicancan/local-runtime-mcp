@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hicancan/local-runtime-mcp/internal/audit"
 	"github.com/hicancan/local-runtime-mcp/internal/config"
 	"github.com/hicancan/local-runtime-mcp/internal/version"
 )
@@ -33,7 +34,7 @@ func TestHelpDescribesUnifiedCommands(t *testing.T) {
 	for _, value := range []string{
 		"serve --transport stdio", "lrmcp start", "lrmcp stop", "lrmcp status",
 		"lrmcp daemon", "lrmcp tunnel up", "lrmcp tunnel down", "lrmcp grant remote",
-		"lrmcp ui", "lrmcp audit list", "lrmcp audit search", "lrmcp audit tail", "lrmcp audit export",
+		"lrmcp ui", "lrmcp audit list", "lrmcp audit search", "lrmcp audit tail", "lrmcp audit export", "lrmcp audit delete",
 		"setup browser", "setup local", "setup client", "setup oauth", "setup remote-token", config.FileName,
 		"command line > LOCAL_RUNTIME_MCP_* environment > YAML > defaults",
 		"https://github.com/hicancan/local-runtime-mcp", "GNU AGPL v3.0 only",
@@ -190,5 +191,45 @@ func TestSetupRemoteTokenPersistsAndShows(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), created.Token) {
 		t.Fatalf("--show omitted token: %s", out.String())
+	}
+}
+
+func TestAuditDeleteOfflinePurgesSelectedAgentsOnly(t *testing.T) {
+	root := t.TempDir()
+	executable := filepath.Join(root, "lrmcp.exe")
+	store, err := audit.Open(filepath.Join(root, "lrmcp-audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = store.RecordNote(audit.NoteInput{SessionID: "local:keep-1", AgentID: "real-one", Wire: "local", Message: "keep me"})
+	_, _ = store.RecordNote(audit.NoteInput{SessionID: "local:drop-1", AgentID: "smoke-one", Wire: "local", Message: "drop me"})
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errBuf bytes.Buffer
+	if err := run(context.Background(), []string{"audit", "delete", "--agent", "smoke-one", "--vacuum"}, strings.NewReader(""), &out, &errBuf, executable); err != nil {
+		t.Fatalf("audit delete failed: %v (%s)", err, errBuf.String())
+	}
+	var resp struct {
+		Live    bool               `json:"live"`
+		Deleted audit.DeleteResult `json:"deleted"`
+		Stats   audit.Stats        `json:"stats"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatalf("invalid json: %v (%s)", err, out.String())
+	}
+	if resp.Live || resp.Deleted.Sessions != 1 || resp.Deleted.Events != 1 || resp.Stats.Sessions != 1 {
+		t.Fatalf("unexpected audit delete response: %+v", resp)
+	}
+
+	check, err := audit.Open(filepath.Join(root, "lrmcp-audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	sessions, err := check.ListSessions(20)
+	if err != nil || len(sessions) != 1 || sessions[0].AgentID != "real-one" {
+		t.Fatalf("unexpected remaining sessions: %+v err=%v", sessions, err)
 	}
 }

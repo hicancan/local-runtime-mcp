@@ -745,6 +745,7 @@ Usage:
   lrmcp audit search <query> [--compact] [--limit N] FTS5 full-text search across audit history
   lrmcp audit tail [--agent ID] [--session ID]       Stream live events in real time
   lrmcp audit export [--session ID] [--output FILE]  Export audit stream as JSONL
+  lrmcp audit delete [--agent ID] [--session ID] [--vacuum]  Purge audit timelines and orphan blobs
   lrmcp setup browser [flags]
   lrmcp setup local [flags]
   lrmcp setup client --id NAME [--browser-id ID]

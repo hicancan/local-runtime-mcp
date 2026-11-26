@@ -312,6 +312,21 @@ func (s *Studio) registerRoutes() {
 		ServeSSE(w, r, s.backend.Audit)
 	})
 
+	s.mux.HandleFunc("POST /ui/api/audit/delete", func(w http.ResponseWriter, r *http.Request) {
+		var req audit.DeleteRequest
+		if err := decodeJSON(w, r, &req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid_request", "Provide agent_ids and/or session_ids.")
+			return
+		}
+		res, err := s.backend.Audit.Delete(req)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "audit_delete_failed", err.Error())
+			return
+		}
+		stats, _ := s.backend.Audit.Stats()
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": res, "stats": stats})
+	})
+
 	s.mux.HandleFunc("GET /ui/api/proposals", func(w http.ResponseWriter, _ *http.Request) {
 		list := []capability.Proposal{}
 		if s.backend.Proposals != nil {

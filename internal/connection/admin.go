@@ -197,6 +197,21 @@ func newAdminHandler(
 		_ = host.Audit().ExportJSONL(w, r.URL.Query().Get("session_id"))
 	})
 
+	mux.HandleFunc("POST /admin/audit/delete", func(w http.ResponseWriter, r *http.Request) {
+		var req audit.DeleteRequest
+		if err := decodeAdminJSON(w, r, &req); err != nil {
+			writeAdminError(w, http.StatusBadRequest, "invalid_request", "Provide JSON body with agent_ids and/or session_ids.")
+			return
+		}
+		res, err := host.Audit().Delete(req)
+		if err != nil {
+			writeAdminError(w, http.StatusBadRequest, "audit_delete_failed", err.Error())
+			return
+		}
+		stats, _ := host.Audit().Stats()
+		writeAdminJSON(w, http.StatusOK, map[string]any{"deleted": res, "stats": stats})
+	})
+
 	mux.HandleFunc("POST /admin/sessions/kick", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			SessionID string `json:"session_id"`
