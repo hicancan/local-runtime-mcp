@@ -413,10 +413,9 @@ func TestMyersLineDiffDetectsReorderAndNoOp(t *testing.T) {
 	}
 }
 
-func TestHiddenTabScopedFocusAndScreenshotEmulation(t *testing.T) {
+func TestHiddenTabBackgroundCapturerLifecycle(t *testing.T) {
 	var mu sync.Mutex
-	var calls []string
-	var focusStates []bool
+	var startCount, stopCount int
 
 	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
 		sendJSON := func(v any) {
@@ -440,10 +439,6 @@ func TestHiddenTabScopedFocusAndScreenshotEmulation(t *testing.T) {
 			var params map[string]any
 			_ = json.Unmarshal(req.Params, &params)
 
-			mu.Lock()
-			calls = append(calls, req.Method)
-			mu.Unlock()
-
 			switch req.Method {
 			case "Browser.getVersion":
 				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"product": "Edge/158"}})
@@ -460,10 +455,14 @@ func TestHiddenTabScopedFocusAndScreenshotEmulation(t *testing.T) {
 				} else {
 					sendJSON(map[string]any{"id": req.ID, "result": map[string]any{"result": map[string]any{"value": "ok"}}})
 				}
-			case "Emulation.setFocusEmulationEnabled":
-				en, _ := params["enabled"].(bool)
+			case "Page.startScreencast":
 				mu.Lock()
-				focusStates = append(focusStates, en)
+				startCount++
+				mu.Unlock()
+				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{}})
+			case "Page.stopScreencast":
+				mu.Lock()
+				stopCount++
 				mu.Unlock()
 				sendJSON(map[string]any{"id": req.ID, "result": map[string]any{}})
 			case "Page.getLayoutMetrics":
@@ -494,31 +493,24 @@ func TestHiddenTabScopedFocusAndScreenshotEmulation(t *testing.T) {
 	defer bridge.Close(context.Background())
 
 	tabID := "cdp-1:T_BG"
+	// Consecutive click + screenshot + click on hidden tab must start capturer ONCE and reuse it.
 	if _, err := bridge.Act(ctx, Action{TabID: tabID, Kind: "click", Locator: Locator{Role: "button", Name: "Go"}}); err != nil {
-		t.Fatalf("hidden tab click failed: %v", err)
+		t.Fatalf("hidden tab click 1 failed: %v", err)
 	}
 	data, info, err := bridge.Screenshot(ctx, ScreenshotOptions{TabID: tabID})
 	if err != nil || string(data) != "bgpng" || info.Width != 1200 || info.Height != 800 {
 		t.Fatalf("hidden tab screenshot failed: len=%d info=%+v err=%v", len(data), info, err)
 	}
+	if _, err := bridge.Act(ctx, Action{TabID: tabID, Kind: "click", Locator: Locator{Role: "button", Name: "Go"}}); err != nil {
+		t.Fatalf("hidden tab click 2 failed: %v", err)
+	}
+	if err := bridge.MarkHandoff(tabID); err != nil {
+		t.Fatalf("MarkHandoff failed: %v", err)
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(focusStates) != 2 || !focusStates[0] || focusStates[1] {
-		t.Fatalf("expected scoped focus emulation [true, false], got %v", focusStates)
-	}
-	setIdx, capIdx, clrIdx := -1, -1, -1
-	for i, m := range calls {
-		switch m {
-		case "Emulation.setDeviceMetricsOverride":
-			setIdx = i
-		case "Page.captureScreenshot":
-			capIdx = i
-		case "Emulation.clearDeviceMetricsOverride":
-			clrIdx = i
-		}
-	}
-	if setIdx < 0 || capIdx <= setIdx || clrIdx <= capIdx {
-		t.Fatalf("expected setDeviceMetricsOverride -> captureScreenshot -> clearDeviceMetricsOverride order, got indices %d/%d/%d in %v", setIdx, capIdx, clrIdx, calls)
+	if startCount != 1 || stopCount != 1 {
+		t.Fatalf("expected exactly 1 startScreencast and 1 stopScreencast on handoff, got start=%d stop=%d", startCount, stopCount)
 	}
 }

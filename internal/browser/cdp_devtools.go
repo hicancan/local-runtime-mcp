@@ -916,6 +916,11 @@ func (c *cdpClient) screencastStartTab(ctx context.Context, targetID string, max
 		quality = 75
 	}
 	ts.mu.Lock()
+	if ts.bgCapturerTimer != nil {
+		ts.bgCapturerTimer.Stop()
+		ts.bgCapturerTimer = nil
+	}
+	ts.bgCapturerOn = false
 	ts.screencastOn = true
 	ts.screencastFrames = nil
 	ts.mu.Unlock()
@@ -936,6 +941,11 @@ func (c *cdpClient) screencastStopTab(ctx context.Context, targetID string) ([]S
 	}
 	_ = c.Send(ctx, ts.sessionID, "Page.stopScreencast", nil, nil)
 	ts.mu.Lock()
+	if ts.bgCapturerTimer != nil {
+		ts.bgCapturerTimer.Stop()
+		ts.bgCapturerTimer = nil
+	}
+	ts.bgCapturerOn = false
 	ts.screencastOn = false
 	frames := append([]ScreencastFrame(nil), ts.screencastFrames...)
 	ts.screencastFrames = nil

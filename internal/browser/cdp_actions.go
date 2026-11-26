@@ -34,6 +34,8 @@ type resolvedPoint struct {
 	Y         float64
 }
 
+const bgCapturerIdleTTL = 15 * time.Second
+
 func (c *cdpClient) isTabHidden(ctx context.Context, sessionID string) bool {
 	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -52,23 +54,84 @@ func (c *cdpClient) isTabHidden(ctx context.Context, sessionID string) bool {
 	return hidden
 }
 
-// ensureActiveForInput temporarily enables Chromium focus emulation when dispatching
-// mouse/keyboard input to a hidden background tab so Blink does not stall coalesced
-// mouseMoved ACKs for 5 seconds waiting on a throttled BeginMainFrame.
-func (c *cdpClient) ensureActiveForInput(ctx context.Context, sessionID string) func() {
-	if !c.isTabHidden(ctx, sessionID) {
-		return func() {}
+// ensureBgCapturer wakes Chromium's occluded-tab compositor via Page.startScreencast
+// (WebContents::IncrementCapturerCount) when interacting with or screenshotting a
+// hidden background tab. This keeps BeginMainFrame and CopyFromSurface running at
+// full 60 FPS without switching the active tab, stealing OS focus, or mutating
+// viewport/DPR metrics, and automatically releases after bgCapturerIdleTTL of inactivity.
+func (c *cdpClient) ensureBgCapturer(ctx context.Context, ts *tabSession) {
+	ts.mu.Lock()
+	if ts.screencastOn {
+		ts.mu.Unlock()
+		return
 	}
-	enCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	err := c.Send(enCtx, sessionID, "Emulation.setFocusEmulationEnabled", map[string]any{"enabled": true}, nil)
+	if ts.bgCapturerOn {
+		if ts.bgCapturerTimer != nil {
+			ts.bgCapturerTimer.Reset(bgCapturerIdleTTL)
+		}
+		ts.mu.Unlock()
+		return
+	}
+	sessID := ts.sessionID
+	ts.mu.Unlock()
+
+	if !c.isTabHidden(ctx, sessID) {
+		return
+	}
+
+	startCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	err := c.Send(startCtx, sessID, "Page.startScreencast", map[string]any{
+		"format":        "jpeg",
+		"quality":       1,
+		"maxWidth":      16,
+		"maxHeight":     16,
+		"everyNthFrame": 60,
+	}, nil)
 	cancel()
 	if err != nil {
-		return func() {}
+		return
 	}
-	return func() {
-		relCtx, relCancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-		defer relCancel()
-		_ = c.Send(relCtx, sessionID, "Emulation.setFocusEmulationEnabled", map[string]any{"enabled": false}, nil)
+
+	ts.mu.Lock()
+	if !ts.screencastOn && c.Alive() {
+		ts.bgCapturerOn = true
+		if ts.bgCapturerTimer != nil {
+			ts.bgCapturerTimer.Stop()
+		}
+		ts.bgCapturerTimer = time.AfterFunc(bgCapturerIdleTTL, func() {
+			c.releaseBgCapturer(ts)
+		})
+	}
+	ts.mu.Unlock()
+}
+
+func (c *cdpClient) releaseBgCapturer(ts *tabSession) {
+	if ts == nil {
+		return
+	}
+	ts.mu.Lock()
+	if ts.bgCapturerTimer != nil {
+		ts.bgCapturerTimer.Stop()
+		ts.bgCapturerTimer = nil
+	}
+	shouldStop := ts.bgCapturerOn && !ts.screencastOn
+	ts.bgCapturerOn = false
+	sessID := ts.sessionID
+	ts.mu.Unlock()
+
+	if shouldStop && c.Alive() {
+		stopCtx, cancel := context.WithTimeout(c.ctx, 2*time.Second)
+		defer cancel()
+		_ = c.Send(stopCtx, sessID, "Page.stopScreencast", nil, nil)
+	}
+}
+
+func (c *cdpClient) releaseBgCapturerByTarget(targetID string) {
+	c.stateMu.Lock()
+	ts := c.tabs[targetID]
+	c.stateMu.Unlock()
+	if ts != nil {
+		c.releaseBgCapturer(ts)
 	}
 }
 
@@ -88,7 +151,6 @@ func (c *cdpClient) screenshotTab(ctx context.Context, tabID, targetID string, o
 	ts.mu.Lock()
 	epoch := ts.epoch
 	sessID := ts.sessionID
-	emulationActive := ts.emulationActive
 	ts.mu.Unlock()
 
 	var metrics struct {
@@ -159,35 +221,7 @@ func (c *cdpClient) screenshotTab(ctx context.Context, tabID, targetID string, o
 	}
 	params["captureBeyondViewport"] = captureBeyond
 
-	// On headful Chromium, Page.captureScreenshot(fromSurface: true) on an occluded
-	// background tab waits indefinitely for a live compositor surface unless device
-	// metrics emulation triggers an offscreen frame commit. Enable a scoped override
-	// strictly for hidden tabs that do not already have caller emulation active.
-	if !emulationActive && c.isTabHidden(ctx, sessID) {
-		ovW := int(math.Round(vp.ClientWidth))
-		ovH := int(math.Round(vp.ClientHeight))
-		if ovW < 1 {
-			ovW = 1280
-		}
-		if ovH < 1 {
-			ovH = 720
-		}
-		ovCtx, ovCancel := context.WithTimeout(ctx, 2*time.Second)
-		ovErr := c.Send(ovCtx, sessID, "Emulation.setDeviceMetricsOverride", map[string]any{
-			"width":             ovW,
-			"height":            ovH,
-			"deviceScaleFactor": 1,
-			"mobile":            false,
-		}, nil)
-		ovCancel()
-		if ovErr == nil {
-			defer func() {
-				clrCtx, clrCancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-				defer clrCancel()
-				_ = c.Send(clrCtx, sessID, "Emulation.clearDeviceMetricsOverride", nil, nil)
-			}()
-		}
-	}
+	c.ensureBgCapturer(ctx, ts)
 
 	shotCtx, shotCancel := context.WithTimeout(ctx, 20*time.Second)
 	defer shotCancel()
@@ -246,8 +280,7 @@ func (c *cdpClient) actTab(ctx context.Context, tabID, targetID string, action A
 	var value any
 	switch action.Kind {
 	case "click", "double_click", "hover", "drag", "type_text", "set_value", "fill", "press_key", "scroll":
-		releaseFocus := c.ensureActiveForInput(ctx, ts.sessionID)
-		defer releaseFocus()
+		c.ensureBgCapturer(ctx, ts)
 	}
 
 	switch action.Kind {

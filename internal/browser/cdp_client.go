@@ -134,6 +134,8 @@ type tabSession struct {
 	screencastOn     bool
 	screencastSeq    int64
 	screencastFrames []ScreencastFrame
+	bgCapturerOn     bool
+	bgCapturerTimer  *time.Timer
 	emulationActive  bool
 }
 
@@ -385,6 +387,15 @@ func (c *cdpClient) readLoop() {
 	defer func() {
 		c.stateMu.Lock()
 		c.closed = true
+		for _, ts := range c.tabs {
+			ts.mu.Lock()
+			if ts.bgCapturerTimer != nil {
+				ts.bgCapturerTimer.Stop()
+				ts.bgCapturerTimer = nil
+			}
+			ts.bgCapturerOn = false
+			ts.mu.Unlock()
+		}
 		c.stateMu.Unlock()
 		c.pendMu.Lock()
 		for id, ch := range c.pending {
@@ -480,6 +491,11 @@ func (c *cdpClient) handleEvent(env cdpEnvelope) {
 			if ts != nil {
 				delete(c.bySession, ts.sessionID)
 				ts.mu.Lock()
+				if ts.bgCapturerTimer != nil {
+					ts.bgCapturerTimer.Stop()
+					ts.bgCapturerTimer = nil
+				}
+				ts.bgCapturerOn = false
 				for child := range ts.childSessions {
 					delete(c.bySession, child)
 				}
@@ -505,6 +521,11 @@ func (c *cdpClient) handleEvent(env cdpEnvelope) {
 				delete(c.attached, ts.targetID)
 				delete(c.bySession, ts.sessionID)
 				ts.mu.Lock()
+				if ts.bgCapturerTimer != nil {
+					ts.bgCapturerTimer.Stop()
+					ts.bgCapturerTimer = nil
+				}
+				ts.bgCapturerOn = false
 				for child := range ts.childSessions {
 					delete(c.bySession, child)
 				}
@@ -821,26 +842,31 @@ func (c *cdpClient) handleEvent(env cdpEnvelope) {
 			} `json:"metadata"`
 		}
 		if json.Unmarshal(env.Params, &p) == nil {
-			if raw, err := decodeBase64(p.Data); err == nil {
-				ts.mu.Lock()
-				if ts.screencastOn {
-					ts.screencastSeq++
-					ts.screencastFrames = append(ts.screencastFrames, ScreencastFrame{
-						Seq:       ts.screencastSeq,
-						Timestamp: time.Now().UnixMilli(),
-						Width:     int(p.Metadata.DeviceWidth),
-						Height:    int(p.Metadata.DeviceHeight),
-						MIMEType:  "image/jpeg",
-						Data:      raw,
-					})
-					if len(ts.screencastFrames) > maxScreencastBuf {
-						excess := len(ts.screencastFrames) - maxScreencastBuf
-						copy(ts.screencastFrames, ts.screencastFrames[excess:])
-						clear(ts.screencastFrames[maxScreencastBuf:])
-						ts.screencastFrames = ts.screencastFrames[:maxScreencastBuf]
+			ts.mu.Lock()
+			recording := ts.screencastOn
+			ts.mu.Unlock()
+			if recording {
+				if raw, err := decodeBase64(p.Data); err == nil {
+					ts.mu.Lock()
+					if ts.screencastOn {
+						ts.screencastSeq++
+						ts.screencastFrames = append(ts.screencastFrames, ScreencastFrame{
+							Seq:       ts.screencastSeq,
+							Timestamp: time.Now().UnixMilli(),
+							Width:     int(p.Metadata.DeviceWidth),
+							Height:    int(p.Metadata.DeviceHeight),
+							MIMEType:  "image/jpeg",
+							Data:      raw,
+						})
+						if len(ts.screencastFrames) > maxScreencastBuf {
+							excess := len(ts.screencastFrames) - maxScreencastBuf
+							copy(ts.screencastFrames, ts.screencastFrames[excess:])
+							clear(ts.screencastFrames[maxScreencastBuf:])
+							ts.screencastFrames = ts.screencastFrames[:maxScreencastBuf]
+						}
 					}
+					ts.mu.Unlock()
 				}
-				ts.mu.Unlock()
 			}
 			go func(sess string, frameSess int) {
 				ackCtx, cancel := context.WithTimeout(c.ctx, 2*time.Second)

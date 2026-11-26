@@ -902,7 +902,14 @@ func (b *Bridge) MarkHandoff(tabID string) error {
 		b.tabOwners[tabID] = own
 	}
 	own.handedOff = true
+	var cl *cdpClient
+	if entry := b.cdpConns[browserID]; entry != nil && entry.client != nil && entry.client.Alive() {
+		cl = entry.client
+	}
 	b.mu.Unlock()
+	if cl != nil {
+		cl.releaseBgCapturerByTarget(targetID)
+	}
 	return nil
 }
 
