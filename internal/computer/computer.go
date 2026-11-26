@@ -131,8 +131,8 @@ type Action struct {
 	ControlID  string     `json:"control_id,omitempty" jsonschema:"control ID from computer_control acquire; only physical input needs it"`
 	Kind       string     `json:"kind" jsonschema:"semantic (invoke, toggle, select, expand, collapse, set_value, scroll_into_view, scroll_by), window (place), or physical input"`
 	TargetID   string     `json:"target_id,omitempty" jsonschema:"opaque target ID; required for place and activate"`
-	StateID    string     `json:"state_id,omitempty" jsonschema:"state ID from computer_state; required for physical input"`
-	ElementRef string     `json:"element_ref,omitempty" jsonschema:"element ref_id from computer_state or computer_wait"`
+	StateID    string     `json:"state_id,omitempty" jsonschema:"state ID from desktop.state(); required for physical input"`
+	RefID      string     `json:"ref_id,omitempty" jsonschema:"element ref_id from desktop.state() or desktop.wait()"`
 	X          *int       `json:"x,omitempty" jsonschema:"X coordinate relative to the computer_state image"`
 	Y          *int       `json:"y,omitempty" jsonschema:"Y coordinate relative to the computer_state image"`
 	ToX        *int       `json:"to_x,omitempty" jsonschema:"drag destination X coordinate relative to the state image"`
@@ -219,8 +219,8 @@ func Validate(action Action) error {
 		if (action.X == nil) != (action.Y == nil) {
 			return errors.New("scroll x and y must be provided together")
 		}
-		if action.ElementRef != "" && action.X != nil {
-			return errors.New("scroll accepts element_ref or coordinates, not both")
+		if action.RefID != "" && action.X != nil {
+			return errors.New("scroll accepts ref_id or coordinates, not both")
 		}
 		return nil
 	default:
@@ -246,8 +246,8 @@ func validateSemantic(action Action) error {
 		}
 		return nil
 	}
-	if action.ElementRef == "" {
-		return fmt.Errorf("%s requires element_ref", action.Kind)
+	if action.RefID == "" {
+		return fmt.Errorf("%s requires ref_id", action.Kind)
 	}
 	if action.Kind == "scroll_by" && action.ScrollX == 0 && action.ScrollY == 0 {
 		return errors.New("scroll_by needs scroll_x or scroll_y pages")
@@ -256,9 +256,9 @@ func validateSemantic(action Action) error {
 }
 
 func requireTarget(action Action, operation string) error {
-	if action.ElementRef != "" {
+	if action.RefID != "" {
 		if action.X != nil || action.Y != nil {
-			return fmt.Errorf("%s accepts element_ref or coordinates, not both", operation)
+			return fmt.Errorf("%s accepts ref_id or coordinates, not both", operation)
 		}
 		return nil
 	}
@@ -269,8 +269,8 @@ func validateOptionalTarget(action Action, operation string) error {
 	if (action.X == nil) != (action.Y == nil) {
 		return fmt.Errorf("%s x and y must be provided together", operation)
 	}
-	if action.ElementRef != "" && action.X != nil {
-		return fmt.Errorf("%s accepts element_ref or coordinates, not both", operation)
+	if action.RefID != "" && action.X != nil {
+		return fmt.Errorf("%s accepts ref_id or coordinates, not both", operation)
 	}
 	return nil
 }

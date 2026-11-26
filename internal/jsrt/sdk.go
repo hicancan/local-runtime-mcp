@@ -1581,7 +1581,7 @@ func (v *sessionVM) buildDesktopSDK() goja.Value {
 		})
 	})
 	_ = obj.Set("action", func(call goja.FunctionCall) goja.Value {
-		const sig = `desktop.action({ kind, control_id?, target_id?, state_id?, element_ref?, x?, y?, to_x?, to_y?, duration_ms?, button?, text?, key?, scroll_x?, scroll_y?, bounds?, show? })`
+		const sig = `desktop.action({ kind, control_id?, target_id?, state_id?, ref_id?, x?, y?, to_x?, to_y?, duration_ms?, button?, text?, key?, scroll_x?, scroll_y?, bounds?, show? })`
 		if v.isReadOnly() {
 			return v.rejected(errors.New("read-only grant forbids desktop.action"))
 		}
@@ -1597,7 +1597,7 @@ func (v *sessionVM) buildDesktopSDK() goja.Value {
 				return v.rejected(err)
 			}
 		}
-		return v.spawnAsync("desktop."+act.Kind, firstNonEmpty(act.ElementRef, act.TargetID), func(ctx context.Context) (any, error) {
+		return v.spawnAsync("desktop."+act.Kind, firstNonEmpty(act.RefID, act.TargetID), func(ctx context.Context) (any, error) {
 			res, err := ctrl.Act(ctx, act)
 			return toPlain(res), err
 		})

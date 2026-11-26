@@ -25,4 +25,4 @@
 
 ## 待正演条目
 
-（当前清空 — `v18.4.5` 已完成新版 MOOC 课件页 `icourse.outline` 解析、OAuth 真实客户端归属与 `screenshotTab` 并行化优化，等待实战新信号。）
+（当前清空 — `v18.4.7` 已统一全栈桌面 `ref_id` 命名并将 `emitImage` 响应对齐为纯 `ImageContent` + `StructuredContent` 报文格式，等待云端双通道视觉对照复测信号。）

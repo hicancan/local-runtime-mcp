@@ -169,14 +169,17 @@ func TestRunDualStateSummaryImagesAndAudit(t *testing.T) {
 			return { text: rd.content.trim(), w: shot.width };
 		`,
 	})
-	hasImage := false
-	for _, c := range runRes.Content {
-		if ic, ok := c.(*mcp.ImageContent); ok && ic.MIMEType == "image/png" && len(ic.Data) > 0 {
-			hasImage = true
-		}
+	if len(runRes.Content) != 1 {
+		t.Fatalf("expected pure ImageContent block when emitImage is used, got %d content blocks", len(runRes.Content))
 	}
-	if !hasImage {
-		t.Fatalf("expected native MCP ImageContent from emitImage inside run")
+	ic, ok := runRes.Content[0].(*mcp.ImageContent)
+	if !ok || ic.MIMEType != "image/png" || len(ic.Data) == 0 {
+		t.Fatalf("expected Content[0] to be native MCP ImageContent, got %T", runRes.Content[0])
+	}
+	var runCell jsrt.CellResult
+	rawCell, _ := json.Marshal(runRes.StructuredContent)
+	if err := json.Unmarshal(rawCell, &runCell); err != nil || runCell.Status != "done" {
+		t.Fatalf("expected full StructuredContent alongside ImageContent, got %s (%v)", rawCell, err)
 	}
 
 	// Verify audit recorded done_title and image blob under the active task session

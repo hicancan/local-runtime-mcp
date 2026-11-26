@@ -107,7 +107,7 @@ DevTools:
 - desktop.targets({ pid?, title?, process? }?) -> { displays, windows: [{ target_id, pid, process, title, bounds, state, active }] }
 - desktop.state({ control_id?, target_id?, display_id?, region?, image?, cursor?, elements?: "all"|"interactive"|"none", name?, role?, automation_id?, max_elements?, offset?, max_width?, max_height? }?) -> pass to emitImage()
 - desktop.wait({ target_id, name?, automation_id?, role?, until?: "present"|"absent", timeout_ms?, image? })
-- desktop.action({ kind, control_id?, target_id?, state_id?, element_ref?, x?, y?, to_x?, to_y?, duration_ms?, button?, text?, key?, scroll_x?, scroll_y?, bounds?, show? })
+- desktop.action({ kind, control_id?, target_id?, state_id?, ref_id?, x?, y?, to_x?, to_y?, duration_ms?, button?, text?, key?, scroll_x?, scroll_y?, bounds?, show? })
   Semantic kinds (no control_id): invoke, toggle, select, expand, collapse, set_value, scroll_into_view, scroll_by, place
   Physical kinds (require control_id + state_id): click, double_click, move, drag, type_text, press_key, scroll (activate needs control_id + target_id)
 - desktop.control("status" | "acquire" | "release", { control_id?, label? }?)`,

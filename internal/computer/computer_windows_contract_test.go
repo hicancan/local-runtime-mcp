@@ -99,7 +99,7 @@ func TestWindowsComputerContractSmoke(t *testing.T) {
 	if textbox == "" || button == "" {
 		t.Fatalf("fixture UIA references missing: %+v", state)
 	}
-	if _, err := controller.Act(ctx, Action{ControlID: control.ControlID, Kind: "set_value", TargetID: target.TargetID, StateID: state.StateID, ElementRef: textbox, Text: "semantic-v10"}); err != nil {
+	if _, err := controller.Act(ctx, Action{ControlID: control.ControlID, Kind: "set_value", TargetID: target.TargetID, StateID: state.StateID, RefID: textbox, Text: "semantic-v10"}); err != nil {
 		t.Fatalf("real ValuePattern: %v", err)
 	}
 	var value string
@@ -129,7 +129,7 @@ func TestWindowsComputerContractSmoke(t *testing.T) {
 			button = element.RefID
 		}
 	}
-	if _, err := controller.Act(ctx, Action{ControlID: control.ControlID, Kind: "set_value", TargetID: target.TargetID, StateID: state.StateID, ElementRef: button, Text: "unsupported"}); err == nil {
+	if _, err := controller.Act(ctx, Action{ControlID: control.ControlID, Kind: "set_value", TargetID: target.TargetID, StateID: state.StateID, RefID: button, Text: "unsupported"}); err == nil {
 		t.Fatal("button silently used physical fallback for set_value")
 	}
 	_, state, err = controller.State(ctx, StateOptions{ControlID: control.ControlID, TargetID: target.TargetID})

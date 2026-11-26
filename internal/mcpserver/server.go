@@ -44,7 +44,7 @@ SDK signatures (all async unless noted):
 - browser.open(url, { browser_id?, active?, control_id?, session_name?, group? }?) -> TabHandle; browser.tab(id) (sync); browser.cleanup()
 - browser.cdp(method, params?, browser_id?); browser.traceStart({ browser_id?, tab_id?, reload?, ignore_cache?, categories? }?); browser.traceStop(file_path? | { file_path?, browser_id? }?, browser_id?)
 - TabHandle (.id/.title/.url/.browser_id): .goto(url) | .reload() | .back() | .forward() | .close() | .markHandoff() (sync) | .snapshot({ diff?, max_elements?, max_text? }?) | .screenshot({ full_page?, clip_x?, clip_y?, clip_width?, clip_height? }?) | .eval(jsOrFn, ...args) | .cdp(method, params?) | .getByRole(role, nameOrOpts?)/.getByText/.getByLabel/.getByPlaceholder/.locator(css) -> .click()/.fill(t)/.type(t)/.press(k)/.select(o)/.check(b)/.uploadFiles(paths)/.waitFor({ timeout_ms? })/.nth(i) | .network({ resource_types?, url_contains?, include_preserved?, failed_only?, limit? }?) | .networkBody(req_id) | .console({ levels?, limit? }?) | .emulate({ width?, height?, mobile?, cpu_throttling_rate?, network_preset?, color_scheme?, ... }) | .css(selectorOrLoc) | .heapSnapshot(path?) | .logpoint(url, line1Based, expr, col0Based?) | .screencastStart(opts?) | .screencastStop()
-- desktop.targets({ pid?, title?, process? }?) -> { displays, windows: [{ target_id, pid, process, title, bounds, state, active }] }; desktop.state({ target_id?, display_id?, control_id?, image?, elements?: "all"|"interactive"|"none", max_elements?, offset?, max_width?, max_height? }?); desktop.wait({ target_id, name?, role?, automation_id?, until?: "present"|"absent", timeout_ms?, image? }); desktop.action({ kind, control_id?, target_id?, state_id?, element_ref?, ... }); desktop.control("status"|"acquire"|"release", { control_id?, label? }?)
+- desktop.targets({ pid?, title?, process? }?) -> { displays, windows: [{ target_id, pid, process, title, bounds, state, active }] }; desktop.state({ target_id?, display_id?, control_id?, image?, elements?: "all"|"interactive"|"none", max_elements?, offset?, max_width?, max_height? }?); desktop.wait({ target_id, name?, role?, automation_id?, until?: "present"|"absent", timeout_ms?, image? }); desktop.action({ kind, control_id?, target_id?, state_id?, ref_id?, ... }); desktop.control("status"|"acquire"|"release", { control_id?, label? }?)
 - img.read(path, { max_bytes?, max_pixels?, max_width?, max_height?, crop_x?, crop_y?, crop_width?, crop_height? }?); emitImage(imgOrShotOrPath, label?) (sync)
 - caps.list() -> Capability[]; caps.call(name, args?, browser_id?, tab_id?); help(topic?) (sync); print(...); sleep(ms)`
 
@@ -335,12 +335,18 @@ func waitToolSpec(m *Managed, defaultWire string) toolSpec {
 
 func cellResultToMCP(res jsrt.CellResult) *mcp.CallToolResult {
 	var content []mcp.Content
-	payload, _ := json.Marshal(res)
-	content = append(content, &mcp.TextContent{Text: string(payload)})
 	for _, img := range res.Images {
 		if len(img.Data) > 0 && img.MIMEType != "" {
 			content = append(content, &mcp.ImageContent{Data: img.Data, MIMEType: img.MIMEType})
 		}
+	}
+	// Preserve v17 wire parity: when native images are emitted, keep Content strictly
+	// ImageContent blocks (Content[0].type == "image") while StructuredContent carries
+	// the complete CellResult JSON, preventing MCP hosts from shadowing images behind
+	// a leading duplicate TextContent block.
+	if len(content) == 0 {
+		payload, _ := json.Marshal(res)
+		content = append(content, &mcp.TextContent{Text: string(payload)})
 	}
 	return &mcp.CallToolResult{
 		IsError:           res.Status == "error",

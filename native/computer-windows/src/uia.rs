@@ -523,7 +523,7 @@ unsafe fn value_of(element: &IUIAutomationElement) -> Option<String> {
 }
 
 unsafe fn current_bounds(live: Option<&LiveElement>) -> Result<Rectangle, String> {
-    let live = live.ok_or("element_ref expired; observe again")?;
+    let live = live.ok_or("ref_id expired; observe again")?;
     if unsafe { current_runtime_id(&live.element) }? != live.runtime_id {
         return Err("UIA element identity changed; observe again".into());
     }
@@ -543,7 +543,7 @@ unsafe fn semantic(
     stop_generation: u64,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    let live = live.ok_or("element_ref expired; observe again")?;
+    let live = live.ok_or("ref_id expired; observe again")?;
     let element = &live.element;
     if unsafe { current_runtime_id(element) }? != live.runtime_id {
         return Err("UIA element identity changed; observe again".into());

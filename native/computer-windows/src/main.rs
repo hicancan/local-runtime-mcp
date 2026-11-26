@@ -234,7 +234,7 @@ struct ActionParams {
     #[serde(default)]
     state_id: String,
     #[serde(default)]
-    element_ref: String,
+    ref_id: String,
     x: Option<i32>,
     y: Option<i32>,
     to_x: Option<i32>,
@@ -600,13 +600,13 @@ impl Engine {
             return Err("target bounds changed; call desktop.state() again".into());
         }
         self.invalidate();
-        let live = if params.element_ref.is_empty() {
+        let live = if params.ref_id.is_empty() {
             None
         } else {
             let key = *record
                 .elements
-                .get(&params.element_ref)
-                .ok_or("element_ref unknown or stale")?;
+                .get(&params.ref_id)
+                .ok_or("ref_id unknown or stale")?;
             Some(self.uia.bounds(key)?)
         };
         check_cancel()?;
@@ -622,25 +622,25 @@ impl Engine {
 
     /// Operates a control through its automation pattern: no foreground, pointer or keyboard.
     fn semantic(&mut self, params: &ActionParams) -> Result<(), String> {
-        if params.element_ref.is_empty() {
-            return Err(format!("{} requires element_ref", params.kind));
+        if params.ref_id.is_empty() {
+            return Err(format!("{} requires ref_id", params.kind));
         }
         let state_id = params
-            .element_ref
+            .ref_id
             .rsplit_once(':')
             .map(|(state, _)| state)
-            .ok_or("element_ref is invalid")?;
+            .ok_or("ref_id is invalid")?;
         let record = self
             .states
             .get(state_id)
-            .ok_or("element_ref belongs to an expired observation; observe again")?;
+            .ok_or("ref_id belongs to an expired observation; observe again")?;
         if record.stop_generation != STOP_GENERATION.load(Ordering::SeqCst) {
             return Err("desktop control was stopped locally; observe again".into());
         }
         let key = *record
             .elements
-            .get(&params.element_ref)
-            .ok_or("element_ref unknown or stale")?;
+            .get(&params.ref_id)
+            .ok_or("ref_id unknown or stale")?;
         let action = match params.kind.as_str() {
             "invoke" => uia::Semantic::Invoke,
             "toggle" => uia::Semantic::Toggle,
@@ -799,8 +799,8 @@ fn perform_action(
     record: &StateRecord,
     live: Option<Rectangle>,
 ) -> Result<(), String> {
-    let point = if !params.element_ref.is_empty() {
-        let rect = live.ok_or("element_ref is unknown or stale")?;
+    let point = if !params.ref_id.is_empty() {
+        let rect = live.ok_or("ref_id is unknown or stale")?;
         let center = (rect.x + rect.width / 2, rect.y + rect.height / 2);
         if !record.bounds.contains(center.0, center.1) {
             return Err("UIA element is outside the observed area; observe again".into());
@@ -816,9 +816,9 @@ fn perform_action(
     };
     check_cancel()?;
     match params.kind.as_str() {
-        "move" => move_to(point.ok_or("move requires coordinates or element_ref")?),
+        "move" => move_to(point.ok_or("move requires coordinates or ref_id")?),
         "click" | "double_click" => {
-            move_to(point.ok_or("click requires coordinates or element_ref")?)?;
+            move_to(point.ok_or("click requires coordinates or ref_id")?)?;
             let count = if params.kind == "double_click" { 2 } else { 1 };
             for _ in 0..count {
                 mouse_button(&params.button, true)?;
@@ -827,7 +827,7 @@ fn perform_action(
             Ok(())
         }
         "drag" => {
-            let start = point.ok_or("drag requires coordinates or element_ref")?;
+            let start = point.ok_or("drag requires coordinates or ref_id")?;
             let (x, y) = (
                 params.to_x.ok_or("drag requires to_x")?,
                 params.to_y.ok_or("drag requires to_y")?,
